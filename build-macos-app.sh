@@ -159,7 +159,14 @@ info "interpreter: ${PYTHON_BIN} ($("${PYTHON_BIN}" -c 'import platform; print(p
 
 # A dedicated UV_PROJECT_ENVIRONMENT keeps the build out of the checkout's .venv.
 # --locked refuses to rewrite uv.lock and fails if it is stale.
-UV_PROJECT_ENVIRONMENT="${VENV_DIR}" uv sync --locked --python "${PYTHON_BIN}"
+#
+# --reinstall-package forces the project itself to be rebuilt instead of reusing
+# a cached editable wheel. uv keys that wheel on its declared build inputs, not
+# on Git state, so a cached wheel from another checkout or commit would install
+# a stale setuptools_scm version and the bundle would misreport its commit. Only
+# NanoVNASaver is reinstalled; every locked dependency is still cache-served.
+UV_PROJECT_ENVIRONMENT="${VENV_DIR}" uv sync --locked --python "${PYTHON_BIN}" \
+    --reinstall-package "${APP_NAME}"
 
 [ -x "${VENV_PY}" ] || die "expected interpreter missing after sync: ${VENV_PY}"
 "${VENV_PY}" -c 'import PyInstaller' >/dev/null 2>&1 \
