@@ -20,6 +20,7 @@
 import logging
 from ast import literal_eval
 from dataclasses import dataclass, field, fields, is_dataclass, replace
+from typing import ClassVar
 
 from PySide6.QtCore import QByteArray, QSettings
 from PySide6.QtGui import QColor, QColorConstants
@@ -56,6 +57,10 @@ class ChartConfig:
     show_lines: bool = False
     line_thickness: int = 1
     marker_count: int = 3
+    #: Hard ceiling on restored markers.  A settings file written by an
+    #: older build could contain a wildly inflated count, and building that
+    #: many marker widgets blocks startup for minutes.
+    MAX_MARKER_COUNT: ClassVar[int] = 10
     marker_label: bool = False
     marker_filled: bool = False
     marker_at_tip: bool = False
@@ -63,6 +68,26 @@ class ChartConfig:
     returnloss_is_positive: bool = False
     show_bands: bool = False
     vswr_lines: list = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Clamp a corrupt or inflated marker count from an old settings file.
+
+        Older builds persisted a process-wide marker instance counter here,
+        which grew on every startup; restoring thousands of markers made the
+        application appear to hang.
+        """
+        try:
+            count = int(self.marker_count)
+        except (TypeError, ValueError):
+            count = ChartConfig.marker_count
+        if not 1 <= count <= self.MAX_MARKER_COUNT:
+            logger.warning(
+                "Ignoring out-of-range marker count %r; using %d",
+                self.marker_count,
+                ChartConfig.marker_count,
+            )
+            count = ChartConfig.marker_count
+        self.marker_count = count
 
 
 @dataclass

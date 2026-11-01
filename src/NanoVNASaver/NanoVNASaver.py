@@ -680,7 +680,11 @@ class NanoVNASaver(QWidget):
         self.threadpool.waitForDone(2500)
 
         app_config = get_app_config()
-        app_config.chart.marker_count = Marker.count()
+        # Persist how many markers this window owns.  ``Marker.count()`` is a
+        # process-wide instance counter, so using it here made the saved
+        # count grow with every window ever constructed and, once written,
+        # balloon on the next startup.
+        app_config.chart.marker_count = len(self.markers)
         app_config.gui.window_width = self.width()
         app_config.gui.window_height = self.height()
         app_config.gui.splitter_sizes = self.splitter.saveState()

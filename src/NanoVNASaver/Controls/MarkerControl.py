@@ -46,7 +46,22 @@ class MarkerControl(Control):
         super().__init__(app, "Markers")
 
         app_config = get_app_config()
-        for i in range(app_config.chart.marker_count):
+        # Settings are restored with plain attribute assignment, which skips
+        # ChartConfig.__post_init__, so clamp here as well: an inflated count
+        # from an older build must never be allowed to build thousands of
+        # marker widgets.
+        count = min(
+            max(int(app_config.chart.marker_count), 1),
+            app_config.chart.MAX_MARKER_COUNT,
+        )
+        if count != app_config.chart.marker_count:
+            logger.warning(
+                "Clamping marker count from %s to %d",
+                app_config.chart.marker_count,
+                count,
+            )
+            app_config.chart.marker_count = count
+        for i in range(count):
             marker = Marker("", self.app.settings)
             # marker.setFixedHeight(20)
             marker.updated.connect(self.app.markerUpdated)
