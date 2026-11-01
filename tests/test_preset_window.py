@@ -283,3 +283,191 @@ class TestUserPresets:
         broken.write_text("{not json", encoding="utf-8")
         assert preset_window.import_file(str(broken)) is None
         assert "could not read" in preset_window.label_message.text()
+
+
+class TestPresetApplicationIsComplete:
+    """PRESET-02.1: a preset applies its whole sweep setup.
+
+    Written after a real defect: only start/stop/segments were pushed into the
+    UI, so a preset asking for 401 points and 3 averages left the window at
+    the device default of 101 points and 3 averages - and because
+    ``SweepControl.update_sweep`` derives the point count from
+    ``vna.datapoints``, the point count was reverted even when set.
+    """
+
+    @staticmethod
+    def test_every_builtin_preset_sets_the_point_count(vna_app):
+        from NanoVNASaver import Presets
+
+        for name in Presets.BUILTIN_NAMES:
+            preset = Presets.find_builtin(name)
+            application = apply_preset(
+                preset,
+                max_frequency=6_000_000_000,
+                valid_points=vna_app.vna.valid_datapoints,
+            )
+            before = vna_app.sweep.points
+            vna_app.apply_preset_application(application)
+            assert vna_app.sweep.points == preset.sweep.points, name
+            assert vna_app.vna.datapoints == preset.sweep.points, name
+            assert vna_app.sweep.start == preset.sweep.start, name
+            assert vna_app.sweep.end == preset.sweep.end, name
+            assert vna_app.sweep.segments == preset.sweep.segments, name
+            assert vna_app.sweep.properties.averages[0] == (
+                preset.sweep.averages
+            ), name
+            assert vna_app.sweep.points != before or before == (
+                preset.sweep.points
+            )
+
+    @staticmethod
+    def test_an_unsupported_point_count_is_refused_not_silently_sent(
+        vna_app,
+    ):
+        preset = Preset(
+            name="odd points",
+            sweep=SweepPreset(
+                start=1_000_000,
+                end=2_000_000,
+                points=12345,
+                segments=1,
+                averages=1,
+            ),
+        )
+        with pytest.raises(PresetValidationError):
+            apply_preset(
+                preset,
+                max_frequency=6_000_000_000,
+                valid_points=vna_app.vna.valid_datapoints,
+            )
+
+    @staticmethod
+    def test_the_point_count_applier_refuses_unsupported_counts(vna_app):
+        """Defence in depth: the applier is reachable without validation."""
+        vna_app.vna.datapoints = 101
+        vna_app.sweep.set_points(101)
+        assert vna_app._apply_point_count(12345) is False
+        assert vna_app.vna.datapoints == 101
+        assert vna_app.sweep.points == 101
+
+    @staticmethod
+    def test_applying_a_preset_never_connects(vna_app):
+        from NanoVNASaver import Presets
+
+        preset = Presets.find_builtin("Antenna tuning")
+        application = apply_preset(
+            preset,
+            max_frequency=6_000_000_000,
+            valid_points=vna_app.vna.valid_datapoints,
+        )
+        connected_before = vna_app.vna.connected()
+        vna_app.apply_preset_application(application)
+        assert vna_app.vna.connected() == connected_before
+
+
+class TestPresetAppliesChartsAndParameters:
+    """PRESET-02.1: a preset is a workflow, not just a frequency range.
+
+    Written after a real defect: applying a preset changed the sweep but left
+    the chart layout and the workflow parameters untouched, so applying the
+    cable preset produced a screen indistinguishable from before.
+    """
+
+    @staticmethod
+    def _layout(app):
+        cells = []
+        for index in range(app.charts_layout.count()):
+            item = app.charts_layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if widget is None:
+                continue
+            row, column, _rs, _cs = app.charts_layout.getItemPosition(index)
+            cells.append((row, column, widget.name))
+        return sorted(cells)
+
+    @staticmethod
+    def test_the_preset_charts_become_the_main_layout(vna_app):
+        from NanoVNASaver import Presets
+
+        preset = Presets.find_builtin("Cable testing")
+        application = apply_preset(
+            preset,
+            max_frequency=6_000_000_000,
+            valid_points=vna_app.vna.valid_datapoints,
+        )
+        vna_app.apply_preset_application(application)
+        assert [
+            cell[2]
+            for cell in TestPresetAppliesChartsAndParameters._layout(vna_app)
+        ] == list(preset.charts)
+
+    @staticmethod
+    def test_a_different_preset_replaces_the_layout(vna_app):
+        from NanoVNASaver import Presets
+
+        antenna = Presets.find_builtin("Antenna tuning")
+        cable = Presets.find_builtin("Cable testing")
+        for preset in (antenna, cable, antenna):
+            vna_app.apply_preset_application(
+                apply_preset(
+                    preset,
+                    max_frequency=6_000_000_000,
+                    valid_points=vna_app.vna.valid_datapoints,
+                )
+            )
+            names = [
+                cell[2]
+                for cell in TestPresetAppliesChartsAndParameters._layout(
+                    vna_app
+                )
+            ]
+            assert names == list(preset.charts), preset.name
+            assert len(names) == len(set(names)), "a chart was duplicated"
+
+    @staticmethod
+    def test_workflow_parameters_are_recorded(vna_app):
+        from NanoVNASaver import Presets
+
+        preset = Presets.find_builtin("Cable testing")
+        vna_app.apply_preset_application(
+            apply_preset(
+                preset,
+                max_frequency=6_000_000_000,
+                valid_points=vna_app.vna.valid_datapoints,
+            )
+        )
+        assert vna_app._preset_parameters["velocity_factor"] == 0.66
+        assert vna_app._preset_parameters["cable_length"] == 10.0
+        assert vna_app._preset_parameters["marker_count"] == 2
+
+    @staticmethod
+    def test_the_vswr_limit_reaches_the_analysis(vna_app):
+        from NanoVNASaver import Presets
+        from NanoVNASaver.Analysis.VSWRAnalysis import VSWRAnalysis
+
+        preset = Presets.find_builtin("Antenna tuning")
+        vna_app.apply_preset_application(
+            apply_preset(
+                preset,
+                max_frequency=6_000_000_000,
+                valid_points=vna_app.vna.valid_datapoints,
+            )
+        )
+        assert VSWRAnalysis.vswr_limit_value == pytest.approx(2.0)
+
+    @staticmethod
+    def test_the_analysis_kinds_are_recorded_as_enums(vna_app):
+        from NanoVNASaver import Presets
+        from NanoVNASaver.Analysis.Results import AnalysisKind
+
+        preset = Presets.find_builtin("Filter testing")
+        vna_app.apply_preset_application(
+            apply_preset(
+                preset,
+                max_frequency=6_000_000_000,
+                valid_points=vna_app.vna.valid_datapoints,
+            )
+        )
+        assert all(
+            isinstance(kind, AnalysisKind) for kind in vna_app._preset_analyses
+        )

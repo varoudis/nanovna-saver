@@ -249,10 +249,14 @@ class ReportWindow(QtWidgets.QWidget):
         traces = self.selected_traces()
         analyses = {}
         coverage = {}
+        parameters = dict(getattr(self.app, "_preset_parameters", {}))
+        if "vswr_limit" in parameters:
+            parameters["limit"] = parameters["vswr_limit"]
         for trace in traces:
             analyses[trace.id] = analyse_snapshot(
                 trace.snapshot,
                 analysis_kinds(trace),
+                parameters=parameters,
                 trace_id=trace.id,
                 trace_name=trace.name,
             )

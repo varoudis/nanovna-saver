@@ -20,6 +20,7 @@ import contextlib
 import logging
 import os
 import threading
+from dataclasses import replace
 from time import localtime, strftime
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -27,6 +28,7 @@ from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QWidget
 
 from .About import VERSION
+from .Analysis.Results import AnalysisKind
 from .Calibration import Calibration
 from .CalibrationCoverage import coverage_from_calibration
 from .Charts import (
@@ -63,7 +65,13 @@ from .Hardware.Hardware import Interface
 from .Hardware.VNA import VNA
 from .Marker.Delta import DeltaMarker
 from .Marker.Widget import Marker
-from .Measurement import snapshot_from_datapoints
+from .Measurement import (
+    S11,
+    S21,
+    CompletionState,
+    compute_calibration_identity,
+    snapshot_from_datapoints,
+)
 from .RFTools import corr_att_data
 from .Session import (
     SessionError,
@@ -85,7 +93,7 @@ from .SessionWorkflow import (
     write_recovery,
 )
 from .Settings.Bands import BandsModel
-from .Settings.Sweep import Sweep
+from .Settings.Sweep import Sweep, SweepMode
 from .SweepState import SweepState
 from .SweepWorker import SweepWorker
 from .Touchstone import Touchstone
@@ -112,9 +120,116 @@ WORKING_KILL_TIME_MS = 10 * 1000
 #: on a 60 Hz display; samples arriving faster are merged into the next paint.
 LIVE_REDRAW_INTERVAL_MS = 16
 
+#: Trace id used for the measurement currently displayed, when it is not one
+#: of the captured traces.
+LIVE_TRACE_ID = "trace-live"
+
 
 class Communicate(QObject):
     data_available = QtCore.Signal()
+
+
+def _displayed_trace_id(document, snapshots) -> str:
+    """Which archived trace supplied the displayed measurement.
+
+    Recorded in ``ui`` at save time; older sessions have no entry, in which
+    case the first trace is the best available answer.
+    """
+    recorded = (document.ui or {}).get("displayed_trace", "")
+    if recorded and recorded in snapshots:
+        return recorded
+    return next(iter(snapshots), "")
+
+
+def _displayed_snapshot_of(document, snapshots):
+    return snapshots.get(_displayed_trace_id(document, snapshots))
+
+
+def _unique_trace_id(base: str, taken) -> str:
+    """Return ``base`` or ``base-N``, whichever is free."""
+    used = set(taken)
+    if base not in used:
+        return base
+    index = 2
+    while f"{base}-{index}" in used:
+        index += 1
+    return f"{base}-{index}"
+
+
+def _matches_display(snapshot, s11, s21) -> bool:
+    """Whether ``snapshot`` still describes the samples on screen.
+
+    The acquisition's snapshot is authoritative only while the display it
+    was taken from is unchanged; capturing twice must never hand back the
+    same frozen object.
+    """
+    if not snapshot.available:
+        return False
+    for parameter, displayed in ((S11, s11), (S21, s21)):
+        points = snapshot.channel(parameter)
+        if not displayed:
+            if points:
+                return False
+            continue
+        if points is None or len(points) != len(displayed):
+            return False
+        if any(
+            point.freq != other.freq or point.z != other.z
+            for point, other in zip(points, displayed, strict=True)
+        ):
+            return False
+    return True
+
+
+def _analysis_kinds(stored) -> tuple[AnalysisKind, ...]:
+    """Normalize stored analysis kinds to enum members.
+
+    Sessions store the kind names; restoring them verbatim left strings that
+    later crashed on ``.name`` when the session was saved again.
+    """
+    kinds = []
+    for entry in stored or ():
+        if isinstance(entry, AnalysisKind):
+            kinds.append(entry)
+            continue
+        text = str(entry)
+        try:
+            kinds.append(AnalysisKind(text))
+            continue
+        except ValueError:
+            pass
+        # Sessions store the member *name* ("RESONANCE"), not its value.
+        try:
+            kinds.append(AnalysisKind[text.upper()])
+        except KeyError:
+            logger.warning("Ignoring unknown analysis kind %r", entry)
+    return tuple(kinds)
+
+
+def _snapshot_identity(snapshot) -> tuple:
+    """Content identity of a measurement, used to avoid saving it twice.
+
+    ``MeasurementSnapshot.id`` is freshly generated for every snapshot, so it
+    cannot tell whether the displayed measurement is already one of the
+    captured traces.  The samples themselves can.
+    """
+    return tuple(
+        (parameter, tuple((dp.freq, dp.re, dp.im) for dp in points))
+        for parameter, points in sorted(snapshot.corrected.items())
+    )
+
+
+def _sweep_mode(name: str) -> SweepMode:
+    """Map a preset's stored mode name onto :class:`SweepMode`.
+
+    An unknown name falls back to a single sweep rather than raising: a
+    preset is data from a file, and a stale label must not break applying it.
+    """
+    try:
+        return SweepMode[str(name).upper()]
+    except KeyError:
+        logger.warning("Unknown sweep mode %r; using SINGLE", name)
+        return SweepMode.SINGLE
 
 
 class NanoVNASaver(QWidget):
@@ -146,6 +261,10 @@ class NanoVNASaver(QWidget):
         self._coverage = None
         #: Last fully completed sweep, retained across a cancelled run.
         self._last_complete: tuple[list, list, str] | None = None
+        #: The acquisition's own snapshot, which carries calibration identity,
+        #: correction state and completion.  Capturing reconstructs nothing
+        #: from displayed samples when this is available.
+        self._live_snapshot = None
         self._redraw_timer: QtCore.QTimer | None = None
         #: Session workflow state (SESSION-03.1).
         self.session = SessionState(title="Untitled")
@@ -153,6 +272,12 @@ class NanoVNASaver(QWidget):
         #: One-shot continuation run when the next sweep completes
         #: successfully (SWEEP-04.3).
         self._after_sweep = None
+        #: Analysis kinds requested by the last applied preset.
+        self._preset_analyses: tuple = ()
+        #: Workflow parameters requested by the last applied preset.
+        self._preset_parameters: dict = {}
+        #: Cached device calibration state; never queried from a redraw.
+        self._device_calibration = "unknown"
 
         self.markers: list[Marker] = []
         self.marker_ref = False
@@ -170,9 +295,14 @@ class NanoVNASaver(QWidget):
         self.marker_control = MarkerControl(self)
         self.serial_control = SerialControl(self)
         self.trace_control = TraceControl(self)
+        # Capturing, importing, hiding or reordering a trace must repaint the
+        # overlays immediately; without this the charts only caught up on the
+        # next sweep (TRACE-02.1).
+        self.trace_control.updated.connect(self._trace_control_changed)
         self.serial_control.connected.connect(
             self.sweep_control.update_sweep_btn
         )
+        self.serial_control.connected.connect(self._on_connection_changed)
 
         self.bands: BandsModel = BandsModel()
 
@@ -717,6 +847,7 @@ class NanoVNASaver(QWidget):
             return
         self.saveData(list(sample.s11), list(sample.s21))
         snapshot = sample.snapshot
+        self._live_snapshot = snapshot
         self.mark_session_changed("sweep")
         if snapshot is not None:
             self.data.simulated = snapshot.simulated
@@ -813,6 +944,17 @@ class NanoVNASaver(QWidget):
         callback()
 
     def _remember_complete_sweep(self) -> None:
+        if self._live_snapshot is not None:
+            # Completion lives on the provenance, and a sweep that reached
+            # its final segment is complete even when the last sample was
+            # reported mid-grid.
+            self._live_snapshot = replace(
+                self._live_snapshot,
+                provenance=replace(
+                    self._live_snapshot.provenance,
+                    completion=CompletionState.COMPLETE,
+                ),
+            )
         with self.dataLock:
             self._last_complete = (
                 list(self.data.s11),
@@ -892,27 +1034,48 @@ class NanoVNASaver(QWidget):
             f" {state.value.replace('_', ' ')}"
         )
 
+    def _on_connection_changed(self, _connected: bool) -> None:
+        """Refresh device facts once per connection change, not per redraw."""
+        self.refresh_device_calibration_state()
+        self.refreshCoverage()
+
+    def refresh_device_calibration_state(self) -> str:
+        """Ask the device once where correction happens, and cache it.
+
+        ``getCalibration`` is a serial command: issuing it from
+        ``refreshCoverage`` - which runs on every redraw - blocked the GUI
+        thread for the round trip.  The answer is refreshed only when the
+        device connection changes or on an explicit action.
+        """
+        vna = getattr(self, "vna", None)
+        if vna is None or not getattr(vna, "connected", lambda: False)():
+            self._device_calibration = "unknown"
+            return self._device_calibration
+        try:
+            reported = vna.getCalibration()
+        except Exception:  # device refused to answer
+            logger.debug("Device calibration state unavailable", exc_info=True)
+            self._device_calibration = "unknown"
+            return self._device_calibration
+        if not reported:
+            self._device_calibration = "unknown"
+            return self._device_calibration
+        text = str(reported).lower()
+        if any(word in text for word in ("none", "off", "disabled", "empty")):
+            self._device_calibration = "application"
+        else:
+            self._device_calibration = "device"
+        return self._device_calibration
+
     def _correction_source_label(self) -> str:
         """Where correction happens; "unknown" without device metadata.
 
         CAL-02.4: the application can only state what it knows.  A device
         that reports its own calibration state is distinguished from one
-        that says nothing.
+        that says nothing.  Never performs I/O: the cached answer is set when
+        the connection opens or the user asks for a refresh.
         """
-        vna = getattr(self, "vna", None)
-        if vna is None or not getattr(vna, "connected", lambda: False)():
-            return "unknown"
-        try:
-            reported = vna.getCalibration()
-        except Exception:  # device refused to answer
-            logger.debug("Device calibration state unavailable", exc_info=True)
-            return "unknown"
-        if not reported:
-            return "unknown"
-        text = str(reported).lower()
-        if any(word in text for word in ("none", "off", "disabled", "empty")):
-            return "application"
-        return "device"
+        return getattr(self, "_device_calibration", "unknown")
 
     def setReference(self, s11=None, s21=None, source=None):
         if not s11:
@@ -1004,23 +1167,151 @@ class NanoVNASaver(QWidget):
     # ------------------------------------------------------------------
     # Presets (PRESET-02.5)
     # ------------------------------------------------------------------
+    def _apply_point_count(self, points: int) -> bool:
+        """Select the acquisition point count for the current device.
+
+        ``SweepControl.update_sweep`` derives the sweep's point count from
+        ``vna.datapoints``, so a preset or session asking for 401 points was
+        silently reverted to the device default (101) unless the device
+        selection itself changed.  The device is told first; a count the
+        device does not offer is logged and ignored rather than sent.
+        """
+        if points <= 0:
+            return False
+        supported = tuple(getattr(self.vna, "valid_datapoints", ()) or ())
+        if supported and points not in supported:
+            logger.warning(
+                "Device does not support %d points; keeping %d",
+                points,
+                self.vna.datapoints,
+            )
+            return False
+        self.vna.datapoints = int(points)
+        self.sweep.set_points(int(points))
+        self.sweep_control.update_sweep()
+        return True
+
     def apply_preset_application(self, application) -> None:
         """Apply a validated preset as one settings change.
 
-        Only the sweep span and segmentation are pushed into the UI.  The
-        preset never connects, disconnects or starts a sweep: the user still
-        has to ask for one.
+        The whole sweep configuration is applied - span, segmentation, point
+        count, averaging and mode - not just the span, so the applied setup is
+        the one the preset describes.  The preset never connects,
+        disconnects or starts a sweep: the user still has to ask for one.
         """
         sweep = application.sweep
-        self.sweep_control.set_start(sweep.start)
-        self.sweep_control.set_end(sweep.end)
-        self.sweep_control.set_segments(sweep.segments)
+        self._restoring = True
+        try:
+            self.sweep_control.set_start(sweep.start)
+            self.sweep_control.set_end(sweep.end)
+            self.sweep_control.set_segments(sweep.segments)
+            mode = _sweep_mode(sweep.mode)
+            self._apply_point_count(sweep.points)
+            self.sweep.set_mode(mode)
+            self.sweep.set_averages(
+                max(int(sweep.averages), 1), sweep.truncates
+            )
+            self.sweep.set_logarithmic(sweep.logarithmic)
+            sweep_window = self.windows.get("sweep")
+            if sweep_window is not None and hasattr(sweep_window, "refresh"):
+                sweep_window.refresh()
+        finally:
+            self._restoring = False
         # The analysis window drives the legacy per-algorithm analyses, whose
         # selectors do not map onto AnalysisKind, so there is no clean way to
-        # preselect them.  The requested kinds are recorded for the UI to
-        # report instead of being silently dropped.
+        # preselect them.  The requested kinds are recorded and reported
+        # instead of being silently dropped.
         self._preset_analyses = tuple(application.analysis_kinds)
+        self._preset_parameters = dict(application.parameters)
+        self.apply_preset_charts(application.preset.charts)
+        self.apply_preset_parameters(application.parameters)
+        self.sweep_control.update_center_span()
         self.mark_session_changed("sweep")
+
+    def apply_preset_charts(self, names) -> bool:
+        """Show the preset's charts in the main grid.
+
+        A preset describes a workflow, so the plots that workflow needs are
+        part of it; leaving the layout untouched made an applied preset look
+        like it had done nothing.
+        """
+        wanted = [str(name) for name in names or () if str(name)]
+        if not wanted:
+            return False
+        by_name = {chart.name: chart for chart in self.selectable_charts}
+        cells = [
+            (index, by_name[name])
+            for index, name in enumerate(wanted)
+            if name in by_name
+        ]
+        if not cells:
+            return False
+        # Removing while walking the layout shifts the indices and skips
+        # every other item, so collect first.
+        existing = [
+            item.widget()
+            for item in (
+                self.charts_layout.itemAt(index)
+                for index in range(self.charts_layout.count())
+            )
+            if item is not None and item.widget() is not None
+        ]
+        for widget in existing:
+            self.charts_layout.removeWidget(widget)
+            widget.hide()
+        for index, chart in cells:
+            row, column = divmod(index, 2)
+            target = chart
+            if chart.parent() is not None:
+                target = self.copyChart(chart)
+            self.charts_layout.addWidget(target, row, column)
+            target.show()
+        return True
+
+    def apply_preset_parameters(self, parameters) -> dict:
+        """Apply the workflow parameters a preset asks for.
+
+        Recorded in the session so the value that shaped a report can be
+        recovered; the values that drive analysis are applied where a live
+        control exists.
+        """
+        applied = {}
+        for key, value in dict(parameters or {}).items():
+            if key == "marker_count":
+                applied[key] = self._apply_marker_count(int(value))
+            elif key == "vswr_limit":
+                self._apply_vswr_limit(float(value))
+                applied[key] = float(value)
+            elif key == "velocity_factor":
+                self.windows["tdr"].set_velocity_factor(float(value))
+                applied[key] = float(value)
+            else:
+                applied[key] = value
+        return applied
+
+    def _apply_marker_count(self, count: int) -> int:
+        """Record how many markers the workflow wants.
+
+        Marker widgets are created once, from ``chart.marker_count`` at start
+        up, and have no per-marker visibility switch; showing a different
+        number therefore cannot be done without rebuilding the marker panel.
+        The figure is applied to the configuration for the next start and
+        reported, rather than silently ignored.
+        """
+        config = get_app_config().chart
+        target = max(1, min(int(count), config.MAX_MARKER_COUNT))
+        config.marker_count = target
+        return target
+
+    def _apply_vswr_limit(self, limit: float) -> None:
+        from .Analysis.VSWRAnalysis import VSWRAnalysis
+
+        VSWRAnalysis.vswr_limit_value = limit
+        analyses = self.windows["analysis"].analysis_list
+        for index in range(analyses.count()):
+            analysis = analyses.itemData(index)
+            if isinstance(analysis, VSWRAnalysis):
+                analysis.input_vswr_limit.setValue(limit)
 
     # ------------------------------------------------------------------
     # Session workflow (SESSION-03)
@@ -1055,13 +1346,19 @@ class NanoVNASaver(QWidget):
     def current_snapshot(self):
         """Freeze the *displayed* measurement, or ``None`` when there is none.
 
-        This must read the live buffers, not the trace collection: capture
-        and import both start from what is on screen, and returning a stored
-        trace here would make a second capture duplicate the first.
+        The acquisition's own snapshot is authoritative because it carries the
+        calibration identity, the correction state and the completion state;
+        rebuilding one from displayed samples would silently label a
+        calibrated, partial sweep as complete and uncorrected.  Only when no
+        acquisition or restored snapshot describes the displayed data is
+        a snapshot derived from the displayed samples.
         """
         with self.dataLock:
             s11 = list(self.data.s11)
             s21 = list(self.data.s21)
+        live = getattr(self, "_live_snapshot", None)
+        if live is not None and _matches_display(live, s11, s21):
+            return live
         if not s11 and not s21:
             return None
         return snapshot_from_datapoints(
@@ -1073,6 +1370,12 @@ class NanoVNASaver(QWidget):
             app_version=NanoVNASaver.version,
             source=self.sweepSource,
         )
+
+    def _trace_control_changed(self, _control=None) -> None:
+        """Repaint trace overlays after a trace action (TRACE-02.1)."""
+        self.refresh_trace_charts()
+        for chart in self.subscribing_charts:
+            chart.update()
 
     def refresh_trace_charts(self) -> None:
         """Push the visible traces into every multi-trace chart."""
@@ -1099,50 +1402,146 @@ class NanoVNASaver(QWidget):
             },
             title=title or self.session.title or "Untitled",
             app_version=NanoVNASaver.version,
-            selected_trace=trace_ids[0] if trace_ids else "",
+            selected_trace=(
+                collection.reference.id
+                if collection.reference is not None
+                else (trace_ids[0] if trace_ids else "")
+            ),
+            markers=self.marker_state(),
             sweep=self.sweep_info_dict(),
             charts=self.chart_state_dict(),
+            analysis={
+                "kinds": [kind.name for kind in self._preset_analyses],
+                "parameters": dict(self._preset_parameters),
+            },
+            calibration=self.calibration_state(),
+            calibration_files=self.calibration_file_state(),
+            ui=self.ui_state(trace_ids),
+        )
+
+    def ui_state(self, trace_ids=None) -> dict:
+        """View state that is part of the experiment, not of the settings.
+
+        Records which trace supplied the displayed measurement so reopening
+        shows it instead of the oldest trace in the archive.
+        """
+        ids = list(trace_ids if trace_ids is not None else [])
+        if not ids:
+            return {"displayed_trace": ""}
+        return {"displayed_trace": self._last_displayed_id}
+
+    def marker_state(self) -> list[dict]:
+        """Serializable marker positions (SESSION-01.2)."""
+        return [
+            {
+                "index": index,
+                "frequency": int(marker.freq),
+                "color": marker.color.name(),
+            }
+            for index, marker in enumerate(self.markers)
+            if marker.freq
+        ]
+
+    def calibration_state(self) -> dict:
+        """Identity and provenance of the loaded calibration."""
+        calibration = self.calibration
+        try:
+            identity = compute_calibration_identity(calibration)
+        except Exception:  # an incomplete calibration has no identity
+            logger.debug("No calibration identity available", exc_info=True)
+            identity = ""
+        dataset = getattr(calibration, "dataset", None)
+        frequencies = dataset.frequencies() if dataset is not None else []
+        return {
+            "identity": identity,
+            "source": getattr(calibration, "source", "") or "",
+            "notes": "\n".join(getattr(calibration, "notes", []) or []),
+            "valid_one_port": bool(
+                getattr(calibration, "isValid1Port", lambda: False)()
+            ),
+            "valid_two_port": bool(
+                getattr(calibration, "isValid2Port", lambda: False)()
+            ),
+            "start": frequencies[0] if frequencies else 0,
+            "end": frequencies[-1] if frequencies else 0,
+            "points": len(frequencies),
+        }
+
+    def calibration_file_state(self) -> dict:
+        """Verbatim calibration text, so a session can restore corrections."""
+        calibration = self.calibration
+        if not getattr(calibration, "isValid1Port", lambda: False)():
+            return {}
+        dataset = getattr(calibration, "dataset", None)
+        if dataset is None:
+            return {}
+        try:
+            return {"loaded.cal": str(dataset)}
+        except Exception:  # unrepresentable calibration stays out of the file
+            logger.warning("Unable to serialize the calibration", exc_info=True)
+            return {}
+
+    def _displayed_snapshot(self):
+        """Snapshot of what is currently on screen, or ``None``.
+
+        The acquisition's own snapshot is preferred: it carries calibration
+        identity, correction state and completion, which a reconstruction
+        from displayed samples cannot recover.
+        """
+        with self.dataLock:
+            s11 = list(self.data.s11)
+            s21 = list(self.data.s21)
+        live = getattr(self, "_live_snapshot", None)
+        if live is not None and _matches_display(live, s11, s21):
+            return live
+        if not s11 and not s21:
+            return None
+        return snapshot_from_datapoints(
+            s11 or None,
+            s21 or None,
+            name=self.sweepSource or "measurement",
+            simulated=getattr(self.data, "simulated", False),
+            simulator_scenario=getattr(self.data, "simulated_scenario", ""),
+            app_version=NanoVNASaver.version,
+            source=self.sweepSource,
         )
 
     def _current_snapshots(self):
         """Every snapshot the session must preserve, never a partial sweep.
 
-        Captured traces come first, in display order, so a session always
-        brings the experiment back (SESSION-01.2).  When nothing was
-        captured, the displayed measurement is saved instead, so a plain
-        sweep can still be reopened; it is not saved alongside traces
-        because it would then appear twice in the list.
+        Captured traces come first, in display order (SESSION-01.2), followed
+        by the measurement currently on screen.  The displayed measurement is
+        included even when captured traces exist: a sweep taken after the last
+        capture is part of the experiment, and dropping it silently lost work.
+        It is not duplicated when it is already one of the captured traces.
         """
         collection = self.trace_control.collection
         snapshots = []
         trace_ids = []
+        seen = {}
         for trace_id in collection.ordered_ids():
             trace = collection.get(trace_id)
             if trace is None:
                 continue
             snapshots.append(trace.snapshot)
             trace_ids.append(trace_id)
-        if snapshots:
-            return snapshots, trace_ids
+            seen.setdefault(_snapshot_identity(trace.snapshot), trace_id)
 
-        with self.dataLock:
-            s11 = list(self.data.s11)
-            s21 = list(self.data.s21)
-        if s11 or s21:
-            snapshots.append(
-                snapshot_from_datapoints(
-                    s11 or None,
-                    s21 or None,
-                    name=self.sweepSource or "measurement",
-                    simulated=getattr(self.data, "simulated", False),
-                    simulator_scenario=getattr(
-                        self.data, "simulated_scenario", ""
-                    ),
-                    app_version=NanoVNASaver.version,
-                    source=self.sweepSource,
-                )
-            )
-            trace_ids.append("trace-0")
+        self._last_displayed_id = ""
+        displayed = self._displayed_snapshot()
+        if displayed is not None:
+            identity = _snapshot_identity(displayed)
+            if identity in seen:
+                self._last_displayed_id = seen[identity]
+            else:
+                snapshots.append(displayed)
+                # The archive is a mapping keyed by trace id, so a reopened
+                # session that already holds a restored ``trace-live`` would
+                # have its newest measurement overwrite that entry - or be
+                # overwritten by it.  Use a fresh id instead.
+                trace_id = _unique_trace_id(LIVE_TRACE_ID, trace_ids)
+                trace_ids.append(trace_id)
+                self._last_displayed_id = trace_id
         return snapshots, trace_ids
 
     def sweep_info_dict(self) -> dict:
@@ -1154,23 +1553,91 @@ class NanoVNASaver(QWidget):
             "segments": sweep.segments,
             "mode": sweep.properties.mode.name,
             "averages": sweep.properties.averages[0],
+            "truncates": sweep.properties.averages[1],
+            "logarithmic": bool(sweep.properties.logarithmic),
         }
 
     def chart_state_dict(self) -> dict:
-        return {
-            "s11": sorted(self.charts.get("s11", {})),
-            "s21": sorted(self.charts.get("s21", {})),
-            "combined": sorted(self.charts.get("combined", {})),
-        }
+        """The charts actually on screen, by name, in grid order.
+
+        Recording the catalogue instead described what *could* be shown, so
+        reopening a session never restored the layout.
+        """
+        cells = []
+        for index in range(self.charts_layout.count()):
+            item = self.charts_layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if widget is None or widget.isHidden():
+                continue
+            row, column, _row_span, _column_span = (
+                self.charts_layout.getItemPosition(index)
+            )
+            cells.append({"row": row, "column": column, "name": widget.name})
+        cells.sort(key=lambda cell: (cell["row"], cell["column"]))
+        return {"cells": cells}
+
+    def apply_chart_state(self, state) -> bool:
+        """Show the saved chart layout; return whether anything was applied."""
+        if "cells" not in (state or {}):
+            return False
+        cells = state["cells"] or []
+        by_name = {chart.name: chart for chart in self.selectable_charts}
+        # The saved layout replaces the current layout, including cells that
+        # no longer exist. Keep the widgets alive for future chart selection.
+        while self.charts_layout.count():
+            item = self.charts_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().hide()
+        for cell in cells:
+            name = str(cell.get("name", ""))
+            chart = by_name.get(name)
+            if chart is None:
+                logger.warning("Session chart %r is not available", name)
+                continue
+            row = int(cell.get("row", 0))
+            column = int(cell.get("column", 0))
+            # Repeated chart names need independent widgets. Charts owned by
+            # another window (notably TDR) must remain in that window as well.
+            parent = chart.parentWidget()
+            if self.charts_layout.indexOf(chart) > -1 or (
+                parent is not None
+                and parent is not self.charts_layout.parentWidget()
+            ):
+                chart = self.copyChart(chart)
+            self.charts_layout.addWidget(chart, row, column)
+            chart.show()
+        return True
 
     def action_new_session(self) -> None:
+        """Start an empty experiment (SESSION-03).
+
+        Everything that belongs to the previous experiment is cleared: the
+        displayed data, the reference, the captured traces, the
+        calibration-derived state and the remembered complete sweep.  Leaving
+        any of it behind both leaked the old experiment into the new session
+        and immediately marked the fresh session dirty.
+        """
         if not self._confirm_discard():
             return
         discard_recovery(self.session)
         self.session.reset(title="Untitled")
-        self.data = Touchstone()
-        self.ref_data = Touchstone()
-        self.resetReference()
+        self._restoring = True
+        try:
+            self.data = Touchstone()
+            self.ref_data = Touchstone()
+            self.resetReference()
+            self.trace_control.collection.clear()
+            self.trace_control.refresh()
+            self._last_complete = None
+            self._live_snapshot = None
+            self._coverage = None
+            self._after_sweep = None
+            self._preset_analyses = ()
+            self._preset_parameters = {}
+            self.sweepSource = ""
+        finally:
+            self._restoring = False
+        self.refreshCoverage()
         self.dataUpdated()
         self.update_session_title()
 
@@ -1276,7 +1743,11 @@ class NanoVNASaver(QWidget):
         self._restoring = True
         try:
             snapshots = document_snapshots(document)
-            first = next(iter(snapshots.values()), None)
+            # The session records which trace was displayed; reopening must
+            # show that measurement, not whichever trace happens to be first
+            # in the archive.
+            first = _displayed_snapshot_of(document, snapshots)
+            self._live_snapshot = first
             with self.dataLock:
                 if first is None:
                     self.data.s11 = []
@@ -1289,6 +1760,17 @@ class NanoVNASaver(QWidget):
                         first.provenance.simulator_scenario or ""
                     )
             self._restore_traces(document, snapshots)
+            self._restore_markers(document)
+            self._restore_sweep(document)
+            self._restore_calibration(document)
+            self.apply_chart_state(document.charts)
+            self._preset_analyses = _analysis_kinds(
+                document.analysis.get("kinds")
+            )
+            self._preset_parameters = dict(
+                document.analysis.get("parameters") or {}
+            )
+            self.apply_preset_parameters(self._preset_parameters)
             self.sweepSource = document.title or ""
             recovery = find_recovery_for(self.session.filename)
             if recovery:
@@ -1296,6 +1778,73 @@ class NanoVNASaver(QWidget):
         finally:
             self._restoring = False
         self.dataUpdated()
+
+    def _restore_markers(self, document) -> None:
+        """Restore marker frequencies (SESSION-01.2)."""
+        for marker in self.markers:
+            marker.freq = 0
+        for entry in document.markers:
+            index = int(entry.get("index", -1))
+            if not 0 <= index < len(self.markers):
+                continue
+            frequency = int(entry.get("frequency", 0))
+            if frequency <= 0:
+                continue
+            marker = self.markers[index]
+            marker.frequencyInput.setText(str(frequency))
+            marker.freq = frequency
+            color = entry.get("color")
+            if color:
+                with contextlib.suppress(ValueError):
+                    marker.setColor(QtGui.QColor(color))
+        for marker in self.markers:
+            marker.findLocation(self.data.s11)
+
+    def _restore_sweep(self, document) -> None:
+        """Restore the saved sweep settings without touching a device."""
+        sweep = document.sweep
+        if not sweep:
+            return
+        start = int(sweep.get("start", 0))
+        end = int(sweep.get("end", 0))
+        if start <= 0 or end <= start:
+            return
+        self.sweep_control.set_start(start)
+        self.sweep_control.set_end(end)
+        self.sweep_control.set_segments(max(int(sweep.get("segments", 1)), 1))
+        self._apply_point_count(int(sweep.get("points", 0)))
+        self.sweep.set_mode(_sweep_mode(str(sweep.get("mode", "SINGLE"))))
+        self.sweep.set_averages(
+            max(int(sweep.get("averages", 1)), 1),
+            int(sweep.get("truncates", 0)),
+        )
+        self.sweep.set_logarithmic(bool(sweep.get("logarithmic", False)))
+        self.sweep_control.update_center_span()
+
+    def _restore_calibration(self, document) -> None:
+        """Reload the session's own calibration text, if it carried one."""
+        text = (document.calibration_files or {}).get("loaded.cal", "")
+        if not text:
+            return
+        calibration = Calibration()
+        try:
+            calibration.dataset = calibration.dataset.from_str(text)
+            calibration.notes = calibration.dataset.notes.splitlines()
+            calibration.calc_corrections()
+        except (ValueError, KeyError, IndexError):
+            logger.warning(
+                "Session calibration could not be rebuilt", exc_info=True
+            )
+            return
+        self.calibration = calibration
+        expected = document.calibration.get("identity", "")
+        actual = compute_calibration_identity(calibration)
+        if expected and actual and expected != actual:
+            logger.warning(
+                "Session calibration identity changed: %s -> %s",
+                expected,
+                actual,
+            )
 
     def _restore_traces(self, document, snapshots) -> None:
         """Rebuild the trace list from a document (SESSION-03.4).
@@ -1306,7 +1855,7 @@ class NanoVNASaver(QWidget):
         """
         collection = self.trace_control.collection
         collection.clear()
-        displayed = next(iter(snapshots), "")
+        displayed = _displayed_trace_id(document, snapshots)
         for entry in document.traces:
             trace_id = entry.get("trace_id", "")
             snapshot = snapshots.get(trace_id)

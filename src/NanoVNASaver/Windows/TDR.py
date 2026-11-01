@@ -212,6 +212,25 @@ class TDRWindow(QtWidgets.QWidget):
         self.app.tdr_chart.resetDisplayLimits()
         self.updateTDR()
 
+    def set_velocity_factor(self, factor: float) -> None:
+        """Apply a preset/session value without a stale cable selection."""
+        if not 0 < factor <= 1:
+            raise ValueError("Velocity factor must be in (0, 1]")
+        dropdown = self.tdr_velocity_dropdown
+        field = self.tdr_velocity_input
+        dropdown_blocked = dropdown.blockSignals(True)
+        field_blocked = field.blockSignals(True)
+        try:
+            index = dropdown.findData(factor)
+            dropdown.setCurrentIndex(
+                index if index >= 0 else dropdown.findData(-1)
+            )
+            field.setText(str(factor))
+        finally:
+            dropdown.blockSignals(dropdown_blocked)
+            field.blockSignals(field_blocked)
+        self.updateTDR()
+
     def updateTDR(self):
         TDR_format = self.format_dropdown.currentText()
         TDR_window = self.window_dropdown.currentData()
