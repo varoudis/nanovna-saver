@@ -23,7 +23,12 @@ import unittest
 from NanoVNASaver.RFTools import Datapoint
 
 # Import targets to be tested
-from NanoVNASaver.Touchstone import Options, Touchstone
+from NanoVNASaver.Touchstone import (
+    FrequencyMismatchError,
+    MissingParameterError,
+    Options,
+    Touchstone,
+)
 
 
 class TestTouchstoneOptions(unittest.TestCase):
@@ -180,18 +185,23 @@ class TestTouchstoneTouchstone(unittest.TestCase):
 
     def test_save(self):
         ts = Touchstone("./tests/data/valid.s2p")
-        self.assertEqual(ts.saves(), "# HZ S RI R 50\n")
+        # An empty dataset has no S11 and must be rejected, not written.
+        self.assertRaises(MissingParameterError, ts.saves)
         ts.load()
         lines = ts.saves().splitlines()
-        self.assertEqual(len(lines), 1021)
-        self.assertEqual(lines[0], "# HZ S RI R 50")
-        self.assertEqual(lines[1], "500000 -0.333238 0.000180018")
+        comments = [ln for ln in lines if ln.startswith("!")]
+        self.assertEqual(len(lines) - len(comments), 1021)
+        self.assertEqual(lines[len(comments)], "# HZ S RI R 50")
+        self.assertEqual(
+            lines[len(comments) + 1], "500000 -0.333238 0.000180018"
+        )
         self.assertEqual(lines[-1], "900000000 -0.127646 0.31969")
         lines = ts.saves(4).splitlines()
-        self.assertEqual(len(lines), 1021)
-        self.assertEqual(lines[0], "# HZ S RI R 50")
+        comments = [ln for ln in lines if ln.startswith("!")]
+        self.assertEqual(len(lines) - len(comments), 1021)
+        self.assertEqual(lines[len(comments)], "# HZ S RI R 50")
         self.assertEqual(
-            lines[1],
+            lines[len(comments) + 1],
             "500000 -0.333238 0.000180018 0.67478 -8.1951e-07"
             " 0.67529 -8.20129e-07 -0.333238 0.000308078",
         )
@@ -210,3 +220,4 @@ class TestTouchstoneTouchstone(unittest.TestCase):
         self.assertRaisesRegex(
             LookupError, "Frequencies of sdata not correlated", ts.saves, 4
         )
+        self.assertRaises(FrequencyMismatchError, ts.saves, 4)
