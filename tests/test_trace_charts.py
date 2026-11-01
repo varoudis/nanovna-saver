@@ -256,3 +256,134 @@ class TestChartAudit:
 
         control = TraceControl(FakeApp())
         assert "TDR" in control.label_limit.text()
+
+
+class TestTraceUpdatesReachTheCharts:
+    """TRACE-02.1: a trace action repaints immediately.
+
+    Written after a real defect: the trace control's ``updated`` signal was
+    never connected, so capturing, hiding or importing a trace changed no
+    chart until the next sweep arrived.
+    """
+
+    @staticmethod
+    def _window(qt_app):
+        from NanoVNASaver.NanoVNASaver import NanoVNASaver
+
+        return NanoVNASaver()
+
+    @staticmethod
+    def test_capturing_a_trace_pushes_it_into_the_charts(qt_app):
+        window = TestTraceUpdatesReachTheCharts._window(qt_app)
+        try:
+            window.data.s11 = [
+                Datapoint(1_000_000 + index * 1_000, 0.4, 0.1)
+                for index in range(5)
+            ]
+            window.data.s21 = []
+            window.trace_control.capture_current()
+
+            assert window.trace_control.collection.ordered_ids()
+            drawn = [
+                series
+                for chart in window.s11charts
+                for series in getattr(chart, "traces", [])
+            ]
+            assert drawn, "captured trace never reached the charts"
+            assert len(drawn[0][2]) == 5
+        finally:
+            window.worker.quit()
+
+    @staticmethod
+    def test_the_signal_is_connected_once(qt_app):
+        from NanoVNASaver.NanoVNASaver import NanoVNASaver
+
+        window = NanoVNASaver()
+        try:
+            handled = []
+            window.trace_control.updated.disconnect()
+            window.trace_control.updated.connect(
+                lambda _control=None: handled.append(1)
+            )
+            window.trace_control.refresh()
+            window.trace_control.updated.emit(window.trace_control)
+            assert handled == [1]
+        finally:
+            window.worker.quit()
+
+
+class TestOverlaysOnEverySquareChart:
+    """TRACE-02.2: Smith and polar plots draw overlays too.
+
+    Written after a real defect: ``SquareChart.drawValues`` returned early
+    when the primary data was empty, so a Smith chart with only overlays
+    rendered nothing - the one plot where overlays matter most.
+    """
+
+    @staticmethod
+    def _render(chart):
+        from PySide6 import QtGui
+
+        image = QtGui.QImage(
+            max(chart.width(), 64),
+            max(chart.height(), 64),
+            QtGui.QImage.Format.Format_ARGB32,
+        )
+        image.fill(QtGui.QColor("black"))
+        painter = QtGui.QPainter(image)
+        chart.drawValues(painter)
+        painter.end()
+        return image
+
+    @staticmethod
+    def _non_black(image):
+        count = 0
+        for y in range(image.height()):
+            for x in range(image.width()):
+                if image.pixelColor(x, y) != image.pixelColor(0, 0):
+                    count += 1
+        return count
+
+    @staticmethod
+    def test_smith_draws_overlays_without_primary_data(qt_app):
+        from NanoVNASaver.Charts.Smith import SmithChart
+
+        chart = SmithChart("S11")
+        chart.resize(200, 200)
+        chart.data = []
+        chart.reference = []
+        chart.setTraces(
+            [
+                (
+                    "trace-1",
+                    "#ff0000",
+                    [Datapoint(1e6 + i * 1e5, 0.4, 0.1) for i in range(20)],
+                )
+            ]
+        )
+        assert TestOverlaysOnEverySquareChart._non_black(
+            TestOverlaysOnEverySquareChart._render(chart)
+        )
+        chart.deleteLater()
+
+    @staticmethod
+    def test_polar_draws_overlays_without_primary_data(qt_app):
+        from NanoVNASaver.Charts.Polar import PolarChart
+
+        chart = PolarChart("S11")
+        chart.resize(200, 200)
+        chart.data = []
+        chart.reference = []
+        chart.setTraces(
+            [
+                (
+                    "trace-1",
+                    "#00ff00",
+                    [Datapoint(1e6 + i * 1e5, 0.4, 0.1) for i in range(20)],
+                )
+            ]
+        )
+        assert TestOverlaysOnEverySquareChart._non_black(
+            TestOverlaysOnEverySquareChart._render(chart)
+        )
+        chart.deleteLater()

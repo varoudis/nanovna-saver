@@ -383,3 +383,67 @@ class TestComparisonCache:
         cache.get(first, second, "S11", ComparisonKind.COMPLEX)
         cache.invalidate(first.id)
         assert cache._entries == {}
+
+
+class TestComparisonAcrossDifferentGrids:
+    """TRACE-04.1: overlap is a span, not a shared grid.
+
+    Written after a real defect: comparison required at least one *identically
+    sampled* frequency, so two traces on offset grids (a very common case when
+    a sweep's start or point count changed) were reported as having no
+    overlapping frequencies even though their spans overlapped completely.
+    """
+
+    @staticmethod
+    def _pair(source_freqs, reference_freqs):
+        collection = TraceCollection()
+        reference = collection.add(
+            _snapshot(_flat(reference_freqs, 0.1), name="ref"), name="ref"
+        )
+        source = collection.add(
+            _snapshot(_flat(source_freqs, 0.1), name="src"), name="src"
+        )
+        return source, reference
+
+    @staticmethod
+    def test_offset_grids_are_comparable():
+        source, reference = TestComparisonAcrossDifferentGrids._pair(
+            [100, 200, 300], [150, 250, 350]
+        )
+        result = compare_traces(source, reference, kind=ComparisonKind.COMPLEX)
+        assert result.available
+        freqs = [point.freq for point in result.points]
+        # The reference trace's own grid, clipped to the shared span
+        # [max(min), min(max)] = [150, 300].
+        assert freqs == [150, 250]
+        assert all(abs(point.scalar) < 1e-9 for point in result.points)
+
+    @staticmethod
+    def test_no_shared_frequency_is_not_a_failure():
+        source, reference = TestComparisonAcrossDifferentGrids._pair(
+            [1_000_000, 1_100_000, 1_200_000],
+            [1_050_000, 1_150_000, 1_250_000],
+        )
+        result = compare_traces(source, reference, kind=ComparisonKind.COMPLEX)
+        assert result.available
+        assert result.points
+
+    @staticmethod
+    def test_disjoint_spans_are_still_unavailable():
+        source, reference = TestComparisonAcrossDifferentGrids._pair(
+            [900, 950], [100, 200, 300]
+        )
+        result = compare_traces(source, reference, kind=ComparisonKind.COMPLEX)
+        assert not result.available
+        assert "overlapping" in result.unavailable_reason
+
+    @staticmethod
+    def test_only_the_shared_span_is_compared():
+        source, reference = TestComparisonAcrossDifferentGrids._pair(
+            [100, 200, 300, 400], [250, 350, 450]
+        )
+        result = compare_traces(source, reference, kind=ComparisonKind.COMPLEX)
+        assert result.available
+        # Reference grid [250, 350, 450] clipped to the shared span
+        # [250, 400]: 450 is outside the source's data and is not used.
+        assert [point.freq for point in result.points] == [250, 350]

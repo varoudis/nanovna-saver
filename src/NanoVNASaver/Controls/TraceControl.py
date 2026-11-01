@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from PySide6 import QtGui, QtWidgets
 
+from ..Measurement import SPARAMETERS as PARAMETERS
 from ..Traces import (
     ComparisonCache,
     ComparisonKind,
@@ -249,20 +250,32 @@ class TraceControl(Control):
         filename, _selected = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Import a Touchstone file as a trace",
-            self.app.app_config.save_directory,
+            "",
             "Touchstone Files [s1p, s2p] (*.s1p *.s2p *.S1P *.S2P)",
         )
         if not filename:
             return
+        self.import_path(filename)
+
+    def import_path(self, filename: str) -> bool:
+        """Import one Touchstone file as a frozen trace.
+
+        Returns ``True`` when a trace was added.  ``Touchstone.load`` logs
+        unreadable files instead of raising, so the loaded channels are
+        checked rather than trusting the call to fail loudly.
+        """
         from ..Measurement import snapshot_from_touchstone
         from ..Touchstone import Touchstone
 
         touchstone = Touchstone(filename)
         try:
-            touchstone.read()
+            touchstone.load()
         except (OSError, ValueError, IndexError) as error:
             self.app.showError(f"Could not read {filename}:\n{error}")
-            return
+            return False
+        if not any(touchstone.channel(parameter) for parameter in PARAMETERS):
+            self.app.showError(f"{filename} contained no S-parameter data.")
+            return False
         snapshot = snapshot_from_touchstone(
             touchstone,
             name=os.path.basename(filename),
@@ -273,7 +286,7 @@ class TraceControl(Control):
         )
         if not snapshot.available:
             self.app.showError(f"{filename} contained no S-parameter data.")
-            return
+            return False
         self.collection.add(
             snapshot,
             name=os.path.basename(filename),
@@ -282,6 +295,7 @@ class TraceControl(Control):
         self.app.mark_session_changed("trace_imported")
         self.refresh()
         self.updated.emit(self)
+        return True
 
     def rename_selected(self) -> None:
         trace_id = self.selected_id()

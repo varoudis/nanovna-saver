@@ -84,13 +84,19 @@ class SquareChart(Chart):
             prev_x, prev_y = x, y
 
     def drawValues(self, qp: QtGui.QPainter):
-        if not (self.data or self.reference):
+        if not (self.data or self.reference or self.traces):
             return
         self.draw_data(qp, Chart.color.sweep, self.data)
 
         fstart = self.data[0].freq if self.data else 0
         fstop = self.data[-1].freq if self.data else 0
         self.draw_data(qp, Chart.color.reference, self.reference, fstart, fstop)
+
+        # Additional traces (TRACE-02.2): a Smith or polar plot is where an
+        # overlay is most useful, so refusing to draw them here would make
+        # the multi-trace feature silently chart-dependent.
+        for _name, color, points in self.traces:
+            self.draw_data(qp, QtGui.QColor(color), points)
 
         for m in self.markers:
             if m.location != -1 and m.location < len(self.data):

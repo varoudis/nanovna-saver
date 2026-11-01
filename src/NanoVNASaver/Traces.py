@@ -489,9 +489,19 @@ def compare_traces(
     reference_points = reference.channel(parameter, corrected)
     source_freqs = {dp.freq for dp in source_points}
     reference_freqs = {dp.freq for dp in reference_points}
-    overlap = sorted(source_freqs & reference_freqs)
 
-    if not overlap:
+    # Hoist the bounds: recomputing min/max per frequency is O(n^2) and made
+    # a 10,000-point comparison take over a second (TRACE-04.2).
+    source_min = min(source_freqs)
+    source_max = max(source_freqs)
+    reference_min = min(reference_freqs)
+    reference_max = max(reference_freqs)
+
+    # Overlap is about *spans*, not shared grid points.  Two traces sampled
+    # on different grids (say 100/200/300 and 150/250/350 Hz) overlap over
+    # 150-300 Hz and can be compared by interpolation; requiring an exact
+    # frequency match wrongly reported "no overlapping frequencies".
+    if source_max < reference_min or reference_max < source_min:
         return _unavailable(
             kind,
             parameter,
@@ -503,13 +513,9 @@ def compare_traces(
     # Compare on the reference trace's grid, restricted to the span where
     # the source also has data.  Nothing outside that intersection is used,
     # so no value is ever extrapolated.
-    # Hoist the bounds: recomputing min/max per frequency is O(n^2) and made
-    # a 10,000-point comparison take over a second (TRACE-04.2).
-    source_min = min(source_freqs)
-    source_max = max(source_freqs)
-    grid = sorted(
-        freq for freq in reference_freqs if source_min <= freq <= source_max
-    )
+    low = max(source_min, reference_min)
+    high = min(source_max, reference_max)
+    grid = sorted(freq for freq in reference_freqs if low <= freq <= high)
     if not grid:
         return _unavailable(
             kind,
