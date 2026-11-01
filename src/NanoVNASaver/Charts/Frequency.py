@@ -32,7 +32,7 @@ from ..Formatting import (
 )
 from ..RFTools import Datapoint
 from ..SITools import Format, Value
-from .Chart import Chart, ChartPosition
+from .Chart import Chart, ChartPosition, coverage_label
 
 logger = logging.getLogger(__name__)
 
@@ -548,9 +548,13 @@ class FrequencyChart(Chart):
 
         self._set_start_stop()
 
-        # Draw bands if required
-        if self.bands.enabled:
+        # Draw bands if required; a chart without bands (for example one
+        # created outside the main window) simply has none to draw.
+        if self.bands is not None and self.bands.enabled:
             self.drawBands(qp, self.fstart, self.fstop)
+
+        # CAL-02.2: mark regions the calibration does not actually cover.
+        self.drawCalibrationCoverage(qp, self.fstart, self.fstop)
 
         min_value, max_value = self._find_scaling()
         self.maxValue = max_value
@@ -595,8 +599,11 @@ class FrequencyChart(Chart):
         self.drawFrequencyTicks(qp)
 
         self.drawData(qp, self.data, Chart.color.sweep)
+        for _name, color, points in self.traces:
+            self.drawData(qp, points, QtGui.QColor(color))
         self.drawData(qp, self.reference, Chart.color.reference)
         self.drawMarkers(qp)
+        self.drawTraceLegend(qp)
 
     def _find_scaling(self) -> tuple[float, float]:
         min_value = self.minDisplayValue / 10e11
@@ -675,6 +682,92 @@ class FrequencyChart(Chart):
             qp.drawRect(
                 x_start, self.topMargin, x_stop - x_start, self.dim.height
             )
+
+    def drawTraceLegend(self, qp) -> None:
+        """Name each drawn trace (TRACE-02.1).
+
+        Two traces can share a span but not a channel, so the legend is the
+        only place a reader learns which curve is which.
+        """
+        if not self.traces:
+            return
+        qp.save()
+        metrics = QtGui.QFontMetricsF(self.font())
+        x = self.leftMargin + 4
+        y = self.topMargin + 10
+        for name, color, _points in self.traces:
+            width = metrics.boundingRect(name).width()
+            if x + width + 24 > self.leftMargin + self.dim.width:
+                x = self.leftMargin + 4
+                y += 12
+            if y > self.topMargin + self.dim.height - 4:
+                break
+            qp.setPen(QtGui.QPen(QtGui.QColor(color)))
+            qp.drawLine(x, y - 3, x + 8, y - 3)
+            qp.setPen(Chart.color.text)
+            qp.drawText(round(x + 11), round(y), name)
+            x += width + 26
+        qp.restore()
+
+    def drawCalibrationCoverage(self, qp, fstart: int, fstop: int) -> None:
+        """Shade the parts of the span the active calibration does not cover.
+
+        Only *coverage* is shown.  This is deliberately not an uncertainty
+        estimate: it says where corrections were interpolated or held at a
+        calibration edge, nothing about calibration age or connector state.
+        """
+        coverage = self.coverage
+        if coverage is None or fstop <= fstart:
+            return
+        calibrated_start = coverage.calibrated_start
+        calibrated_end = coverage.calibrated_end
+        if calibrated_start is None or calibrated_end is None:
+            gaps = [(fstart, fstop)]
+        else:
+            gaps = []
+            if fstart < calibrated_start:
+                gaps.append((fstart, min(calibrated_start, fstop)))
+            if fstop > calibrated_end:
+                gaps.append((max(calibrated_end, fstart), fstop))
+        if not gaps:
+            return
+
+        shade = QtGui.QColor(Chart.color.sweep)
+        shade.setAlpha(28)
+        qp.save()
+        qp.setBrush(shade)
+        qp.setPen(QtGui.QPen(Qt.PenStyle.NoPen))
+        for gap_start, gap_end in gaps:
+            if gap_end <= gap_start:
+                continue
+            x_start = max(
+                self.leftMargin + 1,
+                self.getXPosition(Datapoint(gap_start, 0, 0)),
+            )
+            x_stop = min(
+                self.leftMargin + self.dim.width,
+                self.getXPosition(Datapoint(gap_end, 0, 0)),
+            )
+            if x_stop > x_start:
+                qp.drawRect(
+                    x_start,
+                    self.topMargin,
+                    x_stop - x_start,
+                    self.dim.height,
+                )
+
+        # One concise annotation, not a per-region label.
+        label = coverage_label(coverage)
+        if label:
+            qp.setPen(Chart.color.text)
+            metrics = QtGui.QFontMetricsF(self.font())
+            width = metrics.boundingRect(label).width()
+            qp.drawText(
+                round(self.width() - width - 6),
+                self.topMargin + 12,
+                label,
+            )
+        qp.restore()
 
     def drawData(
         self,

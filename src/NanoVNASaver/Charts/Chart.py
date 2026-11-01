@@ -24,11 +24,24 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QColor, QColorConstants
 
+from ..CalibrationCoverage import CoverageResult
 from ..Defaults import get_app_config
 from ..Marker.Widget import Marker
 from ..RFTools import Datapoint
 
 logger = logging.getLogger(__name__)
+
+
+def _color_name(color) -> str:
+    """Hex string for a QColor, used by legends and sessions."""
+    return QColor(color).name() if color is not None else "#000000"
+
+
+def coverage_label(coverage: CoverageResult | None) -> str:
+    """Short, honest coverage annotation for chart display (CAL-02.2)."""
+    if coverage is None:
+        return ""
+    return coverage.describe()
 
 
 @dataclass
@@ -116,8 +129,21 @@ class ChartMarker(QtWidgets.QWidget):
             self.qp.drawText(x - int(text_width // 2), y - 3 - offset, text)
 
 
+class _NoBands:
+    """Stand-in used when a chart is created outside the main window.
+
+    Charts only ever read ``enabled``, ``color`` and ``bands`` from this
+    object, so a disabled empty instance keeps every paint path working
+    without a ``None`` check in each chart type.
+    """
+
+    enabled = False
+    color = QColorConstants.Transparent
+    bands: ClassVar[list] = []
+
+
 class Chart(QtWidgets.QWidget):
-    bands: ClassVar[Any] = None
+    bands: ClassVar[Any] = _NoBands()
     popout_requested: ClassVar[Signal] = Signal(object)
     color: ClassVar[ChartColors] = ChartColors()
 
@@ -139,6 +165,11 @@ class Chart(QtWidgets.QWidget):
 
         self.data: list[Datapoint] = []
         self.reference: list[Datapoint] = []
+        #: Active coverage, or ``None`` when nothing is known (CAL-02.2).
+        self.coverage = None
+        #: Additional named traces drawn on top of the primary data
+        #: (TRACE-02.2).  Each entry is ``(name, color, points)``.
+        self.traces: list[tuple[str, str, list[Datapoint]]] = []
 
         self.markers: list[Marker] = []
         self.swrMarkers: set[float] = set()
@@ -165,6 +196,35 @@ class Chart(QtWidgets.QWidget):
 
     def setData(self, data) -> None:
         self.data = data
+        self.update()
+
+    def setTraces(self, traces) -> None:
+        """Draw extra named traces (TRACE-02.2).
+
+        ``traces`` is an iterable of ``(name, color, points)``.  Colors and
+        names come from the trace model, so the legend stays consistent with
+        the trace list.
+        """
+        self.traces = [
+            (str(name), str(color), list(points))
+            for name, color, points in traces
+            if points
+        ]
+        self.update()
+
+    def clearTraces(self) -> None:
+        self.traces = []
+        self.update()
+
+    def trace_legend(self) -> list[tuple[str, str]]:
+        """``(name, color)`` pairs for everything drawn, primary first."""
+        legend = [(self.name, _color_name(Chart.color.sweep))]
+        legend.extend((name, color) for name, color, _ in self.traces)
+        return legend
+
+    def setCoverage(self, coverage) -> None:
+        """Attach the active calibration coverage (CAL-02.2)."""
+        self.coverage = coverage
         self.update()
 
     def setMarkers(self, markers) -> None:
@@ -310,6 +370,8 @@ class Chart(QtWidgets.QWidget):
         new_chart = self.__class__(self.name)
         new_chart.data = self.data
         new_chart.reference = self.reference
+        new_chart.coverage = self.coverage
+        new_chart.traces = list(self.traces)
         new_chart.dim = replace(self.dim)
         new_chart.flag = replace(self.flag)
         new_chart.markers = self.markers
