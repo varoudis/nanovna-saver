@@ -20,6 +20,20 @@ Following commands to prepare local env and run application or run tests:
 * `uv run task clean` - remove temporally artifacts (dist, build, *.pyc etc)
 * `uv run task lint` - check sources and try to fix issues
 
+`uv run task test-full` drives `tox`, whose matrix mirrors the Python
+versions advertised in `pyproject.toml`. Keep the two in step: a version in
+the classifiers must actually be tested.
+
+## Related Documentation
+
+* `DEVELOPMENT_PLAN.md` - the milestone plan and per-task acceptance
+  criteria for measurement snapshots, sweeps, calibration coverage, traces,
+  sessions, presets, and reports.
+* `OFFLINE_WALKTHROUGH.md` - the end-to-end simulator walkthrough covering
+  every user-facing workflow, including what it deliberately does not verify.
+* `SESSION_FORMAT.md` - the versioned `.nvsession` format, with migration
+  examples for contributors.
+
 ## Development Routines
 
 A few usefull commands:
@@ -39,6 +53,58 @@ UI layout of Widget, Dialogs and Window stored in `*.ui` files and may be edited
 * Icons, images and other resources should be stored as part of `main.qrc` file.
   * compiled resource files (e.g. `main_rc.py`) should not be put under git version control
   * ui and resource files may be compiled manually via `uv run task compile` or will be executed automatically during `uv build` phase.
+
+## Calibration Coverage
+
+`CalibrationCoverage.py` answers one narrow question: *for which measured
+frequencies does the loaded calibration actually supply a correction?* The
+answer is shown on the frequency charts, in the sweep control, and in reports.
+
+What it establishes:
+
+* the calibrated start and stop frequencies, taken from the calibration file;
+* whether a given frequency is fully covered, only interpolated between
+  calibration points, outside the calibrated span (endpoint-held), or
+  uncorrected entirely;
+* which S-parameters the calibration can correct (a one-port calibration
+  cannot correct S21);
+* a stable identity for the calibration, so a session can prove that the
+  displayed corrected data came from the same calibration that is loaded now.
+
+What it can **not** establish, and never implies:
+
+* **age.** Coverage reports the span in the file, not when the standards were
+  measured or how much drift has accumulated since.
+* **connector state.** Repeated mating, cable movement and connector wear are
+  invisible to the file. A physically damaged calibration reports full
+  coverage.
+* **measurement uncertainty.** Coverage is a span statement. It is not a
+  tolerance, an error bar, or a confidence interval, and the UI must never be
+  presented as one.
+* **validity of the standards.** An unknown, wrong, or out-of-specification
+  load/short/open produces a calibration that looks complete.
+
+Coverage reporting is purely informational. It does not alter the correction
+mathematics: `tests/test_calibration_regression.py` pins corrected samples as
+bit-identical before and after coverage queries, across every bundled
+calibration fixture. If a coverage change ever moves a corrected value, that
+test fails.
+
+## Simulation
+
+`Hardware/Simulated.py` provides a device model that needs no serial port. It
+is selected in the connection panel ("Simulated device"), and every artifact
+derived from it is marked:
+
+* the window title gains `[SIMULATED: <scenario>]`;
+* Touchstone exports carry a `! NanoVNASaver export: SIMULATED DATA ...`
+  comment, which is read back on import;
+* snapshot provenance records `simulated` and the scenario key, and sessions
+  and reports surface the same labels.
+
+Simulated data must never be presented as a physical measurement. Verification
+against a real NanoVNA is a separate, physical step: the automated suite proves
+the simulator's model, not any device's accuracy.
 
 ## Build Process
 
