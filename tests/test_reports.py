@@ -18,6 +18,7 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """REPORT-01/02/03: report model, HTML/CSV export and reproducibility."""
 
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -231,6 +232,130 @@ class TestPlots:
         svg = svg_plot([("a", "#00ff00", [(0.0, 0.0), (1.0, 2.0)])], title="t")
         assert 'fill="#ffffff"' in svg
         assert 'fill="#111111"' in svg
+
+
+def _paths(svg: str) -> list[list[tuple[float, float]]]:
+    """Pixel coordinates of every plotted path, in document order."""
+    paths = []
+    for match in re.finditer(r'<path d="([^"]+)"', svg):
+        points = [
+            (float(px), float(py))
+            for px, py in re.findall(r"[ML](-?\d+\.\d),(-?\d+\.\d)", match[1])
+        ]
+        paths.append(points)
+    return paths
+
+
+class TestSharedPlotAxes:
+    """Every series of one plot is mapped onto the same X and Y axes."""
+
+    @staticmethod
+    def test_a_limit_between_two_measured_values_is_drawn_between_them():
+        measurement = [(10.0, 2.0), (20.0, 4.0)]
+        limit = [(10.0, 3.0), (20.0, 3.0)]
+        svg = svg_plot(
+            [("m", "#ff0000", measurement), ("lim", "#777777", limit)],
+            title="t",
+        )
+        measured, bound = _paths(svg)
+        assert bound[0][1] == pytest.approx(bound[1][1])
+        rows = [y for _, y in measured]
+        # The bound is strictly between the measurement's lowest and highest
+        # value, not pinned to either edge of the frame.
+        assert min(rows) < bound[0][1] < max(rows)
+        assert bound[0][1] == pytest.approx(
+            (min(rows) + max(rows)) / 2, abs=1.0
+        )
+
+    @staticmethod
+    def test_limits_at_different_values_do_not_overlap():
+        svg = svg_plot(
+            [
+                ("low", "#777777", [(10.0, 2.0), (20.0, 2.0)]),
+                ("high", "#777777", [(10.0, 5.0), (20.0, 5.0)]),
+            ],
+            title="t",
+        )
+        low, high = _paths(svg)
+        assert low[0][1] != high[0][1]
+        # A larger value is higher on the chart, i.e. a smaller pixel row.
+        assert high[0][1] < low[0][1]
+
+    @staticmethod
+    def test_bounds_of_different_frequency_bands_share_the_x_axis():
+        svg = svg_plot(
+            [
+                ("trace", "#ff0000", [(10.0, 1.0), (30.0, 1.0)]),
+                ("band a", "#777777", [(10.0, 2.0), (20.0, 2.0)]),
+                ("band b", "#777777", [(20.0, 3.0), (30.0, 3.0)]),
+            ],
+            title="t",
+        )
+        trace, first, second = _paths(svg)
+        left, right = trace[0][0], trace[1][0]
+        assert first[0][0] == pytest.approx(left)
+        assert first[1][0] == pytest.approx(second[0][0])
+        assert second[1][0] == pytest.approx(right)
+        # Each band covers only half of the shared width.
+        assert first[1][0] - first[0][0] == pytest.approx(
+            (right - left) / 2, abs=1.0
+        )
+
+    @staticmethod
+    def test_a_constant_series_is_drawn_within_the_frame():
+        svg = svg_plot(
+            [
+                ("trace", "#ff0000", [(10.0, 1.0), (20.0, 5.0)]),
+                ("flat", "#777777", [(10.0, 3.0), (20.0, 3.0)]),
+                ("constant", "#0000ff", [(12.0, 3.0), (18.0, 3.0)]),
+            ],
+            title="t",
+        )
+        _trace, flat, constant = _paths(svg)
+        # Two series with identical values land on identical rows, and that
+        # row is inside the frame rather than on its bottom edge.
+        assert flat[0][1] == pytest.approx(constant[0][1])
+        assert 1.0 < flat[0][1] < 220.0
+        # The constant series keeps its own X extent.
+        assert constant[0][0] > flat[0][0]
+
+    @staticmethod
+    def test_a_series_with_no_finite_points_is_not_drawn():
+        svg = svg_plot(
+            [
+                ("trace", "#ff0000", [(10.0, 1.0), (20.0, 2.0)]),
+                ("empty", "#777777", []),
+                ("bad", "#0000ff", [(float("nan"), 1.0)]),
+            ],
+            title="t",
+        )
+        assert len(_paths(svg)) == 1
+        # A non-empty series keeps its legend entry even when no sample is
+        # drawable; an empty series contributes nothing at all.
+        assert "bad" in svg
+        assert "empty" not in svg
+
+    @staticmethod
+    def test_a_plot_without_any_finite_point_renders_the_frame():
+        svg = svg_plot([("empty", "#777777", [])], title="t")
+        assert "<svg" in svg and "</svg>" in svg
+        assert _paths(svg) == []
+
+    @staticmethod
+    def test_two_traces_of_different_ranges_share_the_axes():
+        collection = TraceCollection()
+        narrow = collection.add(_snapshot("filter", 10e6, 20e6), name="narrow")
+        wide = collection.add(_snapshot("filter", 10e6, 200e6), name="wide")
+        svg = next(
+            svg
+            for title, svg in report_plots(build_report("x", [narrow, wide]))
+            if title == "S11 magnitude"
+        )
+        first, second = _paths(svg)
+        assert first[0][0] == pytest.approx(second[0][0])
+        # The narrow trace ends inside the shared domain, not at its right
+        # edge.
+        assert first[-1][0] < second[-1][0] - 50
 
 
 class TestHtmlExport:

@@ -41,6 +41,7 @@ from typing import Iterable, Sequence
 
 from .Analysis.Results import AnalysisResult
 from .CalibrationCoverage import CoverageResult, CoverageState
+from .Limits import LimitEvaluation, LimitSet, Metric, Verdict
 from .Measurement import S11, S21, MeasurementSnapshot
 from .RFTools import Datapoint, groupDelay
 from .Traces import Trace
@@ -58,6 +59,7 @@ class ReportTrace:
     snapshot: MeasurementSnapshot
     analyses: tuple[AnalysisResult, ...] = ()
     coverage: CoverageResult | None = None
+    limits: tuple[LimitEvaluation, ...] = ()
 
     @property
     def available(self) -> tuple[str, ...]:
@@ -73,6 +75,7 @@ class ReportTrace:
         trace: Trace,
         analyses: Iterable[AnalysisResult] = (),
         coverage: CoverageResult | None = None,
+        limits: Iterable[LimitEvaluation] = (),
     ) -> "ReportTrace":
         return cls(
             trace_id=trace.id,
@@ -81,6 +84,7 @@ class ReportTrace:
             snapshot=trace.snapshot,
             analyses=tuple(analyses),
             coverage=coverage,
+            limits=tuple(limits),
         )
 
 
@@ -97,6 +101,22 @@ class ReportModel:
     device: str = ""
     measurement_time: str = ""
     format_version: int = REPORT_FORMAT_VERSION
+    #: The limit set frozen into this report, or ``None`` when the report
+    #: was built without limit checking.  The complete evaluation lives in
+    #: each :class:`ReportTrace`, so a report never re-reads live settings.
+    limit_set: LimitSet | None = None
+
+    @property
+    def verdict(self) -> Verdict | None:
+        """Worst verdict over every frozen limit check."""
+        results = [item for trace in self.traces for item in trace.limits]
+        if not results:
+            return None
+        if any(item.verdict is Verdict.FAIL for item in results):
+            return Verdict.FAIL
+        if any(item.verdict is Verdict.UNAVAILABLE for item in results):
+            return Verdict.UNAVAILABLE
+        return Verdict.PASS
 
     @property
     def simulated(self) -> bool:
@@ -117,8 +137,14 @@ def build_report(  # noqa: PLR0913
     coverage: dict[str, CoverageResult] | None = None,
     app_version: str = "",
     generated: datetime | None = None,
+    limits: LimitSet | None = None,
 ) -> ReportModel:
-    """Freeze ``traces`` and their results into a report model."""
+    """Freeze ``traces`` and their results into a report model.
+
+    ``limits`` is evaluated exactly once, here: the returned model holds
+    both the limit set and its results, so later changes to the active limit
+    set or to the measured data cannot alter an already built report.
+    """
     analyses = analyses or {}
     coverage = coverage or {}
     report_traces = tuple(
@@ -126,6 +152,15 @@ def build_report(  # noqa: PLR0913
             trace,
             analyses=analyses.get(trace.id, ()),
             coverage=coverage.get(trace.id),
+            limits=(
+                limits.evaluate(
+                    trace.snapshot,
+                    trace_id=trace.id,
+                    trace_name=trace.name,
+                )
+                if limits is not None
+                else ()
+            ),
         )
         for trace in traces
     )
@@ -143,6 +178,7 @@ def build_report(  # noqa: PLR0913
         traces=report_traces,
         app_version=app_version,
         device=device,
+        limit_set=limits,
         measurement_time=(
             max(measured).astimezone(timezone.utc).isoformat()
             if measured
@@ -194,27 +230,60 @@ def provenance_labels(trace: ReportTrace) -> list[str]:
 # ----------------------------------------------------------------------
 # Charts
 # ----------------------------------------------------------------------
+#: One plotted point: label, colour, (x, y) samples.
+PlotSeries = Sequence[tuple[str, str, Sequence[tuple[float, float]]]]
+
+
+def _plot_axes(
+    series: PlotSeries,
+) -> tuple[float, float, float, float] | None:
+    """Common finite ``(x_min, x_max, y_min, y_max)`` for all series.
+
+    Every series is drawn against the same axes, so a measured trace and a
+    limit segment are only comparable when they share that domain.  Returns
+    ``None`` when no series carries a finite sample.
+    """
+    xs: list[float] = []
+    ys: list[float] = []
+    for _label, _color, points in series:
+        for x, y in points:
+            if math.isfinite(x) and math.isfinite(y):
+                xs.append(float(x))
+                ys.append(float(y))
+    if not xs:
+        return None
+    return min(xs), max(xs), min(ys), max(ys)
+
+
 def _line_path(
-    points: Sequence[tuple[float, float]], width: int, height: int
+    points: Sequence[tuple[float, float]],
+    axes: tuple[float, float, float, float],
+    width: int,
+    height: int,
 ) -> str:
-    if len(points) < 2:
-        return ""
-    xs = [x for x, _ in points]
-    ys = [y for _, y in points]
-    x_min, x_max = min(xs), max(xs)
-    y_min, y_max = min(ys), max(ys)
-    x_span = (x_max - x_min) or 1.0
-    y_span = (y_max - y_min) or 1.0
+    """Path through ``points`` mapped onto the shared ``axes``."""
+    x_min, x_max, y_min, y_max = axes
+    x_span = x_max - x_min
+    y_span = y_max - y_min
     commands = []
-    for index, (x, y) in enumerate(points):
-        px = (x - x_min) / x_span * (width - 2) + 1
-        py = height - 1 - (y - y_min) / y_span * (height - 2)
-        commands.append(f"{'M' if index == 0 else 'L'}{px:.1f},{py:.1f}")
+    for x, y in points:
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        # A degenerate span (a constant series, or a single frequency) is
+        # drawn through the middle of the box rather than pinned to an edge,
+        # which would suggest an extreme value that the data does not have.
+        tx = (x - x_min) / x_span if x_span else 0.5
+        ty = (y - y_min) / y_span if y_span else 0.5
+        px = tx * (width - 2) + 1
+        py = height - 1 - ty * (height - 2)
+        commands.append(f"{'M' if not commands else 'L'}{px:.1f},{py:.1f}")
+    if len(commands) < 2:
+        return ""
     return " ".join(commands)
 
 
 def svg_plot(  # noqa: PLR0913
-    series: Sequence[tuple[str, str, Sequence[tuple[float, float]]]],
+    series: PlotSeries,
     *,
     title: str,
     x_label: str = "Frequency (Hz)",
@@ -222,7 +291,11 @@ def svg_plot(  # noqa: PLR0913
     width: int = 520,
     height: int = 220,
 ) -> str:
-    """Self-contained SVG with a print-friendly light theme and legend."""
+    """Self-contained SVG with a print-friendly light theme and legend.
+
+    All series share one pair of axes derived from their combined finite
+    range, so overlaid traces and limit bounds are spatially comparable.
+    """
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
         f'height="{height + 46}" viewBox="0 0 {width} {height + 46}" '
@@ -234,14 +307,16 @@ def svg_plot(  # noqa: PLR0913
         f'<rect x="1" y="24" width="{width - 2}" height="{height}" '
         'fill="none" stroke="#cccccc"/>',
     ]
-    for _label, color, points in series:
-        path = _line_path(points, width - 2, height)
-        if not path:
-            continue
-        parts.append(
-            f'<path d="{path}" transform="translate(1,24)" fill="none" '
-            f'stroke="{color}" stroke-width="1.5"/>'
-        )
+    axes = _plot_axes(series)
+    if axes is not None:
+        for _label, color, points in series:
+            path = _line_path(points, axes, width - 2, height)
+            if not path:
+                continue
+            parts.append(
+                f'<path d="{path}" transform="translate(1,24)" fill="none" '
+                f'stroke="{color}" stroke-width="1.5"/>'
+            )
     legend_x = 8
     for label, color, points in series:
         if not points:
@@ -290,6 +365,75 @@ def _delay(points: Sequence[Datapoint]) -> list[tuple[float, float]]:
         if math.isfinite(delay):
             out.append((float(points[index].freq), delay * 1e9))
     return out
+
+
+LIMIT_COLOR = "#777777"
+
+
+def _metric_points(
+    points: Sequence[Datapoint], metric: Metric
+) -> list[tuple[float, float]]:
+    """Measured values in ``metric`` units, skipping non-finite samples."""
+    out = []
+    for dp in points:
+        value = metric.measure(dp)
+        if math.isfinite(value):
+            out.append((float(dp.freq), value))
+    return out
+
+
+def _bound_points(limit_set: LimitSet, metric: Metric) -> list[tuple]:
+    """(label, colour, points) step lines for every bound of ``metric``."""
+    series: list[tuple] = []
+    for rule in limit_set.rules:
+        if rule.metric is not metric:
+            continue
+        for segment in rule.segments:
+            for kind, bound in (
+                ("maximum", segment.maximum),
+                ("minimum", segment.minimum),
+            ):
+                if bound is None:
+                    continue
+                series.append(
+                    (
+                        f"{rule.id} {kind}",
+                        LIMIT_COLOR,
+                        [
+                            (float(segment.start), float(bound)),
+                            (float(segment.stop), float(bound)),
+                        ],
+                    )
+                )
+    return series
+
+
+def limit_plots(model: ReportModel) -> list[tuple[str, str]]:
+    """One overlay per limited metric, measurement against its bounds."""
+    if model.limit_set is None:
+        return []
+    metrics = list(dict.fromkeys(rule.metric for rule in model.limit_set.rules))
+    plots: list[tuple[str, str]] = []
+    for metric in metrics:
+        series = [
+            (
+                trace.name,
+                trace.color,
+                _metric_points(
+                    trace.snapshot.channel(metric.parameter) or (), metric
+                ),
+            )
+            for trace in model.traces
+        ]
+        series = [item for item in series if item[2]]
+        series.extend(_bound_points(model.limit_set, metric))
+        if not series:
+            continue
+        title = f"{metric.description} with limits"
+        plots.append(
+            (title, svg_plot(series, title=title, y_label=metric.unit))
+        )
+    return plots
 
 
 def report_plots(model: ReportModel) -> list[tuple[str, str]]:
@@ -363,6 +507,7 @@ def report_plots(model: ReportModel) -> list[tuple[str, str]]:
                     svg_plot(delays, title="Group delay", y_label="ns"),
                 )
             )
+    plots.extend(limit_plots(model))
     return plots
 
 
@@ -389,6 +534,12 @@ th { background: #f4f4f4; }
 .plot { margin: 10px 0 18px 0; page-break-inside: avoid; }
 .swatch { display: inline-block; width: 10px; height: 10px;
           margin-right: 5px; border: 1px solid #999; }
+.verdict { display: inline-block; border: 1px solid #999; border-radius: 3px;
+           padding: 0 5px; font-size: 11px; font-weight: 600; }
+.verdict-pass { border-color: #1b6e2f; color: #1b6e2f; }
+.verdict-fail { border-color: #b00020; color: #b00020; }
+.verdict-unavailable { border-color: #8a6d3b; color: #8a6d3b; }
+.limits-note { color: #555; font-size: 11px; margin: 4px 0 10px 0; }
 """
 
 
@@ -461,6 +612,63 @@ def _analysis_table(trace: ReportTrace) -> str:
     )
 
 
+def verdict_badge(verdict: Verdict) -> str:
+    return (
+        f'<span class="verdict verdict-{verdict.value}">'
+        f"{html.escape(verdict.label)}</span>"
+    )
+
+
+def _limit_value_text(metric: Metric, value: float | None) -> str:
+    if value is None:
+        return ""
+    if not math.isfinite(value):
+        return metric.format_value(value)
+    return f"{value:.6g}" + (f" {metric.unit}" if metric.unit else "")
+
+
+def _limit_table(trace: ReportTrace) -> str:
+    if not trace.limits:
+        return ""
+    rows = []
+    for result in trace.limits:
+        band = (
+            f"{result.band_start / 1e6:.6g} - {result.band_stop / 1e6:.6g} MHz"
+        )
+        worst = _limit_value_text(result.metric, result.worst_value)
+        frequency = (
+            ""
+            if result.worst_frequency is None
+            else str(result.worst_frequency)
+        )
+        limit = ""
+        if result.worst_limit is not None:
+            limit = (
+                f"{result.worst_kind} "
+                f"{_limit_value_text(result.metric, result.worst_limit)}"
+            )
+        detail = result.reason if result.verdict is Verdict.UNAVAILABLE else ""
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(result.title)}</td>"
+            f"<td>{html.escape(result.metric.description)}</td>"
+            f"<td>{html.escape(band)}</td>"
+            f"<td>{verdict_badge(result.verdict)}</td>"
+            f"<td>{html.escape(worst)}</td>"
+            f"<td>{html.escape(frequency)}</td>"
+            f"<td>{html.escape(limit)}</td>"
+            f"<td>{html.escape(detail)}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><tr><th>Limit</th><th>Metric</th><th>Band</th>"
+        "<th>Result</th><th>Worst value</th><th>Frequency (Hz)</th>"
+        "<th>Bound at worst value</th><th>Reason</th></tr>"
+        + "".join(rows)
+        + "</table>"
+    )
+
+
 def _format_value(value) -> str:
     if not value.available:
         return "unavailable"
@@ -498,7 +706,31 @@ def render_html(model: ReportModel, *, include_plots: bool = True) -> str:
         f"Traces: {len(model.traces)}"
         + (" (simulated data)" if model.simulated else "")
     )
+    if model.limit_set is not None:
+        parts.append(
+            f"<br>Limit set: {html.escape(model.limit_set.name)}"
+            f" (version {model.limit_set.version})"
+        )
     parts.append("</p>")
+
+    verdict = model.verdict
+    if verdict is not None and model.limit_set is not None:
+        parts.append("<h2>Limit check</h2>")
+        parts.append(
+            f'<p class="meta">Overall result: {verdict_badge(verdict)}'
+            f" over {len(model.limit_set.rules)} rule(s) and"
+            f" {len(model.traces)} trace(s).</p>"
+        )
+        parts.append(
+            '<p class="limits-note">A PASS means every measured sample inside'
+            " every required band satisfied its bounds. Bounds are inclusive"
+            " and values are never interpolated or extrapolated."
+            " UNAVAILABLE means the check could not be decided (missing"
+            " channel, band not covered, incomplete data or an invalid"
+            " sample) and is not a pass. Bands are given in whole hertz and"
+            " include both ends; dB limits are positive for a match or for"
+            " loss.</p>"
+        )
 
     if model.notes:
         parts.append("<h2>Notes</h2>")
@@ -562,6 +794,9 @@ def render_html(model: ReportModel, *, include_plots: bool = True) -> str:
                 f" {trace.coverage.calibrated_end} Hz)</p>"
             )
         parts.append(_trace_table(trace))
+        limit_table = _limit_table(trace)
+        if limit_table:
+            parts.append(limit_table)
         table = _analysis_table(trace)
         if table:
             parts.append(table)
@@ -583,6 +818,24 @@ def render_html(model: ReportModel, *, include_plots: bool = True) -> str:
     )
     parts.append("</body></html>")
     return "\n".join(parts)
+
+
+def _csv_number(value: float | None) -> str:
+    """CSV cell for a measured value.
+
+    A missing value stays blank, but a genuinely infinite measurement is
+    data: a VSWR of ``inf`` is a valid total reflection and must not be
+    silently dropped.  The marker matches ``report_snapshot`` and the
+    snapshot encoder (``inf`` / ``-inf``), so it is portable without being
+    locale dependent.
+    """
+    if value is None:
+        return ""
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    return repr(value)
 
 
 def csv_summary(model: ReportModel) -> str:
@@ -639,6 +892,40 @@ def csv_summary(model: ReportModel) -> str:
                         "",
                     ]
                 )
+        for result in trace.limits:
+            writer.writerow(
+                [
+                    trace.trace_id,
+                    trace.name,
+                    result.metric.parameter,
+                    f"limit:{result.rule_id}",
+                    result.verdict.value,
+                    (
+                        f"{result.title}: worst"
+                        if result.verdict is not Verdict.UNAVAILABLE
+                        else result.title
+                    ),
+                    _csv_number(result.worst_value),
+                    result.metric.unit,
+                    (
+                        ""
+                        if result.worst_frequency is None
+                        else result.worst_frequency
+                    ),
+                    (
+                        f"{result.metric.description}; band "
+                        f"{result.band_start}-{result.band_stop} Hz"
+                        + (
+                            f"; {result.worst_kind} "
+                            f"{result.metric.format_value(result.worst_limit)}"
+                            if result.verdict is Verdict.FAIL
+                            and result.worst_limit is not None
+                            else ""
+                        )
+                    ),
+                    result.reason,
+                ]
+            )
     return buffer.getvalue()
 
 
@@ -663,6 +950,9 @@ def report_snapshot(model: ReportModel) -> dict:
         "app_version": model.app_version,
         "device": model.device,
         "measurement_time": model.measurement_time,
+        "limit_set": (
+            None if model.limit_set is None else model.limit_set.to_dict()
+        ),
         "traces": [
             {
                 "trace_id": trace.trace_id,
@@ -671,6 +961,7 @@ def report_snapshot(model: ReportModel) -> dict:
                 "labels": provenance_labels(trace),
                 "available": list(trace.available),
                 "analyses": [result.to_dict() for result in trace.analyses],
+                "limits": [result.to_dict() for result in trace.limits],
             }
             for trace in model.traces
         ],

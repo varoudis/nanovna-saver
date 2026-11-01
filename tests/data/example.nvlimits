@@ -1,0 +1,33 @@
+{
+  "format": "nanovna-saver-limits",
+  "version": 1,
+  "name": "Two metre band amateur radio",
+  "description": "Example: 144-146 MHz transmit/receive band. Upper bound on S11 VSWR across the whole band, plus a tighter bound in the calling channel; S21 insertion loss bound on the receiver path.",
+  "rules": [
+    {
+      "id": "match",
+      "label": "Antenna match",
+      "metric": "s11_vswr",
+      "segments": [
+        { "start_hz": 144000000, "stop_hz": 145000000, "maximum": 2.0 },
+        { "start_hz": 145000000, "stop_hz": 146000000, "maximum": 1.5 }
+      ]
+    },
+    {
+      "id": "match-tight",
+      "label": "Return loss",
+      "metric": "s11_return_loss_db",
+      "segments": [
+        { "start_hz": 144000000, "stop_hz": 146000000, "minimum": 10.0 }
+      ]
+    },
+    {
+      "id": "path",
+      "label": "Feedline loss",
+      "metric": "s21_insertion_loss_db",
+      "segments": [
+        { "start_hz": 144000000, "stop_hz": 146000000, "maximum": 3.0 }
+      ]
+    }
+  ]
+}

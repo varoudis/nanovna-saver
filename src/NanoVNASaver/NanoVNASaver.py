@@ -63,6 +63,7 @@ from .Defaults import APP_SETTINGS, AppSettings, get_app_config
 from .Formatting import format_frequency, format_gain, format_vswr
 from .Hardware.Hardware import Interface
 from .Hardware.VNA import VNA
+from .Limits import LimitCatalogue
 from .Marker.Delta import DeltaMarker
 from .Marker.Widget import Marker
 from .Measurement import (
@@ -105,6 +106,7 @@ from .Windows import (
     DeviceSettingsWindow,
     DisplaySettingsWindow,
     FilesWindow,
+    LimitsWindow,
     PresetWindow,
     ReportWindow,
     SessionWindow,
@@ -282,6 +284,10 @@ class NanoVNASaver(QWidget):
         self._preset_parameters: dict = {}
         #: Cached device calibration state; never queried from a redraw.
         self._device_calibration = "unknown"
+        #: Limit sets loaded in this session (LIMIT-03).  Reports freeze the
+        #: active set together with its results, so changing the selection
+        #: never alters an already built report.
+        self.limits: LimitCatalogue = LimitCatalogue()
 
         self.markers: list[Marker] = []
         self.marker_ref = False
@@ -452,6 +458,7 @@ class NanoVNASaver(QWidget):
             "preset": PresetWindow(self),
             "sweep_settings": SweepSettingsWindow(self),
             "report": ReportWindow(self),
+            "limits": LimitsWindow(self),
             "session": SessionWindow(self),
             "setup": DisplaySettingsWindow(self),
             "tdr": TDRWindow(self),
@@ -656,6 +663,14 @@ class NanoVNASaver(QWidget):
         )
         btn_presets.clicked.connect(lambda: self.display_window("preset"))
 
+        btn_limits = QtWidgets.QPushButton("Limits ...")
+        btn_limits.setMinimumHeight(20)
+        btn_limits.setToolTip(
+            "Load measurement limit sets and check pass/fail against the"
+            " captured traces"
+        )
+        btn_limits.clicked.connect(lambda: self.display_window("limits"))
+
         btn_report = QtWidgets.QPushButton("Report ...")
         btn_report.setMinimumHeight(20)
         btn_report.setToolTip(
@@ -669,8 +684,9 @@ class NanoVNASaver(QWidget):
         button_grid.addWidget(btn_session, 1, 0)
         button_grid.addWidget(btn_presets, 1, 1)
         button_grid.addWidget(btn_report, 2, 0)
-        button_grid.addWidget(btn_display_setup, 2, 1)
-        button_grid.addWidget(btn_about, 3, 0)
+        button_grid.addWidget(btn_limits, 2, 1)
+        button_grid.addWidget(btn_display_setup, 3, 0)
+        button_grid.addWidget(btn_about, 3, 1)
         left_column.addLayout(button_grid)
 
         logger.debug("Finished building interface")

@@ -36,6 +36,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..Analysis.Results import AnalysisKind, analyse_snapshot
 from ..CalibrationCoverage import coverage_from_calibration
+from ..Limits import LimitSet, Verdict
 from ..Reports import (
     ReportModel,
     ReportTrace,
@@ -87,6 +88,9 @@ class ReportWindow(QtWidgets.QWidget):
         #: Frozen report; ``None`` until the first freeze.
         self.model: ReportModel | None = None
         self._checkboxes: dict[str, QtWidgets.QCheckBox] = {}
+        #: True once the operator picked a limit set explicitly; until then
+        #: the selector follows the catalogue's active set.
+        self._limits_explicit = False
 
         self.setWindowTitle("Report")
         self.setWindowIcon(get_window_icon())
@@ -116,6 +120,20 @@ class ReportWindow(QtWidgets.QWidget):
         ):
             widget.textChanged.connect(self._mark_stale)
 
+        layout.addWidget(QtWidgets.QLabel("Limit set"))
+        self.combo_limits = QtWidgets.QComboBox()
+        self.combo_limits.setToolTip(
+            "Limits frozen into this report. Changing the selection does not"
+            ' alter a report that was already built; press "Refresh".'
+        )
+        self.combo_limits.currentIndexChanged.connect(self._limits_changed)
+        layout.addWidget(self.combo_limits)
+        self.btn_limits = QtWidgets.QPushButton("Manage limits ...")
+        self.btn_limits.clicked.connect(
+            lambda: self.app.display_window("limits")
+        )
+        layout.addWidget(self.btn_limits)
+
         layout.addWidget(QtWidgets.QLabel("Traces included"))
         self.trace_box = QtWidgets.QVBoxLayout()
         container = QtWidgets.QWidget()
@@ -139,6 +157,11 @@ class ReportWindow(QtWidgets.QWidget):
         self.label_uncalibrated.setWordWrap(True)
         self.label_uncalibrated.setStyleSheet("color: #b06a00;")
         layout.addWidget(self.label_uncalibrated)
+
+        self.label_limits = QtWidgets.QLabel("")
+        self.label_limits.setWordWrap(True)
+        self.label_limits.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.label_limits)
 
         self.btn_refresh = QtWidgets.QPushButton("Refresh")
         self.btn_refresh.clicked.connect(self.refresh)
@@ -173,6 +196,60 @@ class ReportWindow(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def checkboxes(self) -> dict[str, QtWidgets.QCheckBox]:
         return dict(self._checkboxes)
+
+    def limits_choices(self) -> list[LimitSet]:
+        """Limit sets offered in the selector."""
+        catalogue = getattr(self.app, "limits", None)
+        return list(catalogue.all()) if catalogue is not None else []
+
+    def _limits_changed(self, *_args) -> None:
+        self._limits_explicit = True
+        self._mark_stale()
+
+    def _rebuild_limit_list(self) -> None:
+        """Recreate the limit selector, keeping a sensible selection.
+
+        The active catalogue entry is used until the operator picks
+        something explicitly, so loading a set becomes visible here without
+        a second action, while an explicit "No limits" stays selected.
+        """
+        if self._limits_explicit:
+            previous = self.selected_limit_name()
+        else:
+            catalogue = getattr(self.app, "limits", None)
+            previous = catalogue.active_name if catalogue is not None else ""
+        self.combo_limits.blockSignals(True)
+        self.combo_limits.clear()
+        self.combo_limits.addItem("No limits", "")
+        for limit_set in self.limits_choices():
+            self.combo_limits.addItem(limit_set.name, limit_set.name)
+        index = self.combo_limits.findData(previous)
+        self.combo_limits.setCurrentIndex(max(index, 0))
+        self.combo_limits.blockSignals(False)
+
+    def selected_limit_name(self) -> str:
+        return str(self.combo_limits.currentData() or "")
+
+    def selected_limit_set(self) -> LimitSet | None:
+        """The set the next freeze will use, or ``None`` for no limits."""
+        name = self.selected_limit_name()
+        if not name:
+            return None
+        catalogue = getattr(self.app, "limits", None)
+        return catalogue.find(name) if catalogue is not None else None
+
+    def select_limit_set(self, name: str) -> bool:
+        index = self.combo_limits.findData(name)
+        if index < 0:
+            # A set may have been loaded since the selector was built.
+            self._rebuild_limit_list()
+            index = self.combo_limits.findData(name)
+        if index < 0:
+            return False
+        self._limits_explicit = True
+        self.combo_limits.setCurrentIndex(index)
+        self._mark_stale()
+        return True
 
     def _rebuild_trace_list(self) -> None:
         """Recreate one checkbox per trace, keeping earlier choices.
@@ -216,6 +293,7 @@ class ReportWindow(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def refresh(self) -> None:
         """Re-read the traces and freeze a new report model."""
+        self._rebuild_limit_list()
         self._rebuild_trace_list()
         self.freeze()
 
@@ -269,6 +347,7 @@ class ReportWindow(QtWidgets.QWidget):
             analyses=analyses,
             coverage=coverage,
             app_version=self._app_version(),
+            limits=self.selected_limit_set(),
         )
 
     def _app_version(self) -> str:
@@ -319,6 +398,45 @@ class ReportWindow(QtWidgets.QWidget):
         else:
             self.label_uncalibrated.setText("")
         self.label_uncalibrated.setVisible(bool(uncorrected))
+
+        self._update_limit_label(model)
+
+    def _update_limit_label(self, model: ReportModel) -> None:
+        """Show the frozen verdict, never the live limit selection."""
+        verdict = model.verdict
+        if model.limit_set is None:
+            self.label_limits.setText("No limit checking in this report.")
+            self.label_limits.setStyleSheet("color: #555555;")
+            return
+        if verdict is None:
+            self.label_limits.setText(
+                f"Limits ({model.limit_set.name}): no traces to check."
+            )
+            self.label_limits.setStyleSheet(
+                "color: #b06a00; font-weight: bold;"
+            )
+            return
+        counts = {value: 0 for value in Verdict}
+        for trace in model.traces:
+            for result in trace.limits:
+                counts[result.verdict] += 1
+        self.label_limits.setText(
+            f"Limits ({model.limit_set.name}): {verdict.label}"
+            f" - {counts[Verdict.PASS]} pass, {counts[Verdict.FAIL]} fail,"
+            f" {counts[Verdict.UNAVAILABLE]} unavailable"
+        )
+        if verdict is Verdict.PASS:
+            self.label_limits.setStyleSheet(
+                "color: #1b6e2f; font-weight: bold;"
+            )
+        elif verdict is Verdict.FAIL:
+            self.label_limits.setStyleSheet(
+                "color: #b00020; font-weight: bold;"
+            )
+        else:
+            self.label_limits.setStyleSheet(
+                "color: #b06a00; font-weight: bold;"
+            )
 
     # ------------------------------------------------------------------
     # Export

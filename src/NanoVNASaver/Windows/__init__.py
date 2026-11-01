@@ -5,6 +5,7 @@ from .CalibrationSettings import CalibrationWindow
 from .DeviceSettings import DeviceSettingsWindow
 from .DisplaySettings import DisplaySettingsWindow
 from .Files import FilesWindow
+from .LimitsWindow import LimitsWindow
 from .MarkerSettings import MarkerSettingsWindow
 from .PresetWindow import PresetWindow
 from .ReportWindow import ReportWindow
@@ -21,6 +22,7 @@ __all__ = [
     "DeviceSettingsWindow",
     "DisplaySettingsWindow",
     "FilesWindow",
+    "LimitsWindow",
     "MarkerSettingsWindow",
     "PresetWindow",
     "ReportWindow",

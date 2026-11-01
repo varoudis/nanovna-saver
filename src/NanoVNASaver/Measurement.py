@@ -156,6 +156,41 @@ class SweepInfo:
             logarithmic=props.logarithmic,
         )
 
+    def declared_frequencies(self) -> tuple[int, ...]:
+        """The frequency grid this acquisition was configured to capture.
+
+        Reconstructed from the recorded settings with the same arithmetic the
+        acquisition itself uses (:class:`NanoVNASaver.Settings.Sweep.Sweep`),
+        so segment joins round exactly as they did during the sweep and a
+        duplicated join frequency is preserved rather than smoothed away.
+
+        Returns an empty tuple when the settings cannot describe a grid
+        (fewer than two units, an internally illegal span, or generation that
+        divides by a degenerate point count).  Consumers must then fall back
+        to a data-only policy: these settings carry no authority about the
+        intended resolution.
+        """
+        from .Settings.Sweep import Properties, Sweep
+
+        if self.points < 1 or self.segments < 1:
+            return ()
+        if self.points * self.segments < 2:
+            return ()
+        try:
+            sweep = Sweep(
+                self.start,
+                self.end,
+                self.points,
+                self.segments,
+                Properties(logarithmic=self.logarithmic),
+            )
+            # ``get_frequencies`` is a generator: its arithmetic (which calls
+            # raise on a degenerate point count) runs here, inside the guard,
+            # not at the call site.
+            return tuple(sweep.get_frequencies())
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return ()
+
     def to_dict(self) -> dict:
         return {
             "start": self.start,

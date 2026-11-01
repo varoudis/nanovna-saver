@@ -173,6 +173,33 @@ plot from the "Display Setup".  The core dimensions (cross section area in mm2,
 effective length in mm) and number of windings can be set in the context menu
 for the plot (right click on the plot).
 
+Measurement limits
+^^^^^^^^^^^^^^^^^^
+
+The "Limits" window loads versioned JSON limit sets and checks captured
+traces against them.  A limit set describes frequency bands and the bounds a
+measurement has to satisfy inside them, for example a maximum S11 VSWR, a
+minimum S11 return loss in dB, or a maximum S21 insertion loss in dB.  Bounds
+are inclusive and are only evaluated at measured samples.  Coverage is checked
+against the acquisition settings recorded in the snapshot: the capture must
+hold exactly the grid those settings declare, so a missing, clustered-missing
+or duplicated sample makes the check UNAVAILABLE.  Without recorded settings
+the check falls back to the captured spacing itself, so logarithmic and
+multi-segment sweeps are handled normally while a genuinely missing sample or
+chunk still makes the check UNAVAILABLE.
+
+Each check reports PASS, FAIL or UNAVAILABLE; the last means the question
+could not be decided (missing S-parameter channel, band not covered by the
+sweep, incomplete acquisition or an invalid sample) and is never treated as a
+pass.  Report previews and HTML/CSV exports freeze the selected limit set
+together with its results, so a later measurement or a different selection
+cannot change an already built report.  An infinite VSWR from a total
+reflection is a real measurement: it is exported as ``inf`` rather than as an
+empty value.
+
+The file format is documented in `docs/LIMIT_SETS.md <docs/LIMIT_SETS.md>`_,
+with a working example in ``tests/data/example.nvlimits``.
+
 Latest Changes
 ^^^^^^^^^^^^^^
 
