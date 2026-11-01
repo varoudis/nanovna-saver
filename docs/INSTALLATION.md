@@ -44,16 +44,41 @@ or
 
 ## Automated MacOS Build Script
 
-1. If needed, install dependencies
+`build-macos-app.sh` produces an unsigned `NanoVNASaver.app` plus a
+`NanoVNASaver.app-<arch>.tar.gz` archive in `dist/`. It can be run from any
+working directory; all paths are resolved relative to the repository.
 
-        brew install python pyqt
-2. Run the automated build script
+1. Install the build prerequisites (Qt is **not** needed from Homebrew -
+   PySide6 comes from the project's locked dependencies):
+
+        brew install uv python@3.13
+
+2. Run the automated build script:
 
         ./build-macos-app.sh
-3. Open the completed app
 
-        open ./dist/NanoVNASaver/NanoVNASaver.app
+3. Open the completed app:
+
+        open ./dist/NanoVNASaver.app
+
    or double-click on NanoVNASaver.app in finder.
+
+Build notes:
+
+* Each run uses a private temporary virtualenv built with the first supported
+  Python it finds (3.10 - 3.13); your existing environments are not touched.
+  Pick an interpreter explicitly with
+  `PYTHON=/path/to/python3.13 ./build-macos-app.sh`.
+* Dependencies come from `uv.lock` (`uv sync --locked`), so the pinned
+  PyInstaller matches the pinned NumPy/SciPy. Resolving unpinned versions can
+  produce a bundle that aborts on startup with a missing NumPy/SciPy submodule.
+* The build regenerates `src/NanoVNASaver/Windows/ui/about.py` and
+  `main_rc.py`; the previous contents are restored when it finishes, whether
+  it succeeded or failed.
+* The bundle is signed ad-hoc, not notarized. Gatekeeper may refuse the first
+  launch; allow it via System Settings > Privacy & Security > "Open Anyway".
+* The archive contains the whole `.app`; keep the bundle intact rather than
+  copying the inner executable elsewhere.
 
 ## MacPorts
 
