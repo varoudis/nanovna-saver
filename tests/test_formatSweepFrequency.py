@@ -38,33 +38,3 @@ class TestCases(unittest.TestCase):
         self.assertEqual(format_frequency_sweep(1234567), "1.234567MHz")
         self.assertEqual(format_frequency_sweep(12345678), "12.345678MHz")
         self.assertEqual(format_frequency_sweep(123456789), "123.456789MHz")
-
-    # def test_defaultMinDigits(self):
-    #     # simple integers with trailing zeros.
-    #     # DEFAULT behavior retains 2 digits after the period, mindigits=2.
-    #     self.assertEqual(rft.formatSweepFrequency(1000), '1.00kHz')
-    #     self.assertEqual(rft.formatSweepFrequency(10000), '10.00kHz')
-    #     self.assertEqual(rft.formatSweepFrequency(100000), '100.00kHz')
-    #     self.assertEqual(rft.formatSweepFrequency(1000000), '1.00MHz')
-
-    # def test_nonDefaultMinDigits(self):
-    #     # simple integers with trailing zeros. setting mindigit value to something
-    #     # other than default, where trailing zeros >= mindigits, the number of
-    #     # zeros shown is equal to mindigits value.
-    #     self.assertEqual(rft.formatSweepFrequency(1000000, mindigits=0), '1MHz')
-    #     self.assertEqual(rft.formatSweepFrequency(1000000, mindigits=1), '1.0MHz')
-    #     self.assertEqual(rft.formatSweepFrequency(1000000, mindigits=3), '1.000MHz')
-    #     self.assertEqual(rft.formatSweepFrequency(10000000, mindigits=4), '10.0000MHz')
-    #     self.assertEqual(rft.formatSweepFrequency(100000000, mindigits=5), '100.00000MHz')
-    #     self.assertEqual(rft.formatSweepFrequency(1000000000, mindigits=6), '1.000000GHz')
-    #     # where trailing zeros < mindigits, only available zeros are shown, if the
-    #     # result includes no decimal places (i.e. Hz values).
-    #     self.assertEqual(rft.formatSweepFrequency(1, mindigits=4), '1Hz')
-    #     self.assertEqual(rft.formatSweepFrequency(10, mindigits=4), '10Hz')
-    #     self.assertEqual(rft.formatSweepFrequency(100, mindigits=4), '100Hz')
-    #     # but where a decimal exists, and mindigits > number of available zeroes,
-    #     # this results in extra zeroes being padded into result, even into sub-Hz
-    #     # resolution. This is not useful for this application.
-    #     # TODO: Consider post-processing result for maxdigits based on SI unit.
-    #     self.assertEqual(rft.formatSweepFrequency(1000, mindigits=5), '1.00000kHz')
-    #     self.assertEqual(rft.formatSweepFrequency(1000, mindigits=10), '1.0000000000kHz')

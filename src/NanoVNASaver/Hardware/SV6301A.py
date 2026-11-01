@@ -43,7 +43,7 @@ class SV6301A(NanoVNA):
     def __init__(self, iface: Interface):
         super().__init__(iface)
         self.sweep_max_freq_hz = 6.3e9
-        
+
     def init_features(self) -> None:
         super().init_features()
         self.features.remove("Scan mask command")

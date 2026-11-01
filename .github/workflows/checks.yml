@@ -1,0 +1,98 @@
+name: "Checks"
+
+# RELEASE-01.3: run the test suite and non-mutating lint checks on every
+# proposed change.  No VNA hardware is required: the simulator covers the
+# device-facing paths, and anything that genuinely needs a physical
+# instrument is reported separately rather than implied by these jobs.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (non-mutating)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Sync dependencies
+      run: uv sync --locked
+
+    # `check` without `--fix`: CI must report problems, never edit them.
+    - name: Ruff check
+      run: uv run ruff check --no-fix src tests
+
+    - name: Ruff format check
+      run: uv run ruff format --check src tests
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Mirrors tox.ini env_list and the pyproject.toml classifiers.
+      matrix:
+        python-version: [ "3.10", "3.11", "3.12", "3.13" ]
+    env:
+      # No display on a CI runner; Qt must still construct widgets.
+      QT_QPA_PLATFORM: offscreen
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Qt runtime libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 \
+          libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0
+
+    - name: Sync dependencies
+      run: uv sync --locked
+
+    - name: Compile UI resources
+      run: uv run task ui-compile
+
+    - name: Run tests
+      run: uv run pytest tests -q
+
+  # Windows and macOS startup smoke tests (RELEASE-01.6).  These import the
+  # application and construct the main window headlessly so packaging
+  # regressions in bundled resources surface before a release.
+  smoke:
+    name: Startup smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, macos-latest ]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Sync dependencies
+      run: uv sync --locked
+
+    - name: Compile UI resources
+      run: uv run task ui-compile
+
+    - name: Construct the main window headlessly
+      run: uv run python -c "import os, sys; sys.path.insert(0, 'src'); from PySide6 import QtWidgets; app = QtWidgets.QApplication([]); from NanoVNASaver.NanoVNASaver import NanoVNASaver; window = NanoVNASaver(); print('startup ok:', window.windowTitle())"
