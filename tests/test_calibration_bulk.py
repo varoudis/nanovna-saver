@@ -409,6 +409,7 @@ class TestArrayConversion:
 class Recorder:
     sample_ready: list = field(default_factory=list)
     run_finished: list = field(default_factory=list)
+    run_request_finished: list = field(default_factory=list)
     state_changed: list = field(default_factory=list)
     progress: list = field(default_factory=list)
     finished: int = 0
@@ -420,8 +421,12 @@ class Emitter:
         self._recorder = recorder
         self._name = name
 
-    def emit(self, payload=None):
-        getattr(self._recorder, self._name).append(payload)
+    def emit(self, *payload):
+        # ``run_request_finished`` carries two arguments; record every
+        # payload shape without discarding the correlation token.
+        getattr(self._recorder, self._name).append(
+            payload[0] if len(payload) == 1 else payload
+        )
 
 
 class Counter:
@@ -450,6 +455,9 @@ class Signals:
     )
     run_finished = property(
         lambda self: Emitter(self._recorder, "run_finished")
+    )
+    run_request_finished = property(
+        lambda self: Emitter(self._recorder, "run_request_finished")
     )
     finished = property(lambda self: Counter(self._recorder, "finished"))
     sweep_error = property(lambda self: Counter(self._recorder, "sweep_error"))

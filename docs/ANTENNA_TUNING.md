@@ -95,7 +95,11 @@ says so as soon as the sweep completes rather than at export time.
 ## Status and safety
 
 * All sweep-flavoured controls are disabled while a sweep is pending or
-  running; **Stop sweep** is the only enabled action then.
+  running; **Stop sweep** is the only enabled action then.  The controls are
+  handed back when the worker thread really ends, not when its terminal is
+  announced: the terminal is published from inside the run, so a cancelled
+  *first* sweep - which leaves no stored measurement to recover from - still
+  returns to an enabled **Overview sweep** and a disabled **Stop sweep**.
 * With no device connected the window says so and offers no sweep.
 * Every sweep this window starts is bound to a fresh run token that is
   carried by the worker's own completion. A completion is adopted only when

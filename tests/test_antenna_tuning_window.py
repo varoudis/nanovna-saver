@@ -24,6 +24,8 @@ the application's own terminal handling are all exercised. Only the thread
 launch is replaced, which keeps the tests deterministic.
 """
 
+import time
+
 import pytest
 
 from NanoVNASaver.AntennaTuning import AntennaExportError
@@ -508,6 +510,247 @@ class TestRunOwnership:
             QtCore.QCoreApplication.processEvents()
         assert tuning.pending_phase() is None
         assert tuning.measured_minimum() is not None
+
+
+class TestControlRecoveryAfterTheFirstRun:
+    """Controls must survive a first run that never stored a result.
+
+    The terminal signals are emitted from inside ``run()``, so when they
+    reach the window ``worker.isRunning()`` is still true and Stop must stay
+    offered.  Only the thread's own completion turns the controls back, and
+    a first cancelled or failed sweep has no stored snapshot to refresh
+    from - the case that used to leave Overview disabled and Stop enabled
+    forever.
+    """
+
+    @staticmethod
+    def _settle(app, tuning):
+        """Pump the GUI loop until the real thread and its step are done.
+
+        ``wait()`` would block this thread and starve both the timers and the
+        queued terminals, so events are pumped while the thread runs - which
+        is exactly what the application does during a sweep.
+        """
+        from PySide6 import QtCore
+
+        deadline = time.monotonic() + 20
+        try:
+            while app.worker.isRunning() or tuning._pending is not None:
+                assert time.monotonic() < deadline, "the sweep thread hung"
+                QtCore.QCoreApplication.processEvents()
+        finally:
+            # Never leave a live thread behind for the next test.
+            if app.worker.isRunning():
+                app.worker.quit()
+                app.worker.wait(20_000)
+        # Let anything posted around the thread's exit be delivered.
+        end = time.monotonic() + 0.08
+        while time.monotonic() < end:
+            QtCore.QCoreApplication.processEvents()
+
+    @staticmethod
+    def _hold_while_terminal_is_handled(app, tuning, seconds=0.15):
+        """Keep the worker running while its terminal is being delivered.
+
+        A loaded GUI thread handles a queued terminal while ``isRunning()``
+        is still true; holding the worker in the emitting thread reproduces
+        that deterministically instead of relying on machine speed.  The
+        returning callable connects and later disconnects the holder.
+        """
+        from PySide6 import QtCore
+
+        def hold(*_args):
+            time.sleep(seconds)
+
+        app.worker.signals.run_request_finished.connect(
+            hold, QtCore.Qt.ConnectionType.DirectConnection
+        )
+
+        def release():
+            app.worker.signals.run_request_finished.disconnect(hold)
+
+        return release
+
+    @staticmethod
+    def _cancel_mid_run(tuning, delay_ms=20):
+        """Ask to stop while the sweep is still running."""
+        from PySide6 import QtCore
+
+        timer = QtCore.QTimer(tuning)
+        timer.setSingleShot(True)
+        timer.timeout.connect(tuning.cancel)
+        timer.start(delay_ms)
+        return timer
+
+    @staticmethod
+    def test_a_cancelled_first_sweep_hands_the_controls_back(app, tuning):
+        """Cancel the first sweep: no snapshot exists to recover from."""
+        # A read that outlives the stop request makes the cancellation land
+        # mid-run on every machine, not just a slow one.
+        app.vna = make_simulated_vna(
+            "antenna", fault=FaultConfig(mode=FaultMode.SLOW, slow_delay=0.02)
+        )
+        app.serial_control.connected.emit(True)
+        tuning.refresh_device_limits()
+        tuning.use_device_range()
+        hold = TestControlRecoveryAfterTheFirstRun
+        release = hold._hold_while_terminal_is_handled(app, tuning)
+        try:
+            enter_overview(tuning)
+            assert tuning.start_overview()
+            timer = hold._cancel_mid_run(tuning)
+            hold._settle(app, tuning)
+        finally:
+            release()
+
+        assert not timer.isActive()
+        assert tuning._pending is None
+        # The interrupted measurement is never offered.
+        assert tuning.completed_snapshot() is None
+        assert not app.worker.isRunning()
+        assert tuning.btn_overview.isEnabled()
+        assert not tuning.btn_stop.isEnabled()
+        assert not tuning.btn_export.isEnabled()
+        assert "Sweep stopped" in tuning.label_status.text()
+
+    @staticmethod
+    def test_a_failed_first_sweep_hands_the_controls_back(app, tuning):
+        """A first run that fails must also release Overview and Stop."""
+        hold = TestControlRecoveryAfterTheFirstRun
+        release = hold._hold_while_terminal_is_handled(app, tuning)
+        try:
+            app.vna = make_simulated_vna(
+                "antenna", fault=FaultConfig(mode=FaultMode.EMPTY_SAMPLES)
+            )
+            app.serial_control.connected.emit(True)
+            enter_overview(tuning)
+            assert tuning.start_overview()
+            TestControlRecoveryAfterTheFirstRun._settle(app, tuning)
+        finally:
+            release()
+
+        assert not app.worker.isRunning()
+        assert tuning.pending_phase() is None
+        assert tuning.completed_snapshot() is None
+        assert tuning.btn_overview.isEnabled()
+        assert not tuning.btn_stop.isEnabled()
+        assert not tuning.btn_export.isEnabled()
+        assert "Sweep failed" in tuning.label_status.text()
+
+    @staticmethod
+    def test_a_stop_after_the_run_completed_is_reported_truthfully(app, tuning):
+        """The run may finish before the stop request lands.
+
+        The completion is deliberately not adopted (the step was abandoned),
+        but the status must not claim the sweep was stopped mid-run.
+        """
+        hold = TestControlRecoveryAfterTheFirstRun
+        enter_overview(tuning)
+        assert tuning.start_overview()
+        token = tuning._pending.token
+        # Abandon the step while the thread is still alive, then deliver the
+        # completion it had already produced.
+        tuning._abandoned_token = token
+        tuning._invalidate_pending()
+        app.worker.signals.run_request_finished.emit(
+            SweepState.COMPLETED, token
+        )
+        hold._settle(app, tuning)
+
+        assert tuning._abandoned_token is None
+        assert tuning.pending_phase() is None
+        # Not adopted, but never described as an interrupted sweep either.
+        assert tuning.completed_snapshot() is None
+        assert not tuning.btn_export.isEnabled()
+        text = tuning.label_status.text()
+        assert "had already completed" in text
+        # Not described as an interrupted run: nothing was lost.
+        assert "Sweep stopped" not in text
+        assert "no complete measurement is displayed" not in text
+
+    @staticmethod
+    def test_a_newer_step_owns_the_status_over_an_abandoned_run(
+        app, tuning, monkeypatch
+    ):
+        """A delayed old terminal must not rewrite the new step's status.
+
+        Regression: an abandoned token kept its claim on the workflow, so an
+        old COMPLETED/CANCELLED arriving after a restarted step replaced
+        "Measuring ..." with a message about the previous sweep.
+        """
+        monkeypatch.setattr(app, "sweep_start", lambda: None)
+        enter_overview(tuning)
+        assert tuning.start_overview()
+        stale_token = tuning._pending.token
+        tuning._abandoned_token = stale_token
+        tuning._invalidate_pending()
+        # A new step takes over the workflow.
+        assert tuning.start_overview()
+        new_token = tuning._pending.token
+        assert new_token is not stale_token
+        status = tuning.label_status.text()
+        assert status == "Measuring (overview) ..."
+
+        for terminal in (
+            SweepState.COMPLETED,
+            SweepState.CANCELLED,
+            SweepState.FAILED,
+        ):
+            app.worker.signals.run_request_finished.emit(terminal, stale_token)
+            assert tuning.label_status.text() == status
+            # The new step is untouched and still owns the workflow.
+            assert tuning._pending is not None
+            assert tuning._pending.token is new_token
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "terminal",
+        [SweepState.CANCELLED, SweepState.FAILED, SweepState.COMPLETED],
+    )
+    def test_an_older_terminal_cannot_clear_a_newer_abandoned_run(
+        app, tuning, monkeypatch, terminal
+    ):
+        """A terminal owning neither state must leave both untouched.
+
+        Regression: every unrelated token cleared ``_abandoned_token``, so an
+        old queued terminal arriving after a *newer* run was cancelled made
+        that run's own later outcome unrecognisable: its status stayed
+        "Stopping ..." for good.
+        """
+        monkeypatch.setattr(app, "sweep_start", lambda: None)
+        enter_overview(tuning)
+        assert tuning.start_overview()
+        older_token = tuning._pending.token
+        tuning._invalidate_pending()
+        # A run that was cancelled while its terminal was still owed.
+        abandoned = object()
+        tuning._abandoned_token = abandoned
+        tuning._set_status("Stopping the sweep ...")
+
+        app.worker.signals.run_request_finished.emit(terminal, older_token)
+        # The older terminal owns neither state: no authority at all.
+        assert tuning._abandoned_token is abandoned
+        assert tuning.label_status.text() == "Stopping the sweep ..."
+        assert tuning._pending is None
+
+        # The abandoned run's own terminal is still handled exactly once.
+        app.worker.signals.run_request_finished.emit(terminal, abandoned)
+        assert tuning._abandoned_token is None
+        if terminal is SweepState.COMPLETED:
+            assert "had already completed" in tuning.label_status.text()
+        else:
+            expected = (
+                "Sweep failed"
+                if terminal is SweepState.FAILED
+                else "Sweep stopped"
+            )
+            assert expected in tuning.label_status.text()
+        # That token is spent: a duplicate delivery has no authority either.
+        handled = tuning.label_status.text()
+        app.worker.signals.run_request_finished.emit(terminal, abandoned)
+        assert tuning.label_status.text() == handled
+        assert tuning._abandoned_token is None
+        assert tuning._pending is None
 
 
 class TestEdgeCases:

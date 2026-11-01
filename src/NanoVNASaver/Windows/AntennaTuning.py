@@ -128,6 +128,12 @@ class AntennaTuningWindow(QtWidgets.QWidget):
         #: Samples of that measurement that cannot be written to a file.
         self._unusable = 0
         self._last_written: Path | None = None
+        #: Token of a step abandoned by :meth:`cancel` while its run was
+        #: still going.  Its terminal is still owed, so the outcome is
+        #: reported when that run really ends rather than guessed here: the
+        #: run may complete before the stop request lands.  Matching the
+        #: token keeps somebody else's terminal out of this workflow.
+        self._abandoned_token: object = None
 
         layout = QtWidgets.QVBoxLayout()
         make_scrollable(self, layout)
@@ -145,6 +151,14 @@ class AntennaTuningWindow(QtWidgets.QWidget):
         # A new session, a restored session or a cleared display changes what
         # may honestly be exported; refresh then, never on every redraw.
         app.communicate.data_available.connect(self._on_data_available)
+        # Terminal states are published from inside ``run()``, while the
+        # worker thread is still running: those handlers always see
+        # ``worker.isRunning()`` true and must keep offering Stop.  Only the
+        # thread's own ``finished`` signal reports the moment the controls
+        # become usable again, so the refresh is bound to that real lifetime.
+        # Without it a cancelled first sweep (no previous result stored) left
+        # Overview disabled and Stop enabled.
+        self.app.worker.finished.connect(self._on_thread_finished)
 
         self.refresh_device_limits()
         self._seed_from_sweep()
@@ -523,12 +537,22 @@ class AntennaTuningWindow(QtWidgets.QWidget):
     def cancel(self) -> None:
         """Stop the running sweep and abandon the pending step."""
         was_pending = self._pending is not None
-        self._invalidate_pending()
-        if self.app.worker.isRunning():
+        token = self._invalidate_pending()
+        if was_pending and self.app.worker.isRunning():
+            # The run keeps its token, so its real outcome can still be
+            # recognised and reported once it ends; the step itself is gone,
+            # which is what makes an already-queued completion unusable.
+            self._abandoned_token = token
             self.app.worker.quit()
             self._set_status("Stopping the sweep ...")
         elif was_pending:
             self._set_status("Measurement cancelled before it started.")
+        elif self.app.worker.isRunning():
+            # Nothing of this workflow is waiting for that sweep: either its
+            # run already reported and only the thread outlives it, or it was
+            # started elsewhere.  Stop it, but never overwrite a result this
+            # workflow has just adopted.
+            self.app.worker.quit()
         else:
             self._set_status("No sweep is running.")
         self.refresh()
@@ -593,6 +617,11 @@ class AntennaTuningWindow(QtWidgets.QWidget):
             return False
         token = object()
         self._pending = PendingStep(token=token, phase=phase, plan=plan)
+        # A newer step takes over the workflow, so any run abandoned before
+        # it must no longer speak for the status: its outcome is history, and
+        # a delayed terminal would otherwise replace "Measuring ..." with a
+        # message about a sweep that is no longer the current one.
+        self._abandoned_token = None
         # The token must be bound before the run can start, and it is bound
         # on the same thread that publishes the pending step.
         self.app.worker.bind_next_run(token)
@@ -639,12 +668,49 @@ class AntennaTuningWindow(QtWidgets.QWidget):
         if self._pending is None:
             self.refresh()
 
+    def _on_thread_finished(self) -> None:
+        """Re-derive the controls once the worker thread has really ended.
+
+        The terminal signals are emitted from inside ``run()``, so at that
+        moment ``worker.isRunning()`` is still true and the window must keep
+        Stop offered.  A started thread always reaches this point, however
+        its run ended (completion, cancellation, failure or an exception),
+        so this is the only place where a step that never stored a result can
+        hand the controls back.  The pending step itself is untouched here:
+        ownership stays with :meth:`_on_run_request_finished`, and a stale
+        queued terminal remains unrecognisable.
+        """
+        self.refresh()
+
     def _on_run_request_finished(self, terminal, token) -> None:
         """Terminal of a *specific* run; only our own step may advance."""
         pending = self._pending
         if pending is None or token is None or token is not pending.token:
-            # Somebody else's run, or an earlier step of this workflow that
-            # was cancelled while its terminal was already queued.
+            # Somebody else's run, or a step that :meth:`cancel` already
+            # abandoned while its terminal was still queued.  An abandoned
+            # step is never resumed - the completion is deliberately not
+            # adopted - but the run may have finished before the stop landed,
+            # so its real outcome is what the status reports.
+            if (
+                token is not None
+                and token is self._abandoned_token
+                and self._pending is None
+            ):
+                self._abandoned_token = None
+                if terminal is SweepState.COMPLETED:
+                    self._set_status(
+                        "The sweep had already completed when the stop"
+                        " arrived. Its measurement is on screen but this"
+                        " workflow did not adopt it - run the overview again"
+                        " to use it."
+                    )
+                else:
+                    self._after_interrupted(terminal)
+            # A terminal that owns neither the current pending step nor the
+            # current abandoned one is somebody else's run - possibly an
+            # older queued terminal, or a newer run whose own outcome is
+            # still owed.  It has no authority over this workflow: it may
+            # neither clear the abandoned token nor touch the status.
             self.refresh()
             return
         if terminal is not SweepState.COMPLETED:
