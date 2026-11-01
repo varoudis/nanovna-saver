@@ -281,8 +281,9 @@ class Marker(QtCore.QObject, Value):
         self.frequencyInput.nextFrequency = -1
         self.frequencyInput.previousFrequency = -1
         datasize = len(data)
-        if datasize == 0:
-            # Set the frequency before loading any data
+        if datasize < 2:
+            # No step size to compare against; a one-point sweep would
+            # otherwise index past the end of the list.
             return
 
         min_freq = data[0].freq

@@ -92,7 +92,9 @@ class Value:
                     s21[-1],
                 ]
 
-        self.freq = s11[1].freq
+        # The marker sits at ``index`` in the caller's list; the padded
+        # triple is centred on it.
+        self.freq = s11[index].freq
         self.s11 = s11[index - 1 : index + 2]
         if s21:
             self.s21 = s21[index - 1 : index + 2]
