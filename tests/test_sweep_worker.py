@@ -358,3 +358,60 @@ class TestProgressModel:
             completed_averages=1,
         )
         assert progress.percentage == pytest.approx(75.0)
+
+
+class TestCorrectionProvenance:
+    """CAL-02: the snapshot says what actually happened to the samples.
+
+    Written after a real defect: the worker produced corrected values while
+    the published snapshot still reported ``correction.applied == False`` and
+    carried no identity, so a corrected measurement was indistinguishable
+    from an uncorrected one.
+    """
+
+    @staticmethod
+    def _calibrated_worker():
+        from NanoVNASaver.Hardware.Simulated import make_simulated_vna
+
+        worker, recorder = _make_worker(_app())
+        calibration = Calibration()
+        calibration.load("tests/data/sol_27_30.cal")
+        calibration.calc_corrections()
+        worker.app.calibration = calibration
+        worker.app.sweep.update(
+            start=27_000_000, end=30_000_000, segments=1, points=101
+        )
+        worker.app.vna = make_simulated_vna("antenna")
+        return worker, recorder
+
+    @staticmethod
+    def test_a_calibrated_sweep_reports_the_correction():
+        worker, recorder = TestCorrectionProvenance._calibrated_worker()
+        worker.run_once()
+        snapshot = recorder.sample_ready[-1].snapshot
+        assert snapshot.correction.applied is True
+        assert snapshot.correction.identity
+        assert snapshot.correction.source.value == "application"
+        assert (
+            snapshot.correction.identity
+            == snapshot.provenance.calibration.identity
+        )
+
+    @staticmethod
+    def test_an_uncalibrated_sweep_reports_no_correction():
+        worker, recorder = _make_worker(_app())
+        worker.run_once()
+        snapshot = recorder.sample_ready[-1].snapshot
+        assert snapshot.correction.applied is False
+        assert snapshot.correction.identity == ""
+        assert snapshot.correction.source.value == "none"
+
+    @staticmethod
+    def test_corrected_samples_differ_from_raw_when_calibrated():
+        worker, recorder = TestCorrectionProvenance._calibrated_worker()
+        worker.run_once()
+        snapshot = recorder.sample_ready[-1].snapshot
+        raw = snapshot.channel("S11", corrected=False)
+        corrected = snapshot.channel("S11")
+        assert raw != corrected, "calibration did not change the samples"
+        assert snapshot.correction.applied is True

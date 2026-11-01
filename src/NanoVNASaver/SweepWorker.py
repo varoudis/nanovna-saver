@@ -48,7 +48,10 @@ from .Calibration import correct_delay
 from .Hardware.VNA import VNA
 from .Measurement import (
     CompletionState,
+    CorrectionSource,
+    CorrectionState,
     SweepInfo,
+    compute_calibration_identity,
     snapshot_from_datapoints,
 )
 from .RFTools import Datapoint
@@ -329,6 +332,11 @@ class SweepWorker(QThread):
         logger.info("%d averages", capture.averages)
 
         while True:
+            # Each pass is a complete measurement: start from empty buffers so
+            # a continuous sweep replaces the previous pass instead of
+            # appending another copy of the grid (repeated frequencies,
+            # unbounded growth).
+            self.init_data()
             for index in range(sweep.segments):
                 if self._cancel.is_set():
                     logger.debug("Stopping sweeping as signalled")
@@ -472,6 +480,20 @@ class SweepWorker(QThread):
         completion = (
             CompletionState.COMPLETE if complete else CompletionState.PARTIAL
         )
+        snapshot = snapshot_from_datapoints(
+            self.data11,
+            self.data21,
+            raw11=self.rawData11,
+            raw21=self.rawData21,
+            completion=completion,
+            sweep=capture.sweep if capture else None,
+            calibration=capture.calibration if capture else None,
+            simulated=simulated,
+            simulator_scenario=scenario,
+            device=self.app.vna.name,
+            source="simulated" if simulated else "",
+            correction=self._correction_state(capture),
+        )
         sample = SweepSample(
             sweep_id=self.sweep_id,
             segment=index,
@@ -480,19 +502,7 @@ class SweepWorker(QThread):
             s21=tuple(self.data21),
             completion=completion,
             capture=capture,
-            snapshot=snapshot_from_datapoints(
-                self.data11,
-                self.data21,
-                raw11=self.rawData11,
-                raw21=self.rawData21,
-                completion=completion,
-                sweep=capture.sweep if capture else None,
-                calibration=capture.calibration if capture else None,
-                simulated=simulated,
-                simulator_scenario=scenario,
-                device=self.app.vna.name,
-                source="simulated" if simulated else "",
-            ),
+            snapshot=snapshot,
         )
         logger.debug(
             "Publishing %d/%d points for sweep %s (%s)",
@@ -504,6 +514,36 @@ class SweepWorker(QThread):
         # Publication is a signal: the GUI thread owns all widget mutation
         # and the application's live data buffers (SWEEP-02.2).
         self.signals.sample_ready.emit(sample)
+
+    def _correction_state(self, capture):
+        """Describe the correction that was actually applied.
+
+        ``applyCalibration`` silently falls back to the raw samples when the
+        calibration is unusable, so the snapshot must record what happened
+        rather than assume that carrying a calibration means it took effect.
+        """
+        calibration = (
+            capture.calibration if capture is not None else self.app.calibration
+        )
+        offset_delay = (
+            capture.offset_delay if capture is not None else self.offsetDelay
+        )
+        applied = bool(
+            getattr(calibration, "isCalculated", False)
+            and calibration.isValid1Port()
+        )
+        if applied:
+            identity = compute_calibration_identity(calibration)
+            source = CorrectionSource.APPLICATION
+        else:
+            identity = ""
+            source = CorrectionSource.NONE
+        return CorrectionState(
+            applied=applied,
+            identity=identity,
+            source=source,
+            offset_delay=float(offset_delay if applied else 0.0),
+        )
 
     def applyCalibration(
         self,
