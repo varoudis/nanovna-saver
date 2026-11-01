@@ -44,7 +44,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from .Calibration import correct_delay
+from .Calibration import (
+    arrays_to_datapoints,
+    correct_delay_bulk,
+    datapoints_to_arrays,
+    validate_delay,
+)
 from .Hardware.VNA import VNA
 from .Measurement import (
     CompletionState,
@@ -63,8 +68,38 @@ from .SweepState import (
     estimate_remaining,
 )
 
+
+def _apply_offset_delay(
+    data: list[Datapoint], offset_delay: float, *, reflect: bool
+) -> list[Datapoint]:
+    """Bulk variant of :func:`Calibration.correct_delay` for one channel."""
+    if not data:
+        return []
+    freq, values = datapoints_to_arrays(data)
+    return arrays_to_datapoints(
+        freq, correct_delay_bulk(freq, values, offset_delay, reflect=reflect)
+    )
+
+
+def _freeze_calibration(calibration):
+    """Return the calibration state as it is now.
+
+    A run must keep one coherent calibration for all of its samples: the
+    identity published with a snapshot has to describe the coefficients that
+    actually produced the corrected values.  :meth:`Calibration.frozen_copy`
+    gives that, so a later ``load()``/``calc_corrections()`` on the live
+    object — in place or by replacement — cannot change a running sweep.
+    Objects without that method (test doubles) are used as they are.
+    """
+    freeze = getattr(calibration, "frozen_copy", None)
+    if freeze is None:
+        return calibration
+    return freeze()
+
+
 if TYPE_CHECKING:
     from .NanoVNASaver.NanoVNASaver import NanoVNASaver as vna_app
+
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +135,10 @@ class SweepCapture:
     """Immutable settings captured when a sweep starts (SWEEP-02.1).
 
     Calibration and offset delay are held by value for the duration of the
-    run: replacing ``app.calibration`` mid-sweep cannot change the meaning
-    of samples that were already acquired.
+    run.  ``calibration`` is a frozen copy taken at the capture boundary
+    (see :meth:`Calibration.frozen_copy`), so replacing ``app.calibration``
+    mid-sweep *and* reloading or recalculating the calibration in place both
+    leave this run's coefficients, validity and identity untouched.
     """
 
     sweep_id: int
@@ -352,11 +389,18 @@ class SweepWorker(QThread):
             if sweep.properties.mode == SweepMode.AVERAGE
             else 1
         )
+        try:
+            offset_delay = validate_delay(self.offsetDelay)
+        except ValueError as exc:
+            raise ValueError(f"Cannot start sweep: {exc}") from exc
+        # Freeze at the run boundary: the coefficients used by every sample
+        # of this run, and the identity published with them, must stay the
+        # ones that were in effect when it started.
         return SweepCapture(
             sweep_id=self.sweep_id,
             sweep=sweep,
-            calibration=self.app.calibration,
-            offset_delay=self.offsetDelay,
+            calibration=_freeze_calibration(self.app.calibration),
+            offset_delay=offset_delay,
             averages=averages,
             truncates=sweep.properties.averages[1],
             continuous=sweep.properties.mode == SweepMode.CONTINOUS,
@@ -570,12 +614,16 @@ class SweepWorker(QThread):
         # and the application's live data buffers (SWEEP-02.2).
         self.signals.sample_ready.emit(sample)
 
-    def _correction_state(self, capture):
+    def _correction_state(self, capture) -> CorrectionState:
         """Describe the correction that was actually applied.
 
-        ``applyCalibration`` silently falls back to the raw samples when the
-        calibration is unusable, so the snapshot must record what happened
-        rather than assume that carrying a calibration means it took effect.
+        ``applyCalibration`` falls back to the raw samples when the
+        calibration is unusable, and applies an offset delay even without a
+        SOL calibration, so the snapshot must record what happened rather
+        than assume that carrying a calibration means it took effect.  A
+        delay-only correction is reported as applied with an empty identity:
+        that keeps it distinct from a calibration correction, and from raw
+        data.
         """
         calibration = (
             capture.calibration if capture is not None else self.app.calibration
@@ -583,21 +631,21 @@ class SweepWorker(QThread):
         offset_delay = (
             capture.offset_delay if capture is not None else self.offsetDelay
         )
-        applied = bool(
+        calibrated = bool(
             getattr(calibration, "isCalculated", False)
             and calibration.isValid1Port()
         )
-        if applied:
-            identity = compute_calibration_identity(calibration)
-            source = CorrectionSource.APPLICATION
-        else:
-            identity = ""
-            source = CorrectionSource.NONE
+        delay = float(offset_delay) if offset_delay else 0.0
+        applied = calibrated or delay != 0.0
         return CorrectionState(
             applied=applied,
-            identity=identity,
-            source=source,
-            offset_delay=float(offset_delay if applied else 0.0),
+            identity=compute_calibration_identity(calibration)
+            if calibrated
+            else "",
+            source=CorrectionSource.APPLICATION
+            if applied
+            else CorrectionSource.NONE,
+            offset_delay=delay,
         )
 
     def applyCalibration(
@@ -607,38 +655,133 @@ class SweepWorker(QThread):
         *,
         capture: SweepCapture | None = None,
     ) -> tuple[list[Datapoint], list[Datapoint]]:
-        capture = capture or self._capture
+        """Apply the captured calibration and offset delay to raw samples.
+
+        Correction runs through :class:`Calibration`'s bulk (NumPy) path, so
+        a whole sweep paragraph is corrected with a handful of array
+        operations instead of one SciPy interpolation call per datapoint.
+        The scalar ``correct11``/``correct21`` methods remain the reference
+        implementation; results here are numerically equal, not necessarily
+        bit-identical (NumPy and CPython complex division may differ in the
+        last bit).
+
+        Raw samples are returned unchanged whenever the calibration cannot be
+        applied (not calculated, incomplete, or a channel unavailable); the
+        correction state published with the sweep records which happened.
+        The offset delay is independent of the SOL calibration: it is applied
+        to the (corrected or raw) samples whenever it is non-zero.
+
+        Anything that would produce a non-finite sample raises instead of
+        publishing an invalid measurement: a non-finite offset delay, or a
+        correction that is undefined at some frequency.
+
+        Without an explicit ``capture`` the *live* calibration and offset
+        delay are used, which is what re-correcting already acquired raw data
+        from the calibration window needs.  During a sweep the worker always
+        passes its frozen capture, so a run can never mix calibration states.
+        """
         calibration = (
             capture.calibration if capture is not None else self.app.calibration
         )
-        offset_delay = (
+        offset_delay = validate_delay(
             capture.offset_delay if capture is not None else self.offsetDelay
         )
-        data11: list[Datapoint] = []
-        data21: list[Datapoint] = []
 
         if not calibration.isCalculated:
             data11 = raw_data11.copy()
             data21 = raw_data21.copy()
-        elif calibration.isValid1Port():
-            data11.extend(calibration.correct11(dp) for dp in raw_data11)
+        elif not raw_data11 and not raw_data21:
+            return [], []
+        elif raw_data11 and raw_data21:
+            data11, data21 = self._calibrate_bulk(
+                calibration, raw_data11, raw_data21
+            )
+        elif raw_data21:
+            if calibration.isValid2Port():
+                raise ValueError(
+                    "Cannot calibrate: S21 samples need the matching raw S11"
+                    " samples, but none were supplied."
+                )
+            data11 = []
+            data21 = raw_data21.copy()
         else:
-            data11 = raw_data11.copy()
-
-        if calibration.isValid2Port():
-            for counter, dp in enumerate(raw_data21):
-                dp11 = raw_data11[counter]
-                data21.append(calibration.correct21(dp, dp11))
-        else:
-            data21 = raw_data21
+            # Only S11 was measured (one-port device or an unread S21).
+            data11 = self._calibrate_channel(calibration, raw_data11)
+            data21 = []
 
         if offset_delay != 0.0:
-            data11 = [
-                correct_delay(dp, offset_delay, reflect=True) for dp in data11
-            ]
-            data21 = [correct_delay(dp, offset_delay) for dp in data21]
+            data11, data21 = self._apply_delay(data11, data21, offset_delay)
 
         return data11, data21
+
+    @staticmethod
+    def _apply_delay(
+        data11: list[Datapoint],
+        data21: list[Datapoint],
+        offset_delay: float,
+    ) -> tuple[list[Datapoint], list[Datapoint]]:
+        """Apply the offset delay in bulk; S11 gets the doubled factor."""
+        try:
+            return (
+                _apply_offset_delay(data11, offset_delay, reflect=True),
+                _apply_offset_delay(data21, offset_delay, reflect=False),
+            )
+        except ValueError as exc:
+            raise ValueError(f"Cannot apply offset delay: {exc}") from exc
+
+    @staticmethod
+    def _calibrate_bulk(
+        calibration,
+        raw_data11: list[Datapoint],
+        raw_data21: list[Datapoint],
+    ) -> tuple[list[Datapoint], list[Datapoint]]:
+        """Correct both channels over the raw frequency grid, in bulk.
+
+        Both channels must describe the same frequency grid: the S21
+        correction is evaluated per frequency and consumes the matching raw
+        S11 sample, so a shifted grid would silently pair the wrong values.
+        The integer hertz grid is carried through unchanged, which keeps the
+        published frequencies exactly as measured.
+        """
+        if len(raw_data11) != len(raw_data21):
+            raise ValueError(
+                "Cannot calibrate: S11 has"
+                f" {len(raw_data11)} point(s) but S21 has"
+                f" {len(raw_data21)}."
+            )
+        freq, raw11 = datapoints_to_arrays(raw_data11)
+        freq21, raw21 = datapoints_to_arrays(raw_data21)
+        if not np.array_equal(freq, freq21):
+            raise ValueError(
+                "Cannot calibrate: the S11 and S21 frequency grids differ."
+            )
+
+        corrected11 = (
+            calibration.correct11_bulk(freq, raw11)
+            if calibration.isValid1Port()
+            else raw11
+        )
+        corrected21 = (
+            calibration.correct21_bulk(freq, raw21, raw11)
+            if calibration.isValid2Port()
+            else raw21
+        )
+        return (
+            arrays_to_datapoints(freq, corrected11),
+            arrays_to_datapoints(freq, corrected21),
+        )
+
+    @staticmethod
+    def _calibrate_channel(
+        calibration, raw_data: list[Datapoint]
+    ) -> list[Datapoint]:
+        """Correct a single channel (S11) when no S21 samples were read."""
+        if not calibration.isValid1Port():
+            return raw_data.copy()
+        freq, values = datapoints_to_arrays(raw_data)
+        return arrays_to_datapoints(
+            freq, calibration.correct11_bulk(freq, values)
+        )
 
     def read_averaged_segment(
         self,

@@ -21,11 +21,18 @@
 import csv
 import io
 import os
+from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
+from NanoVNASaver.CalibrationCoverage import CoverageResult, CoverageState
 from NanoVNASaver.Hardware.SimulatedScenarios import build_scenario
-from NanoVNASaver.Measurement import snapshot_from_datapoints
+from NanoVNASaver.Measurement import (
+    CorrectionSource,
+    CorrectionState,
+    snapshot_from_datapoints,
+)
 from NanoVNASaver.RFTools import Datapoint
 
 _QT_APP = None
@@ -217,3 +224,136 @@ class TestReportWindow:
     @staticmethod
     def test_the_window_is_registered_with_the_application(app):
         assert "report" in app.windows
+
+
+def _full_coverage():
+    """A coverage result that says a calibration applies to the span."""
+    return CoverageResult(
+        state=CoverageState.FULL,
+        spans=(),
+        calibrated_start=None,
+        calibrated_end=None,
+        interpolated_points=0,
+        edge_held_points=0,
+        corrected_parameters=("S11", "S21"),
+        uncorrected_parameters=(),
+    )
+
+
+def _report_trace(name, correction, coverage=None):
+    from NanoVNASaver.Reports import ReportTrace
+
+    snapshot = replace(
+        _scenario_snapshot(name, "antenna"), correction=correction
+    )
+    coverage = _full_coverage() if coverage is None else coverage
+    return ReportTrace(
+        trace_id=name,
+        name=name,
+        color="#ffffff",
+        snapshot=snapshot,
+        coverage=coverage,
+    )
+
+
+def _model(*traces):
+    from NanoVNASaver.Reports import ReportModel
+
+    return ReportModel(
+        title="warnings",
+        dut="",
+        notes="",
+        generated=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        traces=traces,
+    )
+
+
+_RAW = CorrectionState()
+_DELAY_ONLY = CorrectionState(
+    applied=True,
+    identity="",
+    source=CorrectionSource.APPLICATION,
+    offset_delay=33e-12,
+)
+_UNIDENTIFIED = CorrectionState(
+    applied=True, identity="", source=CorrectionSource.DEVICE
+)
+
+
+class TestCalibrationWarnings:
+    @staticmethod
+    def test_raw_traces_say_the_values_are_raw(report_window):
+        report_window._update_warnings(_model(_report_trace("raw", _RAW)))
+        text = report_window.label_uncalibrated.text()
+        assert "No calibration applied to: raw" in text
+        assert "Values are raw measurements." in text
+
+    @staticmethod
+    def test_a_recorded_identity_without_an_applied_correction_is_still_raw(
+        report_window,
+    ):
+        """``identity`` alone must not silence the warning."""
+        not_applied = CorrectionState(
+            applied=False,
+            identity="known-calibration",
+            source=CorrectionSource.APPLICATION,
+        )
+        trace = _report_trace("stale", not_applied)
+        assert report_window._uncorrected(trace)
+        report_window._update_warnings(_model(trace))
+        assert "No calibration applied to: stale" in (
+            report_window.label_uncalibrated.text()
+        )
+
+    @staticmethod
+    def test_a_calibrated_trace_raises_no_warning(report_window):
+        calibrated = CorrectionState(
+            applied=True,
+            identity="cal-1",
+            source=CorrectionSource.APPLICATION,
+            offset_delay=33e-12,
+        )
+        report_window._update_warnings(
+            _model(_report_trace("calibrated", calibrated))
+        )
+        assert report_window.label_uncalibrated.text() == ""
+        assert not report_window.label_uncalibrated.isVisibleTo(report_window)
+
+    @staticmethod
+    def test_delay_only_data_is_not_called_raw(report_window):
+        report_window._update_warnings(
+            _model(_report_trace("delayed", _DELAY_ONLY))
+        )
+        text = report_window.label_uncalibrated.text()
+        assert "Values are raw measurements" not in text
+        assert "offset delay correction applied, not a calibration" in text
+
+    @staticmethod
+    def test_an_identityless_correction_is_not_described_as_delay_only(
+        report_window,
+    ):
+        report_window._update_warnings(
+            _model(_report_trace("device", _UNIDENTIFIED))
+        )
+        text = report_window.label_uncalibrated.text()
+        assert "offset delay" not in text
+        # Corrected data must not be described as raw either.
+        assert "Values are raw measurements" not in text
+        assert "Correction provenance not verified for: device" in text
+
+    @staticmethod
+    def test_mixed_raw_and_delay_only_traces_are_described_separately(
+        report_window,
+    ):
+        report_window._update_warnings(
+            _model(
+                _report_trace("raw", _RAW),
+                _report_trace("delayed", _DELAY_ONLY),
+            )
+        )
+        text = report_window.label_uncalibrated.text()
+        assert "No calibration applied to: raw. Values are raw" in text
+        assert "No SOL calibration applied to: delayed." in text
+        # The raw sentence must not be attached to the delay-only trace.
+        assert "No calibration applied to: delayed" not in text
+        assert "delayed. Values are raw" not in text

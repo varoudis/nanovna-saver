@@ -37,16 +37,69 @@ import io
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Iterable, Sequence
 
 from .Analysis.Results import AnalysisResult
 from .CalibrationCoverage import CoverageResult, CoverageState
 from .Limits import LimitEvaluation, LimitSet, Metric, Verdict
-from .Measurement import S11, S21, MeasurementSnapshot
+from .Measurement import (
+    S11,
+    S21,
+    CorrectionSource,
+    MeasurementSnapshot,
+)
 from .RFTools import Datapoint, groupDelay
 from .Traces import Trace
 
 REPORT_FORMAT_VERSION = 1
+
+
+class CorrectionKind(Enum):
+    """What kind of correction produced the reported samples.
+
+    Derived from the full recorded facts, never from a single missing field:
+    an empty identity does not prove that no calibration was involved (older
+    or device-supplied corrections carry no application identity).
+    """
+
+    NONE = "none"
+    """No correction was applied; the samples are raw."""
+
+    CALIBRATED = "calibrated"
+    """A calibration correction was applied and is identified."""
+
+    OFFSET_DELAY_ONLY = "offset_delay_only"
+    """The application applied an offset delay and nothing else."""
+
+    UNIDENTIFIED = "unidentified"
+    """A correction was applied but no calibration identity is recorded."""
+
+
+def correction_kind(snapshot: MeasurementSnapshot) -> CorrectionKind:
+    """Classify the correction recorded on ``snapshot``.
+
+    ``OFFSET_DELAY_ONLY`` is claimed only when every fact says so: the
+    correction was applied, the source is the application, a nonzero finite
+    offset delay was applied, and no calibration identity is recorded.  A
+    device- or unknown-sourced correction, or one with no recorded delay,
+    stays ``UNIDENTIFIED`` — it is still reported as a correction, just not
+    as one this application performed from a delay alone.
+    """
+    correction = snapshot.correction
+    if not correction.applied:
+        return CorrectionKind.NONE
+    if correction.identity:
+        return CorrectionKind.CALIBRATED
+    delay = correction.offset_delay
+    if (
+        correction.source is CorrectionSource.APPLICATION
+        and isinstance(delay, (int, float))
+        and math.isfinite(delay)
+        and delay != 0.0
+    ):
+        return CorrectionKind.OFFSET_DELAY_ONLY
+    return CorrectionKind.UNIDENTIFIED
 
 
 @dataclass(frozen=True)
@@ -218,12 +271,13 @@ def provenance_labels(trace: ReportTrace) -> list[str]:
             labels.append("correction held at calibration edge")
     if S21 not in snapshot.available:
         labels.append("one-port data (no S21)")
-    if snapshot.correction.applied:
-        labels.append(
-            f"corrected ({snapshot.correction.source.value})"
-            if snapshot.correction.identity
-            else "corrected"
-        )
+    kind = correction_kind(snapshot)
+    if kind is CorrectionKind.OFFSET_DELAY_ONLY:
+        labels.append("offset delay correction (no calibration)")
+    elif kind is not CorrectionKind.NONE:
+        # A calibration or an unidentified correction: name the source but
+        # do not claim a delay that was not recorded.
+        labels.append(f"corrected ({snapshot.correction.source.value})")
     return labels
 
 
@@ -772,15 +826,23 @@ def render_html(model: ReportModel, *, include_plots: bool = True) -> str:
                 f"{sweep.averages} average(s)</p>"
             )
         correction = trace.snapshot.correction
-        if correction.applied:
-            identity = (
-                f", calibration {html.escape(correction.identity[:12])}"
-                if correction.identity
-                else ", calibration identity unknown"
-            )
+        kind = correction_kind(trace.snapshot)
+        if kind is CorrectionKind.CALIBRATED:
             parts.append(
                 '<p class="meta">Correction: applied from '
-                f"{html.escape(correction.source.value)}{identity}</p>"
+                f"{html.escape(correction.source.value)}, calibration "
+                f"{html.escape(correction.identity[:12])}</p>"
+            )
+        elif kind is CorrectionKind.OFFSET_DELAY_ONLY:
+            parts.append(
+                '<p class="meta">Correction: offset delay only (no'
+                f" calibration), {correction.offset_delay * 1e12:.6g} ps</p>"
+            )
+        elif kind is CorrectionKind.UNIDENTIFIED:
+            parts.append(
+                '<p class="meta">Correction: applied from '
+                f"{html.escape(correction.source.value)},"
+                " calibration identity not recorded</p>"
             )
         else:
             parts.append(

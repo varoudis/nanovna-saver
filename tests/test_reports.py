@@ -18,6 +18,7 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """REPORT-01/02/03: report model, HTML/CSV export and reproducibility."""
 
+import math
 import re
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -36,11 +37,15 @@ from NanoVNASaver.CalibrationCoverage import coverage_from_calibration
 from NanoVNASaver.Hardware.Simulated import make_simulated_vna
 from NanoVNASaver.Measurement import (
     CalibrationIdentity,
+    CorrectionSource,
+    CorrectionState,
     SweepInfo,
     snapshot_from_datapoints,
 )
 from NanoVNASaver.Reports import (
+    CorrectionKind,
     build_report,
+    correction_kind,
     csv_summary,
     provenance_labels,
     render_html,
@@ -196,6 +201,180 @@ class TestProvenanceLabels:
         trace = collection.add(calibrated)
         labels = provenance_labels(build_report("x", [trace]).traces[0])
         assert "UNCALIBRATED" not in labels
+
+    @staticmethod
+    def test_delay_only_correction_is_not_labelled_as_calibrated():
+        """Provenance must separate an offset delay from a calibration."""
+        snapshot = replace(
+            _snapshot("antenna", 13e6, 15e6),
+            correction=CorrectionState(
+                applied=True,
+                identity="",
+                source=CorrectionSource.APPLICATION,
+                offset_delay=1e-9,
+            ),
+        )
+        collection = TraceCollection()
+        trace = collection.add(snapshot)
+        labels = provenance_labels(build_report("x", [trace]).traces[0])
+
+        assert "corrected (application)" not in labels
+        assert any("offset delay" in label for label in labels)
+        assert "UNCALIBRATED" in labels
+
+    @staticmethod
+    def test_delay_only_correction_html_names_the_delay():
+        snapshot = replace(
+            _snapshot("antenna", 13e6, 15e6),
+            correction=CorrectionState(
+                applied=True,
+                identity="",
+                source=CorrectionSource.APPLICATION,
+                offset_delay=33e-12,
+            ),
+        )
+        collection = TraceCollection()
+        trace = collection.add(snapshot)
+        document = render_html(build_report("x", [trace]))
+
+        assert "offset delay only" in document
+        assert "33 ps" in document
+        assert "not applied (raw data)" not in document
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        ("source", "offset_delay"),
+        [
+            (CorrectionSource.DEVICE, 0.0),
+            (CorrectionSource.UNKNOWN, 0.0),
+            (CorrectionSource.APPLICATION, 0.0),
+            (CorrectionSource.DEVICE, 1e-9),
+        ],
+        ids=["device", "unknown", "application-no-delay", "device-delay"],
+    )
+    def test_identityless_non_delay_corrections_are_not_called_delays(
+        source, offset_delay
+    ):
+        """A missing identity is not proof that only a delay was applied."""
+        snapshot = replace(
+            _snapshot("antenna", 13e6, 15e6),
+            correction=CorrectionState(
+                applied=True,
+                identity="",
+                source=source,
+                offset_delay=offset_delay,
+            ),
+        )
+        collection = TraceCollection()
+        trace = collection.add(snapshot)
+        model = build_report("x", [trace])
+        labels = provenance_labels(model.traces[0])
+        document = render_html(model)
+
+        assert not any("offset delay" in label for label in labels)
+        assert "offset delay" not in document
+        assert f"corrected ({source.value})" in labels
+        assert f"applied from {source.value}" in document
+        assert "calibration identity not recorded" in document
+
+    @staticmethod
+    def test_an_unapplied_correction_is_reported_as_raw():
+        """``applied`` decides, not the presence of an identity."""
+        snapshot = replace(
+            _snapshot("antenna", 13e6, 15e6),
+            correction=CorrectionState(
+                applied=False,
+                identity="known-identity",
+                source=CorrectionSource.NONE,
+                offset_delay=0.0,
+            ),
+        )
+        collection = TraceCollection()
+        trace = collection.add(snapshot)
+        model = build_report("x", [trace])
+        labels = provenance_labels(model.traces[0])
+        document = render_html(model)
+
+        assert not any("corrected" in label for label in labels)
+        assert "not applied (raw data)" in document
+        assert "known-identity" not in document
+
+
+class TestCorrectionKind:
+    @staticmethod
+    @pytest.mark.parametrize(
+        ("correction", "expected"),
+        [
+            (CorrectionState(), CorrectionKind.NONE),
+            (
+                CorrectionState(
+                    applied=True,
+                    identity="cal-1",
+                    source=CorrectionSource.APPLICATION,
+                    offset_delay=1e-9,
+                ),
+                CorrectionKind.CALIBRATED,
+            ),
+            (
+                CorrectionState(
+                    applied=True,
+                    identity="",
+                    source=CorrectionSource.APPLICATION,
+                    offset_delay=1e-9,
+                ),
+                CorrectionKind.OFFSET_DELAY_ONLY,
+            ),
+            (
+                CorrectionState(
+                    applied=True,
+                    identity="",
+                    source=CorrectionSource.APPLICATION,
+                    offset_delay=0.0,
+                ),
+                CorrectionKind.UNIDENTIFIED,
+            ),
+            (
+                CorrectionState(
+                    applied=True,
+                    identity="",
+                    source=CorrectionSource.DEVICE,
+                    offset_delay=0.0,
+                ),
+                CorrectionKind.UNIDENTIFIED,
+            ),
+            (
+                CorrectionState(
+                    applied=True,
+                    identity="",
+                    source=CorrectionSource.APPLICATION,
+                    offset_delay=math.nan,
+                ),
+                CorrectionKind.UNIDENTIFIED,
+            ),
+            (
+                CorrectionState(
+                    applied=False,
+                    identity="cal-1",
+                    source=CorrectionSource.APPLICATION,
+                ),
+                CorrectionKind.NONE,
+            ),
+        ],
+        ids=[
+            "none",
+            "calibrated",
+            "delay-only",
+            "application-no-delay",
+            "device",
+            "non-finite-delay",
+            "not-applied-with-identity",
+        ],
+    )
+    def test_classifies_from_its_full_facts(correction, expected):
+        snapshot = replace(
+            _snapshot("antenna", 13e6, 15e6), correction=correction
+        )
+        assert correction_kind(snapshot) is expected
 
 
 class TestPlots:

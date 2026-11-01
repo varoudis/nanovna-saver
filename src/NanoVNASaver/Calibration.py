@@ -17,14 +17,16 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import cmath
+import copy
 import logging
 import math
 import os
 import re
 from collections import UserDict, defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
+import numpy as np
 from scipy.interpolate import interp1d
 
 from .RFTools import Datapoint
@@ -72,6 +74,199 @@ def correct_delay(d: Datapoint, delay: float, reflect: bool = False):
         complex(0, 1) * 2 * math.pi * d.freq * delay * -1 * mult
     )
     return Datapoint(d.freq, corr_data.real, corr_data.imag)
+
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def validate_delay(delay: float) -> float:
+    """Return ``delay`` as a finite float, rejecting anything else.
+
+    A non-finite offset delay (``inf`` or ``NaN``) makes every corrected
+    sample non-finite.  Rejecting it here stops an acquisition with an
+    actionable message instead of publishing a "corrected" measurement full
+    of ``NaN``.
+    """
+    if isinstance(delay, bool) or not isinstance(
+        delay, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(
+            f"Offset delay must be a finite time in seconds, got {delay!r}"
+        )
+    value = float(delay)
+    if not math.isfinite(value):
+        raise ValueError(
+            f"Offset delay must be a finite time in seconds, got {delay!r}"
+        )
+    return value
+
+
+def datapoints_to_arrays(
+    points: Sequence[Datapoint],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split datapoints into integer frequencies and complex values.
+
+    The frequency array keeps the exact integer hertz values, so a round trip
+    through :func:`arrays_to_datapoints` cannot change a frequency.  A
+    frequency that is not a finite integer number of hertz is rejected
+    instead of being truncated by the array conversion.
+    """
+    count = len(points)
+    frequencies = [point.freq for point in points]
+    if {type(freq) for freq in frequencies} <= {int}:
+        # Whole sweeps are all plain ints; one min/max check replaces a
+        # validation call per point.
+        if frequencies:
+            low = min(frequencies)
+            high = max(frequencies)
+            if low < _INT64_MIN or high > _INT64_MAX:
+                _datapoint_frequency(low if low < _INT64_MIN else high)
+        freq = np.fromiter(frequencies, np.int64, count)
+    else:
+        freq = np.fromiter(
+            (_datapoint_frequency(value) for value in frequencies),
+            np.int64,
+            count,
+        )
+    values = np.fromiter((point.z for point in points), np.complex128, count)
+    return freq, values
+
+
+def _datapoint_frequency(freq) -> int:
+    """Validate one datapoint frequency for the array conversion."""
+    if not isinstance(freq, (int, np.integer)) or isinstance(freq, bool):
+        if (
+            isinstance(freq, (float, np.floating))
+            and math.isfinite(freq)
+            and float(freq).is_integer()
+        ):
+            freq = int(freq)
+        else:
+            raise ValueError(
+                "Datapoint frequencies must be finite integer hertz values,"
+                f" got {freq!r}"
+            )
+    value = int(freq)
+    if not _INT64_MIN <= value <= _INT64_MAX:
+        raise ValueError(
+            f"Datapoint frequency {value!r} Hz cannot be represented"
+            " as a 64-bit integer"
+        )
+    return value
+
+
+def _integer_frequencies(freq: np.ndarray) -> list[int]:
+    """Return ``freq`` as Python ints, rejecting values that do not fit.
+
+    Float and object arrays are accepted only when every value is finite,
+    integral and inside the ``int64`` range.  Casting ``inf`` or ``nan`` to
+    an integer would otherwise produce an arbitrary frequency
+    (``INT64_MAX`` or ``INT64_MIN``) and publish it as measured data.
+    """
+    if freq.dtype.kind == "O":
+        # Python ints beyond the int64 range make NumPy choose an object
+        # array; validate them elementwise so the error names the value.
+        return [_datapoint_frequency(value) for value in freq.tolist()]
+    if freq.dtype.kind == "f":
+        non_finite = ~np.isfinite(freq)
+        if non_finite.any():
+            raise ValueError(
+                "Bulk datapoint conversion needs finite frequencies,"
+                f" got {freq[non_finite][0]!r}"
+            )
+        rounded = np.rint(freq)
+        whole = rounded == freq
+        if not whole.all():
+            raise ValueError(
+                "Bulk datapoint conversion needs integer frequencies,"
+                f" got {freq[~whole][0]!r}"
+            )
+    elif freq.dtype.kind not in "iu":
+        raise ValueError(
+            "Bulk datapoint conversion needs integer frequencies,"
+            f" got a {freq.dtype.kind!r} array"
+        )
+    if freq.size:
+        low = int(freq.min())
+        high = int(freq.max())
+        if low < _INT64_MIN or high > _INT64_MAX:
+            out_of_range = low if low < _INT64_MIN else high
+            raise ValueError(
+                "Bulk datapoint conversion needs frequencies that fit in a"
+                f" 64-bit integer, got {out_of_range!r}"
+            )
+    return [int(value) for value in freq.tolist()]
+
+
+def arrays_to_datapoints(
+    freq: np.ndarray, values: np.ndarray
+) -> list[Datapoint]:
+    """Rebuild datapoints from an integer frequency array and complex values.
+
+    Frequencies must be finite, integral and representable as ``int``; see
+    :func:`_integer_frequencies`.  Anything else raises ``ValueError`` rather
+    than being cast to an arbitrary integer.
+    """
+    freq_arr = np.asarray(freq)
+    values_arr = np.asarray(values, dtype=np.complex128)
+    if freq_arr.ndim != 1 or values_arr.ndim != 1:
+        raise ValueError("Bulk datapoint conversion needs 1-D arrays")
+    if len(freq_arr) != len(values_arr):
+        raise ValueError(
+            f"Bulk datapoint conversion needs {len(freq_arr)} frequencies for"
+            f" {len(values_arr)} values"
+        )
+    return list(
+        map(
+            Datapoint,
+            _integer_frequencies(freq_arr),
+            values_arr.real.tolist(),
+            values_arr.imag.tolist(),
+        )
+    )
+
+
+def correct_delay_bulk(
+    freq: np.ndarray, values: np.ndarray, delay: float, reflect: bool = False
+) -> np.ndarray:
+    """Vectorised :func:`correct_delay`.
+
+    Evaluates the same phase term over a whole array.  ``numpy.exp`` may
+    differ from ``cmath.exp`` in the last bit, so results are numerically
+    equal to the scalar version rather than bit-identical.
+
+    ``delay`` must be finite and the result must stay finite: an offset
+    delay that cannot produce real sample values (``inf``, ``NaN``, or a
+    phase term that overflows) raises ``ValueError`` instead of returning
+    non-finite samples as corrected data.
+    """
+    freq_arr = np.asarray(freq, dtype=np.float64)
+    values_arr = np.asarray(values, dtype=np.complex128)
+    if freq_arr.ndim != 1 or values_arr.ndim != 1:
+        raise ValueError("Bulk delay correction needs 1-D arrays")
+    if len(freq_arr) != len(values_arr):
+        raise ValueError(
+            f"Bulk delay correction needs {len(freq_arr)} frequencies,"
+            f" got {len(values_arr)} values"
+        )
+    delay_value = validate_delay(delay)
+    if not len(freq_arr) or delay_value == 0.0:
+        return values_arr.copy()
+    mult = 2 if reflect else 1
+    with np.errstate(over="ignore", invalid="ignore"):
+        corrected = values_arr * np.exp(
+            complex(0, 1) * 2 * math.pi * freq_arr * delay_value * -1 * mult
+        )
+    finite = np.isfinite(corrected.real) & np.isfinite(corrected.imag)
+    if not finite.all():
+        first = freq_arr[~finite][0]
+        raise ValueError(
+            f"Offset delay of {delay_value!r} s produces non-finite corrected"
+            f" values, starting at {first!r} Hz."
+            " Check the offset delay setting."
+        )
+    return corrected
 
 
 @dataclass
@@ -288,7 +483,23 @@ class Calibration:
         self.interp = {}
         self.isCalculated = False
 
-        self.source = "Manual"
+    def frozen_copy(self) -> "Calibration":
+        """Return an independent copy of this calibration's current state.
+
+        Used at a run boundary so that later ``load()``/``calc_corrections()``
+        calls on the live object — including in-place recalculation of the
+        same instance — cannot change the coefficients, validity or identity
+        that a running acquisition already depends on.  The copy is a deep
+        copy of the calibration data and standards, plus a shallow copy of
+        the interpolation table (the ``interp1d`` objects are immutable once
+        built and are replaced, never mutated, by ``gen_interpolation``).
+        """
+        frozen = copy.copy(self)
+        frozen.dataset = copy.deepcopy(self.dataset)
+        frozen.cal_element = copy.deepcopy(self.cal_element)
+        frozen.interp = dict(self.interp)
+        frozen.notes = list(self.notes)
+        return frozen
 
     def insert(self, name: str, data: list[Datapoint]):
         for dp in data:
@@ -556,6 +767,111 @@ class Calibration:
             / (i["e11"](dp.freq) * dp11.z - i["delta_e"](dp.freq))
         )
         return Datapoint(dp.freq, s21.real, s21.imag)
+
+    # -- bulk (NumPy) correction ---------------------------------------
+    #
+    # The scalar methods above stay the reference implementation.  The bulk
+    # path evaluates the same equations over whole arrays: interpolation is
+    # done by calling each ``interp1d`` once with the frequency array (SciPy
+    # handles the linear search and the endpoint fill in C), then the exact
+    # same arithmetic as ``correct11``/``correct21`` is applied elementwise.
+    # Dividing elementwise in NumPy may differ from CPython's complex
+    # division by a fraction of an ULP, so results are numerically equal, not
+    # bit-identical, to the scalar oracle.
+
+    def _interp_channel(self, name: str, freq: np.ndarray) -> np.ndarray:
+        """Evaluate one interpolation channel over a frequency array."""
+        try:
+            interpolator = self.interp[name]
+        except KeyError as exc:  # pragma: no cover - programming error
+            raise ValueError(
+                "Calibration is not calculated: call calc_corrections()"
+            ) from exc
+        return np.asarray(interpolator(freq), dtype=np.complex128)
+
+    def correct11_bulk(self, freq: np.ndarray, s11: np.ndarray) -> np.ndarray:
+        """Correct S11 for every frequency in one vectorised pass.
+
+        ``freq`` and ``s11`` must be 1-D arrays of equal, non-zero length.
+        Returns the corrected complex S11 array with the same length.  The
+        equations and edge-holding behaviour are those of :meth:`correct11`.
+
+        Raises ``ValueError`` when a sample cannot be corrected (a vanishing
+        denominator, or a non-finite result).  Returning ``inf``/``NaN``
+        samples would present an invalid calibration as corrected data.
+        """
+        freq_arr = np.asarray(freq, dtype=np.float64)
+        s11_arr = np.asarray(s11, dtype=np.complex128)
+        self._check_bulk_arrays("S11", freq_arr, s11_arr)
+        e00 = self._interp_channel("e00", freq_arr)
+        e11 = self._interp_channel("e11", freq_arr)
+        delta_e = self._interp_channel("delta_e", freq_arr)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            corrected = (s11_arr - e00) / ((s11_arr * e11) - delta_e)
+        self._check_bulk_result("S11", freq_arr, corrected)
+        return corrected
+
+    def correct21_bulk(
+        self, freq: np.ndarray, s21: np.ndarray, s11: np.ndarray
+    ) -> np.ndarray:
+        """Correct S21 for every frequency in one vectorised pass.
+
+        ``s11`` is the *raw* port-1 reflection of the same frequency, exactly
+        as :meth:`correct21` expects; the caller must not pass corrected S11.
+        The three arrays must be 1-D with equal, non-zero length.  Raises
+        ``ValueError`` like :meth:`correct11_bulk`.
+        """
+        freq_arr = np.asarray(freq, dtype=np.float64)
+        s21_arr = np.asarray(s21, dtype=np.complex128)
+        s11_arr = np.asarray(s11, dtype=np.complex128)
+        self._check_bulk_arrays("S21", freq_arr, s21_arr, s11_arr)
+        e30 = self._interp_channel("e30", freq_arr)
+        e10e32 = self._interp_channel("e10e32", freq_arr)
+        e10e01 = self._interp_channel("e10e01", freq_arr)
+        e11 = self._interp_channel("e11", freq_arr)
+        delta_e = self._interp_channel("delta_e", freq_arr)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            s21_corr = (s21_arr - e30) / e10e32
+            corrected = s21_corr * (e10e01 / ((e11 * s11_arr) - delta_e))
+        self._check_bulk_result("S21", freq_arr, corrected)
+        return corrected
+
+    @staticmethod
+    def _check_bulk_result(
+        channel: str, freq: np.ndarray, corrected: np.ndarray
+    ) -> None:
+        """Refuse to publish an invalid correction as corrected data."""
+        finite = np.isfinite(corrected.real) & np.isfinite(corrected.imag)
+        if finite.all():
+            return
+        invalid = int(np.count_nonzero(~finite))
+        first = int(freq[~finite][0])
+        raise ValueError(
+            f"{channel} correction is undefined for {invalid} of"
+            f" {len(freq)} point(s), starting at {first} Hz."
+            " The calibration or the measured data is invalid there."
+        )
+
+    @staticmethod
+    def _check_bulk_arrays(
+        channel: str, freq: np.ndarray, *values: np.ndarray
+    ) -> None:
+        """Reject shapes that would silently broadcast or index wrongly."""
+        if freq.ndim != 1 or any(value.ndim != 1 for value in values):
+            raise ValueError(
+                f"{channel} bulk correction needs 1-D arrays, got shapes "
+                f"{[freq.shape, *(value.shape for value in values)]}"
+            )
+        if not len(freq):
+            raise ValueError(
+                f"{channel} bulk correction needs at least 1 point"
+            )
+        for value in values:
+            if len(value) != len(freq):
+                raise ValueError(
+                    f"{channel} bulk correction needs {len(freq)} values, "
+                    f"got {len(value)}"
+                )
 
     def save(self, filename: str):
         self.dataset.notes = "\n".join(self.notes)

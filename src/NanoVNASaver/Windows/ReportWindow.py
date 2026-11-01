@@ -30,7 +30,7 @@ broken.  The plots are part of the exported file and the window says so.
 """
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -38,9 +38,11 @@ from ..Analysis.Results import AnalysisKind, analyse_snapshot
 from ..CalibrationCoverage import coverage_from_calibration
 from ..Limits import LimitSet, Verdict
 from ..Reports import (
+    CorrectionKind,
     ReportModel,
     ReportTrace,
     build_report,
+    correction_kind,
     render_html,
     report_plots,
     write_csv,
@@ -371,11 +373,60 @@ class ReportWindow(QtWidgets.QWidget):
     # Warnings
     # ------------------------------------------------------------------
     def _uncorrected(self, trace: ReportTrace) -> bool:
-        """True when the reported values are not calibration-corrected."""
-        if not trace.snapshot.correction.applied:
+        """True when the reported values are not calibration-corrected.
+
+        Both facts are required: a correction must actually have been
+        *applied*, and it must be backed by an identified calibration whose
+        coverage says it applies here.  A recorded identity alone is not
+        evidence that anything took effect, and an applied correction with no
+        calibration identity (an offset-delay-only run) is not calibrated.
+        """
+        correction = trace.snapshot.correction
+        if not correction.applied or not correction.identity:
             return True
         coverage = trace.coverage
         return coverage is None or not coverage.has_calibration
+
+    def _warning_text(self, traces: Sequence[ReportTrace]) -> str:
+        """Describe calibration state without calling corrected data raw."""
+        uncorrected = [trace for trace in traces if self._uncorrected(trace)]
+        if not uncorrected:
+            return ""
+        raw: list[str] = []
+        delay_only: list[str] = []
+        unverified: list[str] = []
+        for trace in uncorrected:
+            kind = correction_kind(trace.snapshot)
+            if kind is CorrectionKind.OFFSET_DELAY_ONLY:
+                delay_only.append(trace.name)
+            elif kind is CorrectionKind.NONE:
+                raw.append(trace.name)
+            else:
+                # A correction ran, but nothing ties it to a calibration that
+                # covers this sweep: neither "raw" nor "calibrated" is true.
+                unverified.append(trace.name)
+        sentences = []
+        if raw:
+            sentences.append(
+                "No calibration applied to: "
+                + ", ".join(raw)
+                + ". Values are raw measurements."
+            )
+        if delay_only:
+            sentences.append(
+                "No SOL calibration applied to: "
+                + ", ".join(delay_only)
+                + ". Values have an offset delay correction applied, not a"
+                " calibration."
+            )
+        if unverified:
+            sentences.append(
+                "Correction provenance not verified for: "
+                + ", ".join(unverified)
+                + ". Values are corrected, but no calibration is verified to"
+                " cover them."
+            )
+        return " ".join(sentences)
 
     def _update_warnings(self, model: ReportModel) -> None:
         if model.simulated:
@@ -388,16 +439,9 @@ class ReportWindow(QtWidgets.QWidget):
             self.label_simulated.setText("")
         self.label_simulated.setVisible(bool(model.simulated))
 
-        uncorrected = [t.name for t in model.traces if self._uncorrected(t)]
-        if uncorrected:
-            self.label_uncalibrated.setText(
-                "No calibration applied to: "
-                + ", ".join(uncorrected)
-                + ". Values are raw measurements."
-            )
-        else:
-            self.label_uncalibrated.setText("")
-        self.label_uncalibrated.setVisible(bool(uncorrected))
+        text = self._warning_text(model.traces)
+        self.label_uncalibrated.setText(text)
+        self.label_uncalibrated.setVisible(bool(text))
 
         self._update_limit_label(model)
 
