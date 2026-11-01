@@ -103,7 +103,22 @@ it. Three built-ins ship: Antenna, Filter, and Cable.
 * Built-ins cannot be renamed or deleted. Your own presets can be saved,
   duplicated, renamed, deleted, exported, and imported.
 
-## 8. Reports
+## 8. Antenna tuning
+
+**Antenna tuning ...** is a guided overview -> minimum -> zoom -> repeat ->
+export workflow. See `ANTENNA_TUNING.md` for the full description.
+
+* The overview sweep runs inside the device range with a supported point
+  count, then reports the lowest **measured** VSWR sample and places a marker
+  on it.
+* Zoom centres a narrow sweep on that sample; repeat re-runs the same window
+  while you adjust the antenna.
+* Export writes a one-port Touchstone file named after the resonance and the
+  timestamp, with the measured minimum and its provenance in the comments.
+* A cancelled sweep, a failed sweep, or a completion from a different span
+  never advances the workflow or becomes exportable data.
+
+## 9. Reports
 
 The report window builds a document from the traces you select:
 
@@ -135,7 +150,7 @@ not valid for such a file. Treat the zeros as absent data.
 dependency, so a PDF would require adding one; the HTML file is
 self-contained and prints correctly from a browser.
 
-## 9. Export
+## 10. Export
 
 * `S1P` writes S11.
 * `S2P` writes all four columns. A channel the measurement never had (for
@@ -146,7 +161,7 @@ self-contained and prints correctly from a browser.
   export never leaves a truncated file behind.
 * The simulation marker is re-read when the file is loaded again.
 
-## 10. What this walkthrough does not verify
+## 11. What this walkthrough does not verify
 
 * Any physical device: accuracy, calibration validity, protocol quirks, or
   firmware-specific behaviour.

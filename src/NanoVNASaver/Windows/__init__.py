@@ -1,5 +1,6 @@
 from .About import AboutWindow
 from .AnalysisWindow import AnalysisWindow
+from .AntennaTuning import AntennaTuningWindow
 from .Bands import BandsWindow
 from .CalibrationSettings import CalibrationWindow
 from .DeviceSettings import DeviceSettingsWindow
@@ -17,6 +18,7 @@ from .TDR import TDRWindow
 __all__ = [
     "AboutWindow",
     "AnalysisWindow",
+    "AntennaTuningWindow",
     "BandsWindow",
     "CalibrationWindow",
     "DeviceSettingsWindow",

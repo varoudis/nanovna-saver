@@ -38,6 +38,7 @@ from NanoVNASaver.SweepWorker import SweepCapture, SweepWorker
 class Recorder:
     sample_ready: list = field(default_factory=list)
     run_finished: list = field(default_factory=list)
+    run_request_finished: list = field(default_factory=list)
     state_changed: list = field(default_factory=list)
     progress: list = field(default_factory=list)
     finished: int = 0
@@ -49,8 +50,10 @@ class Emitter:
         self._recorder = recorder
         self._name = name
 
-    def emit(self, payload=None):
-        getattr(self._recorder, self._name).append(payload)
+    def emit(self, *payload):
+        getattr(self._recorder, self._name).append(
+            payload[0] if len(payload) == 1 else payload
+        )
 
 
 class Counter:
@@ -75,6 +78,9 @@ class Signals:
     )
     run_finished = property(
         lambda self: Emitter(self._recorder, "run_finished")
+    )
+    run_request_finished = property(
+        lambda self: Emitter(self._recorder, "run_request_finished")
     )
     finished = property(lambda self: Counter(self._recorder, "finished"))
     sweep_error = property(lambda self: Counter(self._recorder, "sweep_error"))
@@ -117,6 +123,8 @@ def _worker(segments=1, points=101):
     worker._retry_count = 0
     worker._retry_reason = ""
     worker._last_terminal = None
+    worker._request_token = None
+    worker._active_token = None
     recorder = Recorder()
     worker.signals = Signals(recorder)
     return worker, recorder

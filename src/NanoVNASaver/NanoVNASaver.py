@@ -102,6 +102,7 @@ from .Traces import TraceKind
 from .Windows import (
     AboutWindow,
     AnalysisWindow,
+    AntennaTuningWindow,
     CalibrationWindow,
     DeviceSettingsWindow,
     DisplaySettingsWindow,
@@ -452,6 +453,7 @@ class NanoVNASaver(QWidget):
         self.windows: dict[str, QtWidgets.QDialog] = {
             "about": AboutWindow(self),
             "analysis": AnalysisWindow(self),
+            "antenna_tuning": AntennaTuningWindow(self),
             "calibration": CalibrationWindow(self),
             "device_settings": DeviceSettingsWindow(self),
             "file": FilesWindow(self),
@@ -671,6 +673,16 @@ class NanoVNASaver(QWidget):
         )
         btn_limits.clicked.connect(lambda: self.display_window("limits"))
 
+        btn_antenna = QtWidgets.QPushButton("Antenna tuning ...")
+        btn_antenna.setMinimumHeight(20)
+        btn_antenna.setToolTip(
+            "Guided overview sweep, zoom to the measured VSWR minimum,"
+            " repeat while tuning, and export the result as an S1P file"
+        )
+        btn_antenna.clicked.connect(
+            lambda: self.display_window("antenna_tuning")
+        )
+
         btn_report = QtWidgets.QPushButton("Report ...")
         btn_report.setMinimumHeight(20)
         btn_report.setToolTip(
@@ -685,8 +697,12 @@ class NanoVNASaver(QWidget):
         button_grid.addWidget(btn_presets, 1, 1)
         button_grid.addWidget(btn_report, 2, 0)
         button_grid.addWidget(btn_limits, 2, 1)
-        button_grid.addWidget(btn_display_setup, 3, 0)
-        button_grid.addWidget(btn_about, 3, 1)
+        # The guided antenna workflow gets its own full-width row: every
+        # control must stay visible in a distinct cell (limits already owns
+        # the cell antenna was drafted into).
+        button_grid.addWidget(btn_antenna, 3, 0, 1, 2)
+        button_grid.addWidget(btn_display_setup, 4, 0)
+        button_grid.addWidget(btn_about, 4, 1)
         left_column.addLayout(button_grid)
 
         logger.debug("Finished building interface")
@@ -1253,6 +1269,44 @@ class NanoVNASaver(QWidget):
         self.apply_preset_parameters(application.parameters)
         self.sweep_control.update_center_span()
         self.mark_session_changed("sweep")
+
+    def apply_sweep_configuration(
+        self,
+        *,
+        start: int,
+        end: int,
+        segments: int,
+        points: int,
+        logarithmic: bool = False,
+    ) -> bool:
+        """Apply a complete sweep configuration as one change.
+
+        Used by guided workflows that must not leave the sweep half-configured
+        (a new span with the old point count is a different measurement).
+        The device point count is applied first, because
+        ``SweepControl.update_sweep`` derives the sweep's points from it.
+        Nothing is started, connected or swept here.
+
+        Returns whether the resulting sweep matches the request.
+        """
+        self._restoring = True
+        try:
+            self.sweep_control.set_start(start)
+            self.sweep_control.set_end(end)
+            self.sweep_control.set_segments(max(int(segments), 1))
+            self._apply_point_count(int(points))
+            # A guided workflow measures one span at a time; a continuous or
+            # averaging mode left over from elsewhere would change what the
+            # reported minimum means.
+            self.sweep.set_mode(SweepMode.SINGLE)
+            self.sweep.set_logarithmic(bool(logarithmic))
+            self.sweep_control.update_center_span()
+            self.sweep_control.update_step_size()
+        finally:
+            self._restoring = False
+        sweep = self.sweep
+        applied = (sweep.start, sweep.end, sweep.points, sweep.segments)
+        return applied == (int(start), int(end), int(points), int(segments))
 
     def apply_preset_charts(self, names) -> bool:
         """Show the preset's charts in the main grid.

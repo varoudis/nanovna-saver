@@ -164,7 +164,14 @@ class SweepCapture:
 
 @dataclass(frozen=True)
 class SweepSample:
-    """One published, immutable acquisition result (SWEEP-02.2)."""
+    """One published, immutable acquisition result (SWEEP-02.2).
+
+    ``request_token`` is the token the caller bound to this run (``None``
+    when it bound none).  It is captured here, in the acquisition thread,
+    rather than looked up when the queued signal is delivered: by then a
+    newer run may own the worker, and the old sample must not be attributed
+    to it.
+    """
 
     sweep_id: int
     segment: int
@@ -174,6 +181,7 @@ class SweepSample:
     completion: CompletionState
     capture: SweepCapture
     snapshot: object = None
+    request_token: object = None
 
 
 class WorkerSignals(QObject):
@@ -187,16 +195,34 @@ class WorkerSignals(QObject):
     sample_ready = Signal(object)
     #: Emitted once per run with the terminal ``SweepState``.
     run_finished = Signal(object)
+    #: Emitted once per run with ``(terminal, request_token)``.
+    #:
+    #: ``run_finished`` alone cannot say *which* run finished: a terminal
+    #: event already queued for an earlier run is delivered to whoever is
+    #: listening next, so a caller that re-armed an identical sweep would
+    #: adopt somebody else's result.  This signal repeats the same terminal
+    #: state and adds the correlation token the caller supplied.
+    run_request_finished = Signal(object, object)
 
 
 class SweepWorker(QThread):
+    """Runs exactly one acquisition at a time on its own thread."""
+
     #: Reason the last segment read was unusable ("" once data is valid).
     _segment_error = ""
+
+    #: Class-level defaults keep the worker usable when it is built without
+    #: ``__init__`` (headless harnesses construct it via ``__new__``);
+    #: ``__init__`` rebinds them per instance.
+    _request_token: object = None
+    _active_token: object = None
 
     def __init__(self, app: "vna_app") -> None:
         super().__init__()
         logger.info("Initializing SweepWorker")
         self.signals: WorkerSignals = WorkerSignals()
+        self._request_token = None
+        self._active_token = None
         self.app = app
         self.sweep = Sweep()
         self.percentage: float = 0.0
@@ -252,6 +278,21 @@ class SweepWorker(QThread):
         """Alias for :meth:`quit` used by the UI."""
         self.quit()
 
+    def bind_next_run(self, token: object) -> None:
+        """Correlate the *next* run with ``token``.
+
+        Nothing is started here.  A caller that must recognise its own
+        terminal event - rather than any event that happens to arrive next -
+        passes a token it can compare by identity; :attr:`request_token`
+        then reports which token the running (or last finished) run carried.
+        """
+        self._request_token = token
+
+    @property
+    def request_token(self) -> object:
+        """Token of the run currently publishing (``None`` when idle)."""
+        return self._active_token
+
     @Slot()
     def run(self) -> None:
         """QThread entry point."""
@@ -261,6 +302,8 @@ class SweepWorker(QThread):
     def run_once(self) -> None:
         """Synchronous entry point used by tests and headless runs."""
         self._sweep_counter += 1
+        self._active_token = self._request_token
+        self._request_token = None
         self._state_machine.reset(self._sweep_counter)
         self._last_terminal = None
         self._started_at = monotonic()
@@ -308,12 +351,19 @@ class SweepWorker(QThread):
             self._state_machine.terminal_count += 1
             self._state_machine.history.append(terminal)
         self._last_terminal = self._state_machine.state
+        token = self._active_token
         logger.debug(
             "Sweep %s finished as %s", self.sweep_id, self._last_terminal.value
         )
         if self._last_terminal is SweepState.COMPLETED:
             self.signals.finished.emit()
         self.signals.run_finished.emit(self._last_terminal)
+        # The token is emitted *after* the generic signal and never cleared
+        # before emitting: a listener that only knows the token can still
+        # correlate this completion, and a listener that ignores it keeps
+        # the established behaviour.
+        self.signals.run_request_finished.emit(self._last_terminal, token)
+        self._active_token = None
 
     def _transition(self, new_state: SweepState) -> None:
         if self._state_machine.transition(new_state):
@@ -602,6 +652,7 @@ class SweepWorker(QThread):
             completion=completion,
             capture=capture,
             snapshot=snapshot,
+            request_token=self._active_token,
         )
         logger.debug(
             "Publishing %d/%d points for sweep %s (%s)",
