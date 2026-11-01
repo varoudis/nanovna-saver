@@ -19,7 +19,6 @@
 
 
 import logging
-from time import sleep
 from typing import TYPE_CHECKING
 
 from PySide6 import QtWidgets
@@ -127,8 +126,17 @@ class MagLoopAnalysis(VSWRAnalysis):
         self.app.sweep_control.set_start(new_start)
         self.app.sweep_control.set_end(new_end)
 
-        # TODO: get info if sweep is running instead of just sleeping
-        #       a guessed time
-        sleep(2.0)
+        # SWEEP-04.3: continue when the next sweep actually completes rather
+        # than after a guessed delay.  A cancelled or failed sweep clears the
+        # continuation, so the analysis sequence stops with the sweep.
+        self.app.run_after_sweep(self._continue_analysis)
         if self.app.sweep_control.btn_start.isEnabled():
             self.app.sweep_start()
+        else:
+            # A sweep is already running; the continuation above still fires
+            # when it completes, so no follow-up sweep is started here.
+            logger.debug("Sweep active, deferring analysis continuation")
+
+    def _continue_analysis(self) -> None:
+        logger.debug("MagLoop: continuing analysis after a completed sweep")
+        self.runAnalysis()

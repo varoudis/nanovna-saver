@@ -114,7 +114,29 @@ class SweepControl(Control):
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
         self.layout.addRow(self.progress_bar)
+
+        #: Lifecycle state, e.g. "Measuring" or "Cancelling".
+        self.label_state = QtWidgets.QLabel("Idle")
+        self.label_state.setObjectName("sweep_state")
+        #: Segment/average position plus timing information.
+        self.label_progress = QtWidgets.QLabel("")
+        self.label_progress.setObjectName("sweep_progress")
+        self.label_progress.setWordWrap(True)
+        status_layout = QtWidgets.QVBoxLayout()
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(1)
+        status_layout.addWidget(self.label_state)
+        status_layout.addWidget(self.label_progress)
+        #: Calibration status and span (CAL-02.1).
+        self.label_calibration = QtWidgets.QLabel("Calibration: unknown")
+        self.label_calibration.setObjectName("calibration_status")
+        self.label_calibration.setWordWrap(True)
+        status_layout.addWidget(self.label_calibration)
+        status_widget = QtWidgets.QWidget()
+        status_widget.setLayout(status_layout)
+        self.layout.addRow(status_widget)
 
         self.btn_start = self._build_start_button()
         self.btn_stop = self._build_stop_button()
@@ -245,6 +267,59 @@ class SweepControl(Control):
 
     def update_sweep_btn(self, enabled: bool) -> None:
         self.btn_start.setEnabled(enabled)
+
+    def show_progress(self, progress) -> None:
+        """Render a :class:`SweepProgress` from the acquisition thread."""
+        self.label_state.setText(progress.state.value.capitalize())
+        if progress.continuous:
+            self.progress_bar.setMaximum(0)  # busy indicator, no percentage
+        else:
+            self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(int(progress.percentage))
+
+        parts = []
+        if progress.segments > 1:
+            parts.append(f"Segment {progress.segment}/{progress.segments}")
+        if progress.averages > 1:
+            parts.append(f"Average {progress.average}/{progress.averages}")
+        parts.append(f"Elapsed {progress.elapsed_seconds:.1f}s")
+        if progress.continuous:
+            parts.append("continuous mode")
+        elif progress.estimate_available:
+            parts.append(f"about {progress.estimate_seconds:.0f}s remaining")
+        else:
+            parts.append("estimating remaining time")
+        if progress.retry_count:
+            parts.append(
+                f"{progress.retry_count} retries"
+                + (
+                    f" ({progress.retry_reason})"
+                    if progress.retry_reason
+                    else ""
+                )
+            )
+        self.label_progress.setText(" · ".join(parts))
+
+    def show_calibration_status(self, coverage, source: str = "unknown"):
+        """Concise calibration status for the main window (CAL-02.1/02.4)."""
+        if coverage is None:
+            self.label_calibration.setText("Calibration: unknown")
+            self.label_calibration.setToolTip("")
+            return
+        text = f"Calibration: {coverage.describe()} · correction on {source}"
+        self.label_calibration.setText(text)
+        self.label_calibration.setToolTip(
+            "Coverage shows where calibration corrections are interpolated"
+            " or held at a span edge. It is not an uncertainty estimate and"
+            " says nothing about calibration age or connector condition."
+        )
+
+    def show_idle(self, message: str = "") -> None:
+        """Reset the progress display after a run ends."""
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.label_state.setText("Idle")
+        self.label_progress.setText(message)
 
     def get_settings(self) -> SweepConfig:
         return get_app_config().sweep_settings
