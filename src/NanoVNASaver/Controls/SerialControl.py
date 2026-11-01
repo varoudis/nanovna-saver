@@ -26,7 +26,18 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Signal
 
 from ..Hardware.Hardware import Interface, get_comment, get_interfaces, get_VNA
+from ..Hardware.ReplayScenario import (
+    ReplayData,
+    ReplayError,
+    ReplayScenario,
+    load_replay_file,
+)
 from ..Hardware.Simulated import make_simulated_vna
+from ..Settings.ReplayRange import (
+    ReplayRangeError,
+    ReplayRangePlan,
+    plan_replay_range,
+)
 from .Control import Control
 
 if TYPE_CHECKING:
@@ -35,14 +46,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Scenario name used for a Touchstone replay source.
+REPLAY_SCENARIO = "replay"
+
 #: Scenario names offered in demonstration mode (SIM-02.1).
-SCENARIO_NAMES = ("antenna", "filter", "cable", "attenuator")
+SCENARIO_NAMES = ("antenna", "filter", "cable", "attenuator", REPLAY_SCENARIO)
 
 SCENARIO_LABELS = {
     "antenna": "Antenna resonance",
     "filter": "Butterworth low-pass filter",
     "cable": "Coaxial cable",
     "attenuator": "Fixed attenuator",
+    REPLAY_SCENARIO: "Touchstone replay (file)",
 }
 
 
@@ -213,9 +228,15 @@ class SerialControl(Control):
 
         self.cb_scenario = QtWidgets.QComboBox()
         for name in SCENARIO_NAMES:
+            # Replay is a scenario, not a separate import path: its
+            # Touchstone file runs through the same sweep pipeline.
             self.cb_scenario.addItem(SCENARIO_LABELS[name], name)
         self.cb_scenario.setToolTip(
-            "Analytic scenario used by the simulated device."
+            "Scenario used by the simulated device. Touchstone replay sweeps"
+            " a recorded S1P/S2P file instead of an analytic model."
+        )
+        self.cb_scenario.currentIndexChanged.connect(
+            self.update_simulation_state
         )
         scenario_row = QtWidgets.QHBoxLayout()
         scenario_row.addWidget(QtWidgets.QLabel("Scenario"), stretch=0)
@@ -223,6 +244,28 @@ class SerialControl(Control):
         self.row_scenario = QtWidgets.QWidget()
         self.row_scenario.setLayout(scenario_row)
         self.layout.addRow(self.row_scenario)
+
+        # -- Touchstone replay source -------------------------------
+        self.btn_replay_file = QtWidgets.QPushButton("Choose replay file ...")
+        self.btn_replay_file.setMinimumHeight(20)
+        self.btn_replay_file.setToolTip(
+            "Choose a Touchstone .s1p or .s2p file to replay. Replay never"
+            " extrapolates beyond the file's own frequency range."
+        )
+        self.btn_replay_file.clicked.connect(self.choose_replay_file)
+        self.row_replay_file = QtWidgets.QWidget()
+        replay_file_layout = QtWidgets.QVBoxLayout(self.row_replay_file)
+        replay_file_layout.setContentsMargins(0, 0, 0, 0)
+        replay_file_layout.setSpacing(1)
+        replay_file_layout.addWidget(self.btn_replay_file)
+        self.label_replay_source = QtWidgets.QLabel("No replay file loaded")
+        self.label_replay_source.setObjectName("replay_source")
+        self.label_replay_source.setWordWrap(True)
+        replay_file_layout.addWidget(self.label_replay_source)
+        self.layout.addRow(self.row_replay_file)
+
+        #: Validated replay source; ``None`` until a file is chosen.
+        self._replay: ReplayData | None = None
 
         self.inp_port = QtWidgets.QComboBox()
         self.inp_port.setMinimumHeight(20)
@@ -278,6 +321,14 @@ class SerialControl(Control):
 
     def connect_device(self):
         """Connect, publishing the connected state only on full success."""
+        if self.sweep_active():
+            # Replacing the device mid-sweep would change what the running
+            # worker reads between segments.
+            self.app.showError(
+                "A sweep is running. Stop it before changing the device or"
+                " the replay source."
+            )
+            return
         previous_vna = self.app.vna
         interface = None
         try:
@@ -333,29 +384,200 @@ class SerialControl(Control):
     def selected_scenario(self) -> str:
         return self.cb_scenario.currentData() or SCENARIO_NAMES[0]
 
+    # -- replay source -------------------------------------------------
+    def replay_data(self) -> ReplayData | None:
+        """The loaded replay source, or ``None``."""
+        return self._replay
+
+    def sweep_active(self) -> bool:
+        """True while the worker is acquiring a sweep."""
+        worker = getattr(self.app, "worker", None)
+        running = getattr(worker, "isRunning", None)
+        return bool(running()) if callable(running) else False
+
+    def choose_replay_file(self, filename: str | None = None) -> bool:
+        """Load a Touchstone replay source, keeping the previous one on error.
+
+        Returns ``True`` when a valid source is loaded.  Any failure leaves
+        the previously working source untouched and reports the reason, so
+        a bad pick never silently changes what the next sweep replays.
+        """
+        if self.sweep_active():
+            # The running worker owns the device conversation; swapping the
+            # source would change the meaning of samples mid-acquisition.
+            self.app.showError(
+                "A sweep is running. Stop it before changing the replay source."
+            )
+            return False
+        connected_vna = getattr(self.app, "vna", None)
+        if getattr(connected_vna, "scenario_key", "") == REPLAY_SCENARIO and (
+            getattr(connected_vna, "connected", lambda: False)()
+        ):
+            # The connected device already captured its source; swapping the
+            # UI state would make the next sweep replay something other than
+            # what was announced.
+            self.app.showError(
+                "Disconnect the replay device before choosing another file."
+            )
+            return False
+        if filename is None:
+            filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Choose a Touchstone file to replay",
+                "",
+                "Touchstone Files (*.s1p *.s2p);;All files (*.*)",
+            )
+        if not filename:
+            return False
+        try:
+            source = load_replay_file(filename)
+        except ReplayError as exc:
+            logger.error("Replay source rejected: %s", exc)
+            self.app.showError(str(exc))
+            return False
+        except Exception as exc:  # never let a pick break the control
+            logger.exception("Unexpected replay load failure: %s", exc)
+            self.app.showError(f"The replay file could not be loaded: {exc}")
+            return False
+        self.set_replay_data(source)
+        return True
+
+    def set_replay_data(self, source: ReplayData | None) -> None:
+        """Publish a validated replay source and select the replay scenario."""
+        self._replay = source
+        if source is None:
+            self.label_replay_source.setText("No replay file loaded")
+            return
+        self.label_replay_source.setText(f"{source.name}\n{source.summary()}")
+        index = self.cb_scenario.findData(REPLAY_SCENARIO)
+        if index >= 0:
+            self.cb_scenario.setCurrentIndex(index)
+
+    def replay_vna(self):
+        """Build the replay device, or raise a user-facing failure."""
+        if self._replay is None:
+            raise DeviceConnectionError(
+                "No replay file is loaded. Choose a Touchstone .s1p or"
+                " .s2p file before connecting the replay scenario."
+            )
+        return make_simulated_vna(
+            ReplayScenario(self._replay),
+            sweep_start=self._replay.start,
+            sweep_stop=self._replay.stop,
+        )
+
     def _connect_simulated(self) -> None:
         """Connect the simulated device through the normal workflow.
 
         A simulated device owns its own in-process transport, so no serial
         port is opened and the control's interface is left as the inert
-        placeholder it started with.
+        placeholder it started with.  For replay the sweep default is
+        planned *before* the device is published, so a file whose span
+        cannot support the configured points leaves the previous device
+        and sweep untouched.
         """
         scenario = self.selected_scenario()
-        vna = make_simulated_vna(scenario)
+        replay = scenario == REPLAY_SCENARIO
+        if not replay:
+            self.app.vna = make_simulated_vna(scenario)
+            logger.info("Connected simulated device (%s)", scenario)
+            self._simulated_connected()
+            return
+
+        vna = self.replay_vna()
+        plan = self.replay_range_plan(vna)
         self.app.vna = vna
         logger.info("Connected simulated device (%s)", scenario)
+        self.apply_replay_range(plan)
+        self._simulated_connected()
 
+    def _simulated_connected(self) -> None:
+        """Publish the connected state and start the first sweep."""
         self.btn_toggle.setText("Disconnect")
         self.btn_toggle.repaint()
         self.connected.emit(True)
         self.app.windows["sweep_settings"].vna_connected()
         self.app.sweep_start()
 
+    def replay_range_plan(self, vna=None) -> ReplayRangePlan:
+        """Plan the default replay sweep for the connected device.
+
+        Uses the point count the sweep control will actually request (the
+        device's ``datapoints``) and the configured segment count.  Raises
+        :class:`DeviceConnectionError` when the file span cannot hold that
+        many distinct frequencies, so the caller can keep the previous
+        state instead of replaying an illegal or degenerate grid.
+        """
+        if self._replay is None:
+            raise DeviceConnectionError(
+                "No replay file is loaded. Choose a Touchstone .s1p or"
+                " .s2p file before connecting the replay scenario."
+            )
+        sweep = self.app.sweep
+        points = int(getattr(vna, "datapoints", sweep.points))
+        segments = self.segment_count()
+        try:
+            return plan_replay_range(
+                self._replay.start,
+                self._replay.stop,
+                points=points,
+                segments=segments,
+                logarithmic=sweep.properties.logarithmic,
+            )
+        except ReplayRangeError as exc:
+            raise DeviceConnectionError(
+                f"{exc} The replay source {self._replay.name} is still"
+                " loaded; adjust the sweep settings or choose another file."
+            ) from exc
+
+    def segment_count(self) -> int:
+        """Segment count the sweep control will use."""
+        getter = getattr(self.app.sweep_control, "get_segments", None)
+        segments = getter() if callable(getter) else self.app.sweep.segments
+        return max(int(segments), 1)
+
+    def apply_replay_range(self, plan: ReplayRangePlan) -> None:
+        """Apply a planned replay sweep to the sweep control.
+
+        The plan is validated against the real :class:`Sweep` grid, so the
+        stop it carries never requests a frequency outside the file and a
+        positive-span file never collapses into repeated samples.  A span
+        the user sets outside the file afterwards is still rejected by the
+        worker's preflight with an explicit message.
+        """
+        if plan.reduced:
+            self.app.sweep_control.set_segments(plan.segments)
+        self.app.sweep_control.set_start(plan.start)
+        self.app.sweep_control.set_end(plan.stop)
+        self.app.sweep_control.update_center_span()
+        note = plan.describe()
+        if note:
+            logger.info("Replay default sweep adjusted: %s", note)
+        self._report_plan(plan)
+
+    def _report_plan(self, plan: ReplayRangePlan) -> None:
+        """Show the planned default next to the loaded replay source."""
+        if self._replay is None:
+            return
+        text = f"{self._replay.name}\n{self._replay.summary()}"
+        note = plan.describe()
+        if note:
+            text += f"\nDefault sweep: {note}"
+        self.label_replay_source.setText(text)
+
     def update_simulation_state(self, *_args) -> None:
         """Keep the transport controls consistent with the mode selector."""
         simulated = self.cb_simulated.isChecked()
+        replay_selected = simulated and (
+            self.selected_scenario() == REPLAY_SCENARIO
+        )
         self.row_scenario.setVisible(simulated)
         self.cb_scenario.setEnabled(simulated)
+        # The replay file picker is only meaningful for the replay scenario,
+        # but a loaded source stays visible when switching scenarios so it
+        # is never lost silently.
+        self.row_replay_file.setVisible(simulated)
+        self.btn_replay_file.setEnabled(replay_selected)
         self.inp_port.setEnabled(not simulated)
         self.btn_rescan.setEnabled(
             not simulated and not self.is_vna_connected()

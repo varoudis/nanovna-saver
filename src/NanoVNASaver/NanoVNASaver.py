@@ -124,6 +124,10 @@ LIVE_REDRAW_INTERVAL_MS = 16
 #: of the captured traces.
 LIVE_TRACE_ID = "trace-live"
 
+#: Prefix of the generated provenance comment on the displayed data.  It is
+#: rebuilt from the acquisition snapshot, never accumulated.
+_SIMULATED_COMMENT_PREFIX = "SIMULATED DATA"
+
 
 class Communicate(QObject):
     data_available = QtCore.Signal()
@@ -854,16 +858,22 @@ class NanoVNASaver(QWidget):
             self.data.simulated_scenario = (
                 snapshot.provenance.simulator_scenario or ""
             )
+            # Exactly one generated provenance comment: each published sample
+            # refreshes it instead of stacking copies.
             self.data.comments = [
                 comment
                 for comment in self.data.comments
-                if "SIMULATED DATA" not in comment
+                if not comment.startswith(_SIMULATED_COMMENT_PREFIX)
             ]
             if snapshot.simulated:
                 scenario = snapshot.provenance.simulator_scenario or "unknown"
-                self.data.comments.append(
-                    f"SIMULATED DATA (scenario {scenario})"
-                )
+                comment = f"{_SIMULATED_COMMENT_PREFIX} (scenario {scenario})"
+                # A replay names its source file so a saved export never
+                # looks like an independent measurement (REPLAY-01.4).
+                note = " ".join(snapshot.provenance.notes.split())
+                if note:
+                    comment += f": {note}"
+                self.data.comments.append(comment)
         self._sweep_had_data = True
         # Provenance is only known now, so refresh the title after it is set:
         # the [SIMULATED: ...] marker must never lag behind the data.

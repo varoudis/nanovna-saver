@@ -43,6 +43,7 @@ from time import sleep
 from typing import Sequence
 
 from ..utils import Version
+from .ReplayScenario import ReplayChannelError
 from .SimulatedScenarios import (
     DEFAULT_SCENARIOS,
     REFERENCE_IMPEDANCE,
@@ -174,6 +175,8 @@ class SimulatedDevice:
         latency: float = 0.0,
         fault: FaultConfig | None = None,
         scenario_kwargs: dict | None = None,
+        sweep_start: int | None = None,
+        sweep_stop: int | None = None,
     ) -> None:
         if isinstance(scenario, str):
             scenario = build_scenario(scenario, **(scenario_kwargs or {}))
@@ -186,8 +189,9 @@ class SimulatedDevice:
         self._random = random.Random(seed)
         self._reads_served = 0
         self._closed = False
-        self.start = 3_600_000
-        self.stop = 30_000_000
+        self.start = 3_600_000 if sweep_start is None else int(sweep_start)
+        default_stop = max(30_000_000, self.start)
+        self.stop = default_stop if sweep_stop is None else int(sweep_stop)
         self.points = 101
         self.bandwidth = 1000
 
@@ -197,6 +201,9 @@ class SimulatedDevice:
     @property
     def scenario_key(self) -> str:
         """Canonical scenario name as offered by the demonstration mode."""
+        key = getattr(self.scenario, "scenario_key", "")
+        if isinstance(key, str) and key:
+            return key
         for key, factory in SCENARIO_TYPES.items():
             if isinstance(self.scenario, factory):
                 return key
@@ -205,7 +212,34 @@ class SimulatedDevice:
     @property
     def scenario_name(self) -> str:
         """Human-readable scenario identity for display and provenance."""
+        name = getattr(self.scenario, "display_name", "")
+        if isinstance(name, str) and name:
+            return name
         return type(self.scenario).__name__
+
+    @property
+    def supported_channels(self) -> tuple[str, ...]:
+        """Channels this scenario can honestly produce.
+
+        Analytic scenarios always describe a complete S11/S21 response.  A
+        replay scenario exposes only the channels its file provides, so a
+        one-port file never turns into a fabricated S21.
+        """
+        channels = getattr(self.scenario, "supported_channels", None)
+        if channels:
+            return tuple(channels)
+        return ("data 0", "data 1")
+
+    @property
+    def provenance_note(self) -> str:
+        """Extra provenance text for snapshots (replay source, if any)."""
+        note = getattr(self.scenario, "provenance_text", None)
+        return note() if callable(note) else ""
+
+    def preflight(self, start: int, stop: int) -> str | None:
+        """Scenario-specific sweep preflight; ``None`` means valid."""
+        check = getattr(self.scenario, "preflight", None)
+        return check(start, stop) if callable(check) else None
 
     @property
     def simulated(self) -> bool:
@@ -213,6 +247,12 @@ class SimulatedDevice:
 
     @property
     def reference_impedance(self) -> float:
+        """Reference impedance of everything this device emits.
+
+        A replay scenario is only accepted when the file matches this
+        system impedance (see ``ReplayScenario``), so no data is ever
+        relabelled as if it had been measured at a different impedance.
+        """
         return REFERENCE_IMPEDANCE
 
     def version(self) -> Version:
@@ -266,6 +306,14 @@ class SimulatedDevice:
         """Return one channel of the current sweep, as ``readValues`` does."""
         if self._closed or self.fault.mode is FaultMode.DISCONNECT:
             raise IOError("simulated transport disconnected")
+
+        if channel not in self.supported_channels:
+            # No sample is invented for a channel this scenario cannot
+            # produce: a one-port replay has no S21 at all (REPLAY-01.3).
+            raise ReplayChannelError(
+                f"the {self.scenario_name} scenario provides no"
+                f" {'S11' if channel == 'data 0' else 'S21'} channel"
+            )
 
         mode = self.fault.mode
         if (
@@ -356,6 +404,8 @@ class SimulatedVNA:
         latency: float = 0.0,
         fault: FaultConfig | None = None,
         scenario_kwargs: dict | None = None,
+        sweep_start: int | None = None,
+        sweep_stop: int | None = None,
     ) -> None:
         self.device = device or SimulatedDevice(
             scenario,
@@ -364,6 +414,8 @@ class SimulatedVNA:
             latency=latency,
             fault=fault,
             scenario_kwargs=scenario_kwargs,
+            sweep_start=sweep_start,
+            sweep_stop=sweep_stop,
         )
         self.name = "Simulated VNA"
         self.valid_datapoints = (101, 51, 11, 201, 401)
@@ -452,15 +504,28 @@ class SimulatedVNA:
     def reference_impedance(self) -> float:
         return self.device.reference_impedance
 
+    @property
+    def supported_channels(self) -> tuple[str, ...]:
+        return self.device.supported_channels
+
+    @property
+    def provenance_note(self) -> str:
+        return self.device.provenance_note
+
+    def preflight(self, start: int, stop: int) -> str | None:
+        return self.device.preflight(start, stop)
+
 
 def make_simulated_vna(  # noqa: PLR0913
-    scenario: str = "antenna",
+    scenario: Scenario | str = "antenna",
     *,
     seed: int | None = None,
     noise_floor: float = 0.0,
     latency: float = 0.0,
     fault: FaultConfig | None = None,
     scenario_kwargs: dict | None = None,
+    sweep_start: int | None = None,
+    sweep_stop: int | None = None,
 ) -> SimulatedVNA:
     """Factory used by the connection control for demonstration mode."""
     return SimulatedVNA(
@@ -470,4 +535,6 @@ def make_simulated_vna(  # noqa: PLR0913
         latency=latency,
         fault=fault,
         scenario_kwargs=scenario_kwargs,
+        sweep_start=sweep_start,
+        sweep_stop=sweep_stop,
     )

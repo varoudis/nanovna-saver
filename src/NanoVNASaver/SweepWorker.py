@@ -153,6 +153,9 @@ class WorkerSignals(QObject):
 
 
 class SweepWorker(QThread):
+    #: Reason the last segment read was unusable ("" once data is valid).
+    _segment_error = ""
+
     def __init__(self, app: "vna_app") -> None:
         super().__init__()
         logger.info("Initializing SweepWorker")
@@ -176,6 +179,7 @@ class SweepWorker(QThread):
         self._retry_reason = ""
         self._last_terminal: SweepState | None = None
         self._last_progress = None
+        self._segment_error = ""
         self.init_data()
 
     # -- lifecycle -----------------------------------------------------
@@ -224,6 +228,7 @@ class SweepWorker(QThread):
         self._last_terminal = None
         self._started_at = monotonic()
         self.error_message = ""
+        self._segment_error = ""
         terminal = SweepState.FAILED
         try:
             terminal = self._run()
@@ -286,6 +291,17 @@ class SweepWorker(QThread):
             )
             return SweepState.FAILED
 
+        preflight_problem = self._preflight_problem()
+        if preflight_problem is not None:
+            # A scenario that cannot answer this span is rejected before any
+            # sample is read, so the display keeps the previous measurement
+            # instead of showing an invented one.  The reason is reported
+            # through the normal error path so the user can act on it.
+            logger.error("Sweep preflight failed: %s", preflight_problem)
+            self.error_message = preflight_problem
+            self.signals.sweep_error.emit()
+            return SweepState.FAILED
+
         self._capture = self._capture_settings()
         self.percentage = 0.0
         self._retry_count = 0
@@ -304,6 +320,29 @@ class SweepWorker(QThread):
         self._emit_progress(message="Complete")
         logger.debug('Sending "finished" signal')
         return SweepState.COMPLETED
+
+    def _preflight_problem(self) -> str | None:
+        """Ask the connected device whether the configured sweep is usable.
+
+        Every segment's own request range is checked: rounding in
+        ``Sweep.get_index_range`` can push a segment end past the configured
+        stop, so a segmented sweep is rejected before any sample is read
+        instead of failing halfway through.
+        """
+        check = getattr(self.app.vna, "preflight", None)
+        if not callable(check):
+            return None
+        sweep = self.app.sweep
+        for index in range(max(sweep.segments, 1)):
+            start, stop = sweep.get_index_range(index)
+            try:
+                problem = check(start, stop)
+            except Exception as exc:  # a broken preflight must not read
+                logger.exception("Device preflight failed: %s", exc)
+                return f"The device rejected the sweep configuration: {exc}"
+            if problem is not None:
+                return problem
+        return None
 
     def _capture_settings(self) -> SweepCapture:
         sweep = self.app.sweep.copy()
@@ -458,10 +497,16 @@ class SweepWorker(QThread):
             Datapoint(freq, values11[i].real, values11[i].imag)
             for i, freq in enumerate(frequencies)
         ]
-        raw_data21 = [
-            Datapoint(freq, values21[i].real, values21[i].imag)
-            for i, freq in enumerate(frequencies)
-        ]
+        # A one-port source publishes no S21 at all; indexing an absent
+        # channel would fabricate zero samples (REPLAY-01.3).
+        raw_data21 = (
+            [
+                Datapoint(freq, values21[i].real, values21[i].imag)
+                for i, freq in enumerate(frequencies)
+            ]
+            if values21
+            else []
+        )
 
         capture = self._capture
         data11, data21 = self.applyCalibration(
@@ -476,6 +521,15 @@ class SweepWorker(QThread):
         scenario = (
             getattr(self.app.vna, "scenario_key", "") if simulated else ""
         )
+        # A replay scenario describes its source file here, so snapshots,
+        # exports, sessions and reports all carry the replay provenance
+        # (REPLAY-01.4).
+        provenance_note = (
+            str(getattr(self.app.vna, "provenance_note", "") or "")
+            if simulated
+            else ""
+        )
+        source = "simulated" if simulated else ""
         complete = capture is not None and index + 1 >= capture.segments
         completion = (
             CompletionState.COMPLETE if complete else CompletionState.PARTIAL
@@ -491,7 +545,8 @@ class SweepWorker(QThread):
             simulated=simulated,
             simulator_scenario=scenario,
             device=self.app.vna.name,
-            source="simulated" if simulated else "",
+            source=source,
+            notes=provenance_note,
             correction=self._correction_state(capture),
         )
         sample = SweepSample(
@@ -651,7 +706,11 @@ class SweepWorker(QThread):
                 freq, tmp_11, tmp_21 = self.read_segment(start, stop)
 
             if not tmp_11:
-                raise OSError("Invalid data during sweep")
+                reason = self._segment_error or "no samples were returned"
+                raise OSError(
+                    f"Invalid data during sweep (segment {segment + 1}):"
+                    f" {reason}"
+                )
 
             values11.append(tmp_11)
             values21.append(tmp_21)
@@ -673,14 +732,33 @@ class SweepWorker(QThread):
         if truncates > 0 and averages > 1:
             logger.debug("Truncating %d values by %d", len(values11), truncates)
             values11 = truncate(values11, truncates)
-            values21 = truncate(values21, truncates)
+            if values21 and values21[0]:
+                values21 = truncate(values21, truncates)
 
         logger.debug("Averaging %d values", len(values11[0]))
+        averaged21 = (
+            np.average(values21, axis=0).tolist()
+            if values21 and values21[0]
+            else []
+        )
         return (
             freq,
             np.average(values11, axis=0).tolist(),
-            np.average(values21, axis=0).tolist(),
+            averaged21,
         )
+
+    def _supported_channels(self) -> tuple[str, ...]:
+        """Channels the connected device declares that it can provide.
+
+        A device that exposes no such declaration is assumed to provide
+        both channels, which is what every analytic scenario and ordinary
+        VNA does.  A one-port replay source declares S11 only, so no S21 is
+        ever read and none is invented.
+        """
+        channels = getattr(self.app.vna, "supported_channels", None)
+        if not channels:
+            return ("data 0", "data 1")
+        return tuple(channels)
 
     def read_segment(
         self, start: int, stop: int
@@ -690,13 +768,58 @@ class SweepWorker(QThread):
 
         frequencies = self.app.vna.read_frequencies()
         logger.debug("Read %s frequencies", len(frequencies))
+        expected = len(frequencies)
+        supported = self._supported_channels()
+
+        # Every channel the device declares must deliver real samples, so a
+        # device that advertises S21 can never be published as a one-port
+        # measurement just because the read came back empty.
         values11 = self.read_data("data 0")
-        values21 = self.read_data("data 1")
-        if not len(frequencies) == len(values11) == len(values21):
-            logger.info("No valid data during this run")
+        values21 = self.read_data("data 1") if "data 1" in supported else []
+
+        problem = self._segment_data_problem(
+            expected, values11, values21, supported
+        )
+        if problem is not None:
+            logger.info("No valid data during this run: %s", problem)
+            self._segment_error = problem
             frequencies = []
             values11 = values21 = []
+        else:
+            self._segment_error = ""
         return frequencies, values11, values21
+
+    @staticmethod
+    def _segment_data_problem(
+        expected: int,
+        values11: list[complex],
+        values21: list[complex],
+        supported: tuple[str, ...],
+    ) -> str | None:
+        """Describe why a segment is unusable, or ``None`` when it is fine.
+
+        Every channel the device declares must deliver exactly one sample
+        per requested frequency.  An absent channel is only acceptable when
+        the device does not declare it at all (a genuine one-port source);
+        a declared read that comes back empty or short is a device fault,
+        never a one-port measurement.
+        """
+        if not expected:
+            return "the device returned no sweep frequencies"
+        if len(values11) != expected:
+            return (
+                f"the S11 channel returned {len(values11)} samples for"
+                f" {expected} requested frequencies"
+            )
+        if "data 1" not in supported:
+            return None
+        if len(values21) != expected:
+            return (
+                f"the device declares an S21 channel but it returned"
+                f" {len(values21)} samples for {expected} requested"
+                " frequencies"
+            )
+        return None
 
     def read_data(self, data) -> list[complex]:
         logger.debug("Reading %s", data)

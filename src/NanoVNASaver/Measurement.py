@@ -611,10 +611,17 @@ def snapshot_from_datapoints(  # noqa: PLR0913
     correction: CorrectionState | None = None,
     completion: CompletionState = CompletionState.COMPLETE,
     simulator_scenario: str | None = None,
+    notes: str = "",
     raw11: Iterable[Datapoint] | None = None,
     raw21: Iterable[Datapoint] | None = None,
 ) -> MeasurementSnapshot:
-    """Build a snapshot from the application's live acquisition buffers."""
+    """Build a snapshot from the application's live acquisition buffers.
+
+    ``notes`` carries acquisition-level provenance that has no structural
+    field of its own, such as the Touchstone file a replayed sweep came
+    from.
+    """
+
     corrected: dict[str, tuple[Datapoint, ...]] = {}
     if s11:
         corrected[S11] = _freeze_channel(s11)
@@ -660,6 +667,7 @@ def snapshot_from_datapoints(  # noqa: PLR0913
         sweep=SweepInfo.from_sweep(sweep) if sweep is not None else None,
         calibration=cal_identity,
         completion=completion,
+        notes=notes,
         simulator_scenario=simulator_scenario,
     )
     return MeasurementSnapshot(

@@ -523,6 +523,13 @@ def render_html(model: ReportModel, *, include_plots: bool = True) -> str:
         if provenance.device:
             details.append(f"device: {html.escape(provenance.device)}")
         parts.append(f'<p class="meta">{" · ".join(details)}</p>')
+        if provenance.notes:
+            # Acquisition provenance without a structural field of its own,
+            # such as the Touchstone file a replayed sweep came from.
+            parts.append(
+                f'<p class="meta">Provenance: '
+                f"{html.escape(provenance.notes)}</p>"
+            )
         if provenance.sweep is not None:
             sweep = provenance.sweep
             parts.append(

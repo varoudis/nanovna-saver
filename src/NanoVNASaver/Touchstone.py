@@ -342,6 +342,16 @@ class Touchstone:
         except TypeError as e:
             logger.exception("Failed to parse %s: %s", self.filename, e)
 
+    def loads_strict(self, s: str):
+        """Parse like :meth:`loads` but propagate every parse error.
+
+        Callers that must decide for themselves whether a dataset is
+        usable (the replay scenario) need the original ``TypeError``,
+        ``ValueError`` and ``IndexError`` instead of a logged, partial
+        parse.
+        """
+        self._loads(s)
+
     def _loads(self, s: str):
         need_reorder = False
         with io.StringIO(s) as file:
