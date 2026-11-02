@@ -80,9 +80,13 @@ interpolated on the same frequency grid as the file's own samples.
   over from another trace: the second channel is not read at all, the
   snapshot has no S21 at all, and any export therefore writes a one-port
   file.
-* **`.s2p`** provides S11 and S21. S12 and S22 in the file are ignored; the
-  loaded-file label and the recorded provenance both name them explicitly as
-  not replayed. They are never presented as measured or simulated data.
+* **`.s2p`** provides S11 and S21. A complete two-port file's S12 and S22
+  are retained but never published as forward channels: the sweep pipeline
+  carries S11 and S21 only, and the loaded-file label says the reverse pair
+  is "available for reversal". They reach a measurement only through a
+  *reverse view*, which re-labels them exactly as a physical reverse sweep
+  is re-labelled (its S11 becomes S22, its S21 becomes S12). A one-port file
+  cannot be reversed at all, because those channels were never in it.
 
 ### Declared channels are a contract
 
@@ -97,10 +101,23 @@ S21 is never read, published or exported at all.
 
 ## Reference impedance
 
-Replay is a 50 ohm scenario and does **not** renormalize. A file whose
-reference impedance is anything other than 50 ohm is rejected with a message
-naming both impedances; export the file at 50 ohm first (for example with
+The simulated device is a 50 ohm system. **One-port** data in a file with a
+different reference impedance is accepted through an explicit, recorded
+renormalization: the file's own impedance is kept as `source_impedance`, the
+samples are converted with the same closed form the rest of the application
+uses, and both the loaded-file label and the recorded provenance name the
+conversion (`renormalized from 75 ohm`). The physics is unchanged — a 75 ohm
+resistor (Γ = 0 at 75 ohm) replays as Γ = 0.2, which is the same resistor in
+a 50 ohm system.
+
+**Two-port** non-50 ohm files are still rejected with a message naming both
+impedances. Renormalizing S21 needs all four S-parameters, and converting S11
+while passing S21 through untouched would mix two reference impedances in a
+single snapshot. Export such a file at 50 ohm first (for example with
 `scikit-rf`'s `Network.renormalize`) and replay that copy.
+
+Touchstone 2.x is refused explicitly rather than parsed leniently: its
+keyword blocks and option-line meaning are a separate parser scope.
 
 ## Limits
 
@@ -108,8 +125,8 @@ naming both impedances; export the file at 50 ohm first (for example with
 | --- | --- | --- |
 | File size | 32 MiB | Bounded memory while parsing |
 | Samples per channel | 250 000 | Bounded sweep cost |
-| Reference impedance | 50 ohm | No renormalization is performed |
-| File types | `.s1p`, `.s2p`, S-parameters only | Only S11/S21 are replayed |
+| Reference impedance | 50 ohm, or one-port data converted explicitly | Two-port conversion would need all four S-parameters |
+| File types | `.s1p`, `.s2p`, S-parameters only, Touchstone 1.x | Only S11/S21 are published; 2.x is a separate parser |
 | Frequencies | finite, positive, strictly ascending, unique | Deterministic interpolation |
 | Extrapolation | none | A replayed value must originate from the file |
 

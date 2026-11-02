@@ -38,12 +38,20 @@ Honesty constraints
 -------------------
 * A one-port file replays S11 only.  S21 stays absent from every published
   snapshot; it is never replaced by zero-valued samples.
-* Only S11 and S21 can be replayed, because that is the whole channel set
-  the sweep pipeline carries.  S12/S22 present in a two-port file are
-  reported as ignored instead of being silently presented as measurements.
-* A reference impedance other than the simulated device's 50 ohms is
-  rejected with an actionable error.  The samples are not renormalized, so
-  the simulator's reference impedance always describes the data it emits.
+* Only S11 and S21 are *published*, because that is the whole channel set
+  the sweep pipeline carries.  A two-port file's S12/S22 are retained but
+  never presented as forward measurements: they are available only through
+  :meth:`ReplayData.reversed`, which re-labels them the way a physical
+  reverse sweep is re-labelled (RF-04), and the resulting view says its
+  ports were exchanged.
+* A non-50 ohm one-port file is accepted through an explicit, recorded
+  renormalization: the file's own impedance is kept in
+  ``source_impedance``, the samples are converted to the device's
+  reference with ``Processing.renormalize_gamma``, and ``converted`` plus
+  the summary/provenance text say so.  A *two-port* non-50 ohm file is
+  still refused, because renormalizing S21 needs all four S-parameters.
+* Touchstone 2.x is refused with an explicit error rather than parsed
+  leniently by the 1.x reader.
 """
 
 from __future__ import annotations
@@ -51,10 +59,11 @@ from __future__ import annotations
 import logging
 import math
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
 
+from ..Processing import renormalize_gamma
 from ..RFTools import Datapoint
 from ..Touchstone import PARAMETERS, Touchstone
 from .Capability import SourceSpan, SweepCapability
@@ -146,6 +155,20 @@ class ReplayData:
     s11: tuple[Datapoint, ...]
     s21: tuple[Datapoint, ...] = ()
     ignored_parameters: tuple[str, ...] = ()
+    #: The file's own reverse channels, when it describes a complete
+    #: two-port.  Empty for a one-port file, which is what keeps "the file
+    #: has no S12" distinguishable from "S12 is zero".
+    s12: tuple[Datapoint, ...] = ()
+    s22: tuple[Datapoint, ...] = ()
+    #: The impedance the file *stated*.  Equal to ``reference_impedance``
+    #: unless a conversion was applied, in which case the samples above are
+    #: stated at the device's impedance and this records what they came
+    #: from, so the conversion is never invisible.
+    source_impedance: float = 0.0
+    converted: bool = False
+    #: Set on a reverse view produced by :meth:`reversed`, so provenance can
+    #: say the ports were exchanged rather than silently reorder samples.
+    reversed_from: str = ""
 
     @cached_property
     def frequencies(self) -> tuple[int, ...]:
@@ -168,11 +191,45 @@ class ReplayData:
         return Path(self.path).name
 
     def channel(self, parameter: str) -> tuple[Datapoint, ...]:
-        if parameter == "S11":
-            return self.s11
-        if parameter == "S21":
-            return self.s21
+        for name, samples in (
+            ("S11", self.s11),
+            ("S21", self.s21),
+            ("S12", self.s12),
+            ("S22", self.s22),
+        ):
+            if parameter == name:
+                return samples
         raise KeyError(parameter)
+
+    @property
+    def has_reverse(self) -> bool:
+        """True when the file states S12 and S22 as well."""
+        return bool(self.s12) and bool(self.s22)
+
+    def reversed(self) -> "ReplayData":
+        """The same file as measured with the DUT's ports exchanged.
+
+        SIM-02: a complete two-port file describes both orientations, so a
+        reverse capture can be *derived* rather than invented.  Ports
+        swapped means the driven port's reflection becomes the other
+        port's reflection and the forward transmission becomes the reverse
+        one -- the same re-labelling RF-04 performs on a physical reverse
+        sweep.  A one-port file cannot be reversed, because the reverse
+        channels were never in it.
+        """
+        if not self.has_reverse:
+            raise ReplayChannelError(
+                f"{self.name} states no S12/S22, so it cannot be replayed"
+                " in the reverse orientation without inventing them"
+            )
+        return replace(
+            self,
+            s11=self.s22,
+            s21=self.s12,
+            s12=self.s21,
+            s22=self.s11,
+            reversed_from=self.path,
+        )
 
     def is_exact(self, freq: float) -> bool:
         """True when ``freq`` is one of the file's own sample frequencies."""
@@ -216,6 +273,12 @@ class ReplayData:
             f"{self.kind} · {len(self.s11)} points ·"
             f" {self.start} Hz to {self.stop} Hz · {channels}"
         )
+        if self.reversed_from:
+            text += " · ports exchanged"
+        if self.has_reverse:
+            text += " · S12/S22 available for reversal"
+        if self.converted:
+            text += f" · renormalized from {self.source_impedance:g} ohm"
         if self.ignored_parameters:
             text += f" · {', '.join(self.ignored_parameters)} ignored"
         return text
@@ -227,6 +290,16 @@ class ReplayData:
             f"replay of {self.path} ({self.kind}, {channels},"
             " complex linear interpolation, no extrapolation)"
         )
+        if self.reversed_from:
+            text += (
+                "; ports exchanged (the file's S22/S12 presented as S11/S21)"
+            )
+        if self.converted:
+            text += (
+                f"; renormalized from the file's"
+                f" {self.source_impedance:g} ohm to"
+                f" {self.reference_impedance:g} ohm"
+            )
         if self.ignored_parameters:
             text += (
                 f"; {', '.join(self.ignored_parameters)} from the file are"
@@ -329,14 +402,23 @@ def load_replay_file(path: str | Path) -> ReplayData:
             f"{filename}: reference impedance must be positive,"
             f" not {reference:g}"
         )
-    if not math.isclose(reference, REFERENCE_IMPEDANCE, rel_tol=1e-9):
-        raise ReplayReferenceImpedanceError(
-            f"{filename} is referenced to {reference:g} ohm, but the"
-            f" simulated device is a {REFERENCE_IMPEDANCE:g} ohm system."
-            " Replay does not renormalize: export the file at 50 ohm first"
-            " (for example with `scikit-rf`'s `Network.renormalize`) or"
-            " use a 50 ohm file."
-        )
+    converted = not math.isclose(reference, REFERENCE_IMPEDANCE, rel_tol=1e-9)
+    if converted:
+        # SIM-02: a non-50 ohm file is accepted only through an explicit,
+        # recorded conversion.  A two-port file would need all four terms to
+        # renormalize (S21 alone cannot be converted), so only one-port
+        # data is converted; the alternative -- converting S11 and passing
+        # S21 through untouched -- would mix two reference impedances in
+        # one snapshot, which is exactly the silent corruption to avoid.
+        if ports != 1:
+            raise ReplayReferenceImpedanceError(
+                f"{filename} is referenced to {reference:g} ohm, but the"
+                f" simulated device is a {REFERENCE_IMPEDANCE:g} ohm system."
+                f" Renormalizing a {ports}-port file needs all four"
+                " S-parameters and this file does not carry them in a form"
+                " replay preserves; export it at 50 ohm first (for example"
+                " with `scikit-rf`'s `Network.renormalize`)."
+            )
 
     s11 = list(dataset.s11)
     if not s11:
@@ -369,10 +451,44 @@ def load_replay_file(path: str | Path) -> ReplayData:
         frozen_s21 = _validate_channel(
             "S21", list(dataset.s21), freqs, filename
         )
+    source_impedance = reference
+    if converted:
+        gamma = [
+            renormalize_gamma(reference, REFERENCE_IMPEDANCE, dp.z)
+            for dp in frozen_s11
+        ]
+        frozen_s11 = tuple(
+            Datapoint(dp.freq, value.real, value.imag)
+            for dp, value in zip(frozen_s11, gamma, strict=True)
+        )
+        logger.info(
+            "Renormalized replay source %s from %g ohm to %g ohm",
+            file,
+            reference,
+            REFERENCE_IMPEDANCE,
+        )
+        reference = REFERENCE_IMPEDANCE
 
-    ignored = tuple(
-        p for p in PARAMETERS if p not in REPLAYABLE_PARAMETERS and p in present
-    )
+    frozen_s12: tuple[Datapoint, ...] = ()
+    frozen_s22: tuple[Datapoint, ...] = ()
+    if "S12" in present and "S22" in present:
+        # A file that states both reverse channels describes a complete
+        # two-port, so RF-04's reversal can derive a reverse capture from
+        # it.  They are kept but never published as forward channels.
+        frozen_s12 = _validate_channel(
+            "S12", list(dataset.s12), freqs, filename
+        )
+        frozen_s22 = _validate_channel(
+            "S22", list(dataset.s22), freqs, filename
+        )
+
+    # A reverse pair that was kept for RF-04 reversal is reported as
+    # available, not as ignored; only what the file holds and replay cannot
+    # use at all is listed here.
+    carried = set(REPLAYABLE_PARAMETERS)
+    if frozen_s12 and frozen_s22:
+        carried |= {"S12", "S22"}
+    ignored = tuple(p for p in PARAMETERS if p not in carried and p in present)
     kind = "S1P" if ports == 1 else "S2P"
     logger.info(
         "Loaded replay source %s: %s, %d points",
@@ -387,6 +503,10 @@ def load_replay_file(path: str | Path) -> ReplayData:
         s11=frozen_s11,
         s21=frozen_s21,
         ignored_parameters=ignored,
+        s12=frozen_s12,
+        s22=frozen_s22,
+        source_impedance=source_impedance,
+        converted=converted,
     )
 
 

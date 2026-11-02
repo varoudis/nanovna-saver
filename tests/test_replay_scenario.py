@@ -225,13 +225,41 @@ class TestFileValidation:
             load_replay_file(write(tmp_path, "ragged.s2p", text))
 
     @staticmethod
-    def test_reference_impedance_mismatch_is_actionable(tmp_path):
-        text = "# HZ S RI R 75\n1000000 0.1 0.0\n"
+    def test_a_two_port_reference_impedance_mismatch_is_actionable(tmp_path):
+        """SIM-02: renormalizing a two-port needs all four S-parameters.
+
+        Replay keeps S11/S21 only, so a 75 ohm two-port file is still
+        refused rather than half-converted -- converting S11 while leaving
+        S21 at the file's impedance would mix two references in one
+        snapshot.
+        """
+        text = "# HZ S RI R 75\n1000000 0.1 0.0 0.5 0.0 0.0 0.0 0.1 0.0\n"
         with pytest.raises(ReplayReferenceImpedanceError) as error:
-            load_replay_file(write(tmp_path, "seventyfive.s1p", text))
+            load_replay_file(write(tmp_path, "seventyfive.s2p", text))
         message = str(error.value)
         assert "75 ohm" in message and "50 ohm" in message
         assert "renormalize" in message
+
+    @staticmethod
+    def test_touchstone_two_point_zero_is_refused_with_a_clear_error(tmp_path):
+        """SIM-02: 2.x is a separate parser scope, not a silent guess.
+
+        A ``[Version] 2.0`` file has keyword blocks and a different
+        meaning for the option line.  Reading it with the 1.x parser and
+        taking whatever numbers fall out would accept a file whose physical
+        meaning was never established, so it is refused explicitly.
+        """
+        text = (
+            "[Version] 2.0\n"
+            "# HZ S RI R 50\n"
+            "[Number of Ports] 2\n"
+            "[Number of Frequencies] 1\n"
+            "1000000 0.1 0.0 0.9 0.0 0.8 0.0 0.05 0.0\n"
+        )
+        with pytest.raises(ReplayError) as error:
+            load_replay_file(write(tmp_path, "v2.s2p", text))
+        assert "Touchstone 1.x" in str(error.value)
+        assert "[Version] 2.0" in str(error.value)
 
     @staticmethod
     def test_matching_non_integer_impedance_is_accepted(tmp_path):
@@ -261,9 +289,16 @@ class TestChannelHonesty:
         assert two_port.value_at("S21", 1_000_000) == complex(0.90, 0.10)
 
     @staticmethod
-    def test_two_port_reports_ignored_channels(two_port):
-        assert two_port.ignored_parameters == ("S12", "S22")
-        assert "not replayed" in two_port.provenance_text()
+    def test_a_complete_two_port_keeps_its_reverse_channels(two_port):
+        """SIM-02: S12/S22 are no longer discarded, so not "ignored".
+
+        They are held for RF-04's reversal and never published as forward
+        channels, which is what stops a reverse sample being mistaken for
+        a measurement of this orientation.
+        """
+        assert two_port.ignored_parameters == ()
+        assert "available for reversal" in two_port.summary()
+        assert "not replayed" not in two_port.provenance_text()
 
     @staticmethod
     def test_one_port_provenance_says_s11_only(one_port):
@@ -308,6 +343,161 @@ class TestPreflight:
         problem = ReplayScenario(one_port).preflight(3_000_000, 2_000_000)
         assert problem is not None
         assert "must not be below" in problem
+
+
+# ----------------------------------------------------------------------
+# SIM-02: non-50 ohm one-port replay
+# ----------------------------------------------------------------------
+class TestNonFiftyOhmReplay:
+    """A non-50 ohm file is converted explicitly, and says so.
+
+    The reference impedance of a reflection coefficient is not part of the
+    number, only of its interpretation, so a 75 ohm file cannot be replayed
+    as if it were 50 ohm.  One-port data *can* be renormalized exactly; the
+    tests below pin the conversion to an independent closed form.
+    """
+
+    @staticmethod
+    def _seventyfive(tmp_path, gamma: complex) -> ReplayData:
+        text = (
+            "# HZ S RI R 75\n"
+            f"1000000 {gamma.real!r} {gamma.imag!r}\n"
+            "2000000 0.0 0.0\n"
+        )
+        return load_replay_file(write(tmp_path, "seventyfive.s1p", text))
+
+    @staticmethod
+    def test_the_file_impedance_is_recorded_not_hidden(tmp_path):
+        data = TestNonFiftyOhmReplay._seventyfive(tmp_path, complex(0.2, -0.1))
+        assert data.source_impedance == pytest.approx(75.0)
+        assert data.reference_impedance == pytest.approx(50.0)
+        assert data.converted is True
+        assert "renormalized from 75 ohm" in data.summary()
+        assert "renormalized from the file's 75 ohm" in (data.provenance_text())
+
+    @staticmethod
+    def test_a_fifty_ohm_file_is_not_marked_as_converted(one_port):
+        assert one_port.converted is False
+        assert one_port.source_impedance == pytest.approx(50.0)
+        assert "renormalized" not in one_port.summary()
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "gamma",
+        [
+            complex(0.0, 0.0),
+            complex(0.2, -0.1),
+            complex(-0.5, 0.3),
+            complex(0.9, 0.0),
+        ],
+    )
+    def test_the_conversion_matches_the_closed_form(tmp_path, gamma):
+        """G_new = (G + a) / (1 + a*G), a = (Z_old - Z_new)/(Z_old + Z_new).
+
+        Checked against the impedance, which is the physical invariant: the
+        same load must still be the same ohms after renormalization.
+        """
+        data = TestNonFiftyOhmReplay._seventyfive(tmp_path, gamma)
+        z_old = 75.0 * (1 + gamma) / (1 - gamma)
+        expected = (z_old - 50.0) / (z_old + 50.0)
+        got = data.s11[0].z
+        assert got == pytest.approx(expected, abs=1e-12)
+        # And the load it represents is unchanged at 50 ohm.
+        back = 50.0 * (1 + got) / (1 - got)
+        assert back == pytest.approx(z_old, rel=1e-12, abs=1e-12)
+
+    @staticmethod
+    def test_a_seventyfive_ohm_load_becomes_zero_point_two(tmp_path):
+        """A 75 ohm resistor is G = 0 at 75 ohm and G = 0.2 at 50 ohm.
+
+        This is the case that separates a real conversion from passing the
+        number through: the sample stays 0 at 75 ohm but must be 0.2 once
+        the file is replayed in a 50 ohm system.
+        """
+        data = TestNonFiftyOhmReplay._seventyfive(tmp_path, complex(0.0, 0.0))
+        assert data.s11[0].z == pytest.approx(complex(0.2, 0.0), abs=1e-12)
+
+    @staticmethod
+    def test_an_open_stays_an_open_at_any_reference(tmp_path):
+        """G = +1 means an open circuit whatever the reference is.
+
+        The conversion must not "correct" a value that was never wrong.
+        """
+        data = TestNonFiftyOhmReplay._seventyfive(tmp_path, complex(1.0, 0.0))
+        assert data.s11[0].z == pytest.approx(complex(1.0, 0.0), abs=1e-12)
+
+    @staticmethod
+    def test_the_conversion_survives_replay_and_provenance(tmp_path):
+        data = TestNonFiftyOhmReplay._seventyfive(tmp_path, complex(0.2, 0.0))
+        scenario = ReplayScenario(data)
+        result = scenario(1_000_000)
+        assert result.s11 == pytest.approx(data.s11[0].z)
+        assert "renormalized" in scenario.provenance_text()
+        # Only S11: the file had no reverse channels and none are invented.
+        assert data.has_s21 is False
+        assert scenario.supported_channels == ("data 0",)
+
+
+# ----------------------------------------------------------------------
+# SIM-02: reverse channels through the reversal contract
+# ----------------------------------------------------------------------
+class TestReverseChannelReplay:
+    """A complete two-port file can be replayed in reverse orientation.
+
+    The reverse capture is *derived* from the file's own S12/S22 by the
+    same re-labelling RF-04 applies to a physical reverse sweep, so the
+    combined "four-channel" measurement of a replay is honest: every
+    sample came from the file.
+    """
+
+    @staticmethod
+    def test_a_complete_two_port_exposes_both_reverse_channels(two_port):
+        assert two_port.has_reverse is True
+        assert two_port.channel("S12") == two_port.s12
+        assert two_port.channel("S22") == two_port.s22
+        assert "S12/S22 available for reversal" in two_port.summary()
+
+    @staticmethod
+    def test_a_one_port_file_has_no_reverse_channels(one_port):
+        assert one_port.has_reverse is False
+        assert one_port.s12 == () and one_port.s22 == ()
+        with pytest.raises(ReplayChannelError) as error:
+            one_port.reversed()
+        assert "without inventing them" in str(error.value)
+
+    @staticmethod
+    def test_the_reverse_view_swaps_s11_with_s22_and_s21_with_s12(two_port):
+        reverse = two_port.reversed()
+        # Ports exchanged: the file's S22 is what a reverse sweep sees as
+        # its own S11, and its S12 is that sweep's "S21".
+        assert reverse.s11 == two_port.s22
+        assert reverse.s21 == two_port.s12
+        assert reverse.s12 == two_port.s21
+        assert reverse.s22 == two_port.s11
+        # Nothing was rotated, conjugated or scaled.
+        assert reverse.s11[0] == two_port.s22[0]
+        assert reverse.s21[0] == two_port.s12[0]
+        assert reverse.reversed_from == two_port.path
+        assert "ports exchanged" in reverse.summary()
+        assert "ports exchanged" in reverse.provenance_text()
+
+    @staticmethod
+    def test_the_reverse_view_is_a_valid_replay_source(two_port):
+        reverse = ReplayScenario(two_port.reversed())
+        assert reverse.supported_channels == ("data 0", "data 1")
+        first = reverse(1_000_000)
+        assert first.s11 == two_port.s22[0].z
+        assert first.s21 == two_port.s12[0].z
+        # The file's forward data is now the reverse one, not a zero.
+        assert first.s12 is None and first.s22 is None
+
+    @staticmethod
+    def test_the_forward_view_is_unchanged_when_a_reverse_view_exists(two_port):
+        reverse = two_port.reversed()
+        assert reverse is not two_port
+        # A new frozen value, not a mutation of the loaded file.
+        assert two_port.s11 != two_port.s22
+        assert ReplayScenario(two_port)(1_000_000).s11 == two_port.s11[0].z
 
 
 # ----------------------------------------------------------------------
@@ -590,7 +780,17 @@ class TestWorkerAcquisition:
         s21 = {dp.freq: dp.z for dp in sample.s21}
         assert s21[1_000_000] == complex(0.90, 0.10)
         assert s21[2_000_000] == complex(0.70, -0.30)
-        assert "S12, S22" in recorder.sample_ready[-1].snapshot.provenance.notes
+        # The reverse channels exist in the file but are never published as
+        # forward samples: the sweep contract carries S11/S21 only, and the
+        # snapshot must not claim reverse data it does not hold.
+        assert set(sample.snapshot.raw) == {
+            "S11",
+            "S21",
+        }, "reverse samples must not appear as forward channels"
+        assert "not replayed" not in sample.snapshot.provenance.notes
+        assert "available for reversal" not in (
+            sample.snapshot.provenance.notes
+        ), "a forward sweep note must not promise a reversed view"
 
     @staticmethod
     def test_out_of_span_sweep_fails_before_reading_any_sample(one_port):
@@ -1079,8 +1279,11 @@ class TestGuiSelection:
         assert widget.choose_replay_file(one_port.path) is True
         previous = widget.replay_data()
 
-        bad = tmp_path / "bad.s1p"
-        bad.write_text("# HZ S RI R 75\n1000000 0.1 0.0\n", encoding="utf-8")
+        bad = tmp_path / "bad.s2p"
+        bad.write_text(
+            "# HZ S RI R 75\n1000000 0.1 0.0 0.5 0.0 0.0 0.0 0.1 0.0\n",
+            encoding="utf-8",
+        )
         assert widget.choose_replay_file(str(bad)) is False
         assert widget.replay_data() is previous
         assert len(app.errors) == 1
@@ -1330,3 +1533,51 @@ class TestRealWindowReplay:
         finally:
             window.worker.quit()
             window.deleteLater()
+
+
+# ----------------------------------------------------------------------
+# Shared capability model (NEXT-01)
+# ----------------------------------------------------------------------
+class TestCapability:
+    @staticmethod
+    def test_capability_matches_the_scenario_preflight(one_port):
+        capability = ReplayScenario(one_port).capability()
+        for start, stop in (
+            (1_000_000, 4_000_000),
+            (2_000_000, 3_000_000),
+            (1_000_000, 5_000_000),
+            (0, 2_000_000),
+            (3_000_000, 2_000_000),
+        ):
+            device_verdict = ReplayScenario(one_port).preflight(start, stop)
+            capability_verdict = capability.preflight(start, stop)
+            assert (device_verdict is None) == (capability_verdict is None)
+
+    @staticmethod
+    def test_capability_states_the_file_span_and_channels(two_port):
+        capability = ReplayScenario(two_port).capability()
+        assert capability.effective_span.start == 1_000_000
+        assert capability.effective_span.stop == 2_000_000
+        assert capability.supported_channels == ("data 0", "data 1")
+        assert capability.reference_impedance == 50.0
+
+    @staticmethod
+    def test_planned_default_ranges_validate_against_the_file(one_port):
+        capability = ReplayScenario(one_port).capability()
+        for points in (2, 3, 11, 101):
+            for logarithmic in (False, True):
+                plan = plan_replay_range(
+                    one_port.start,
+                    one_port.stop,
+                    points=points,
+                    segments=1,
+                    logarithmic=logarithmic,
+                )
+                validation = capability.validate_grid(
+                    plan.start,
+                    plan.stop,
+                    plan.points,
+                    plan.segments,
+                    logarithmic=plan.logarithmic,
+                )
+                assert validation.ok, validation.problem
