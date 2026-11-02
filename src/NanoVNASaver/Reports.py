@@ -269,6 +269,11 @@ def provenance_labels(trace: ReportTrace) -> list[str]:
         # and are corrected from the nearest endpoint.
         if trace.coverage.edge_held:
             labels.append("correction held at calibration edge")
+    processed = snapshot.provenance.processing
+    if processed is not None:
+        # A processed trace is not a raw measurement; naming the pipeline is
+        # what keeps a widened resonance from being read as a better capture.
+        labels.append(f"PROCESSED ({processed.describe()})")
     if S21 not in snapshot.available:
         labels.append("one-port data (no S21)")
     kind = correction_kind(snapshot)
