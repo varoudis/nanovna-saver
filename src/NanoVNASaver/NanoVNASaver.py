@@ -306,10 +306,16 @@ class NanoVNASaver(QWidget):
         #: One-shot continuation run when the next sweep completes
         #: successfully (SWEEP-04.3).
         self._after_sweep = None
+        #: Forward/reverse capture state (RF-04).  ``None`` means no
+        #: reversal measurement is in progress.
+        self.reversal_capture = None
+        self.reversal_direction = ""
         #: How the last connection attempt ended (``connected``/``failed``/
         #: ``cancelled``/``timed out``); a background attempt has no return
         #: value, so the outcome is recorded when its signal arrives.
         self.last_connection_status = ""
+        #: The combined forward/reverse S-matrix, when one was captured.
+        self.s_matrix = None
         #: Analysis kinds requested by the last applied preset.
         self._preset_analyses: tuple = ()
         #: Workflow parameters requested by the last applied preset.
@@ -658,6 +664,35 @@ class NanoVNASaver(QWidget):
         tdr_control_layout.addRow(self.tdr_button)
 
         left_column.addWidget(tdr_control_box)
+
+        ###############################################################
+        #  Two-port reversal capture (RF-04)
+        ###############################################################
+
+        reversal_control_box = QtWidgets.QGroupBox()
+        reversal_control_box.setTitle("Two-port reversal")
+        reversal_control_layout = QtWidgets.QFormLayout()
+        reversal_control_box.setLayout(reversal_control_layout)
+
+        self.reversal_label = QtWidgets.QLabel("")
+        self.reversal_label.setWordWrap(True)
+        self.reversal_label.setMinimumHeight(20)
+        reversal_control_layout.addRow(self.reversal_label)
+
+        reversal_buttons = QtWidgets.QHBoxLayout()
+        self.reversal_button = QtWidgets.QPushButton("Start")
+        self.reversal_button.setMinimumHeight(20)
+        self.reversal_button.clicked.connect(self.start_reversal_capture)
+        reversal_buttons.addWidget(self.reversal_button)
+        self.reversal_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.reversal_cancel_button.setMinimumHeight(20)
+        self.reversal_cancel_button.clicked.connect(
+            self.cancel_reversal_capture
+        )
+        reversal_buttons.addWidget(self.reversal_cancel_button)
+        reversal_control_layout.addRow(reversal_buttons)
+
+        left_column.addWidget(reversal_control_box)
 
         ###############################################################
         #  Spacer
@@ -1130,7 +1165,10 @@ class NanoVNASaver(QWidget):
         if terminal is SweepState.COMPLETED:
             self._remember_complete_sweep()
             self.sweep_control.show_idle("Complete")
-            self._continue_after_sweep()
+            if self._capture_reversal_step():
+                pass
+            else:
+                self._continue_after_sweep()
         elif terminal is SweepState.CANCELLED:
             self._after_sweep = None
             # A cancelled sweep is never presented as a measurement
@@ -1150,6 +1188,69 @@ class NanoVNASaver(QWidget):
         # the timer alone would leave the last frame of a cancelled or
         # failed sweep on screen until something else asked for a repaint.
         self.flush_pending_redraw()
+
+    def start_reversal_capture(self) -> None:
+        """Begin a forward/reverse measurement (RF-04).
+
+        The operator is guided one sweep at a time: the first run is the
+        forward orientation, then they turn the DUT around and run again.
+        Nothing moves and no sweep is started automatically.
+        """
+        from .Reversal import ReversalCapture
+
+        self.reversal_capture = ReversalCapture()
+        self.reversal_direction = "forward"
+        self.reversal_label.setText(
+            "Forward: measure the DUT as it is now, then turn it around"
+        )
+
+    def cancel_reversal_capture(self) -> None:
+        if self.reversal_capture is not None:
+            self.reversal_capture.cancel()
+        self.reversal_capture = None
+        self.reversal_direction = ""
+        self.reversal_label.setText("")
+
+    def _capture_reversal_step(self) -> bool:
+        """Bind the completed sweep to the reversal step in progress.
+
+        Returns True when the sweep was consumed by a reversal capture, so
+        a queued analysis continuation is not run on a half-combined set.
+        """
+        if self.reversal_capture is None or not self.reversal_direction:
+            return False
+        snapshot = self._live_snapshot
+        if snapshot is None:
+            self.cancel_reversal_capture()
+            return True
+        try:
+            combined = self.reversal_capture.accept(
+                snapshot, direction=self.reversal_direction
+            )
+        except Exception as error:  # reported to the operator
+            self.reversal_label.setText(f"Reversal failed: {error}")
+            self.reversal_direction = ""
+            return True
+        if combined is None:
+            self.reversal_direction = "reverse"
+            self.reversal_label.setText(
+                "Reverse: turn the DUT around, then sweep again"
+            )
+            return True
+        self.reversal_direction = ""
+        self.reversal_label.setText(self.reversal_capture.describe())
+        self.adopt_s_matrix(combined)
+        return True
+
+    def adopt_s_matrix(self, combined) -> None:
+        """Display a combined S-matrix without pretending it is a sweep.
+
+        The forward channels are what the charts plot today; the complete
+        matrix is offered to export.  It is recorded as derived, so it can
+        never be exported as a measurement.
+        """
+        self.s_matrix = combined
+        self.dataUpdated()
 
     def run_after_sweep(self, callback) -> None:
         """Run ``callback`` once after the next successful sweep.
