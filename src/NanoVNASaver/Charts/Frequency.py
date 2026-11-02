@@ -369,15 +369,19 @@ class FrequencyChart(Chart):
             )
         return math.floor(self.width() / 2)
 
-    def getYPosition(self, d: Datapoint) -> int:
-        try:
-            return self.topMargin + round(
-                (self.maxValue - self.value_function(d))
-                / self.span
-                * self.dim.height
-            )
-        except ValueError:
-            return self.topMargin
+    def getYPosition(self, d: Datapoint) -> int | None:
+        """Y pixel for ``d``, or ``None`` when the value is not a number.
+
+        A non-finite value (``inf``, ``-inf`` or NaN — a 50 Ω load has no
+        capacitive equivalent, for example) has no position on the axis: it
+        is a gap in the trace, not a point at the top or bottom edge.
+        """
+        value = self.value_function(d)
+        if not math.isfinite(value):
+            return None
+        return self.topMargin + round(
+            (self.maxValue - value) / self.span * self.dim.height
+        )
 
     def frequencyAtPosition(self, x, limit=True) -> int:
         """
@@ -609,18 +613,28 @@ class FrequencyChart(Chart):
         self.drawTraceLegend(qp)
 
     def _find_scaling(self) -> tuple[float, float]:
+        """Value range to draw, using finite values only.
+
+        An undefined value carries no magnitude, so letting it into the
+        range would stretch the axis to infinity and make every real value
+        indistinguishable.  It is skipped here and later left as a gap.
+        """
         min_value = self.minDisplayValue / 10e11
         max_value = self.maxDisplayValue / 10e11
         if self.fixedValues:
             return (min_value, max_value)
         for d in self.data:
             val = self.value_function(d)
+            if not math.isfinite(val):
+                continue
             min_value = min(min_value, val)
             max_value = max(max_value, val)
         for d in self.reference:  # Also check min/max for the reference sweep
             if d.freq < self.fstart or d.freq > self.fstop:
                 continue
             val = self.value_function(d)
+            if not math.isfinite(val):
+                continue
             min_value = min(min_value, val)
             max_value = max(max_value, val)
         return (min_value, max_value)

@@ -278,13 +278,15 @@ class Chart(QtWidgets.QWidget):
                 for freq, value in points
             ]
             for first, second in it.pairwise(plotted):
+                # A bound whose value is undefined has no position; drawing
+                # it at an edge would misstate the limit, so it is a gap.
+                start = self.getYPosition(first)
+                end = self.getYPosition(second)
+                if start is None or end is None:
+                    continue
                 qp.drawLine(
-                    QtCore.QPoint(
-                        self.getXPosition(first), self.getYPosition(first)
-                    ),
-                    QtCore.QPoint(
-                        self.getXPosition(second), self.getYPosition(second)
-                    ),
+                    QtCore.QPoint(self.getXPosition(first), start),
+                    QtCore.QPoint(self.getXPosition(second), end),
                 )
 
     def setMarkers(self, markers) -> None:
@@ -328,13 +330,18 @@ class Chart(QtWidgets.QWidget):
         nearest = None
         for m in self.markers:
             mx, my = self.getPosition(self.data[m.location])
+            if my is None:
+                # The marker sits on an undefined value, which has no
+                # position to drag it from.
+                continue
             distance = abs(complex(x - mx, y - my))
             if distance < shortest:
                 shortest = distance
                 nearest = m
         return nearest
 
-    def getPosition(self, d: Datapoint) -> tuple[int, int]:
+    def getPosition(self, d: Datapoint) -> tuple[int, int | None]:
+        """Chart position of ``d``; the Y part is ``None`` when undefined."""
         return self.getXPosition(d), self.getYPosition(d)
 
     def setDrawLines(self, draw_lines) -> None:

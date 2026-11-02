@@ -124,8 +124,12 @@ class QualityFactorChart(FrequencyChart):
         self.drawData(qp, self.reference, Chart.color.reference)
         self.drawMarkers(qp)
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
+        # Q is undefined for a non-finite reflection coefficient; the same
+        # gap rule as the base chart applies (see Frequency.getYPosition).
         Q = d.qFactor(self.reference_impedance)
+        if not math.isfinite(Q):
+            return None
         return self.topMargin + int(
             (self.maxQ - Q) / self.span * self.dim.height
         )
