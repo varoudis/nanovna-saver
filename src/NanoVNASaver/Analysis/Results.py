@@ -43,7 +43,7 @@ from typing import Iterable, Sequence
 
 from .. import AnalyticTools as At
 from ..Measurement import S11, S21, MeasurementSnapshot
-from ..RFTools import Datapoint, reflection_coefficient
+from ..RFTools import Datapoint
 
 logger = logging.getLogger(__name__)
 
@@ -620,13 +620,6 @@ def analyse_snapshot(
         ),
     }
     return [runners[kind]() for kind in kinds]
-
-
-def reflection_coefficient_of(
-    dp: Datapoint, reference: float = 50.0
-) -> complex:
-    """Expose the shared helper for report calculations."""
-    return reflection_coefficient(dp.impedance(reference), reference)
 
 
 def summarize(results: Sequence[AnalysisResult]) -> str:

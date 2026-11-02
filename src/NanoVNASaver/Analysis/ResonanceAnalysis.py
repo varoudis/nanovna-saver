@@ -69,7 +69,7 @@ class ResonanceAnalysis(Analysis):
             "freq": s11[index].freq,
             "s11": s11[index].z,
             "lambda": s11[index].wavelength,
-            "impedance": s11[index].impedance(),
+            "impedance": s11[index].impedance(self._reference()),
             "vswr": s11[index].vswr,
         }
         my_data["vswr_49"] = vswr_transformed(my_data["impedance"], 49)

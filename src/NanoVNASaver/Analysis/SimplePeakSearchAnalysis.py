@@ -116,8 +116,14 @@ class SimplePeakSearchAnalysis(Analysis):
         if self.button["gain"].isChecked():
             return ([d.gain for d in s21], format_gain)
         if self.button["resistance"].isChecked():
-            return ([d.impedance().real for d in s11], format_resistance)
+            return (
+                [d.impedance(self._reference()).real for d in s11],
+                format_resistance,
+            )
         if self.button["reactance"].isChecked():
-            return ([d.impedance().imag for d in s11], format_resistance)
+            return (
+                [d.impedance(self._reference()).imag for d in s11],
+                format_resistance,
+            )
         # default
         return ([d.vswr for d in s11], format_vswr)

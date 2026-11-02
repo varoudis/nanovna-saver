@@ -95,7 +95,7 @@ class PermeabilityChart(FrequencyChart):
             min_val = 1000.0
             max_val = -1000.0
             for d in self.data:
-                imp = d.impedance()
+                imp = d.impedance(self.reference_impedance)
                 re, im = imp.real, imp.imag
                 re = re * 10e6 / d.freq
                 im = im * 10e6 / d.freq
@@ -107,7 +107,7 @@ class PermeabilityChart(FrequencyChart):
             for d in self.reference:
                 if d.freq < self.fstart or d.freq > self.fstop:
                     continue
-                imp = d.impedance()
+                imp = d.impedance(self.reference_impedance)
                 re, im = imp.real, imp.imag
                 re = re * 10e6 / d.freq
                 im = im * 10e6 / d.freq
@@ -291,7 +291,7 @@ class PermeabilityChart(FrequencyChart):
                 self.drawMarker(x, y_im, qp, m.color, self.markers.index(m) + 1)
 
     def getImYPosition(self, d: Datapoint) -> int:
-        im = d.impedance().imag
+        im = d.impedance(self.reference_impedance).imag
         im = im * 10e6 / d.freq
         if self.logarithmicY:
             min_val = self.max - self.span
@@ -308,7 +308,7 @@ class PermeabilityChart(FrequencyChart):
         )
 
     def getReYPosition(self, d: Datapoint) -> int:
-        re = d.impedance().real
+        re = d.impedance(self.reference_impedance).real
         re = re * 10e6 / d.freq
         if self.logarithmicY:
             min_val = self.max - self.span

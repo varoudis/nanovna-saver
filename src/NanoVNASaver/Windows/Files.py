@@ -227,6 +227,10 @@ class FilesWindow(QtWidgets.QWidget):
             t = Touchstone(filename)
             t.load()
             self.app.saveData(t.s11, t.s21, filename)
+            # The file states the impedance it was measured at, so every
+            # derived display must follow it rather than assume 50 ohm
+            # (RF-02).
+            self.app.adopt_reference_impedance(t.opts.resistance)
             self._imported = t
             self._imported_source = filename
             self.refresh_export_actions()

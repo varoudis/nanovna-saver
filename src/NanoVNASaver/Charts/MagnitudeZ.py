@@ -138,9 +138,8 @@ class MagnitudeZChart(FrequencyChart):
             val = self.maxValue - (absy / self.dim.height * self.span)
         return [val]
 
-    @staticmethod
-    def magnitude(p: Datapoint) -> float:
-        return abs(p.impedance())
+    def magnitude(self, p: Datapoint) -> float:
+        return abs(p.impedance(self.reference_impedance))
 
     def logarithmicYAllowed(self) -> bool:
         return True

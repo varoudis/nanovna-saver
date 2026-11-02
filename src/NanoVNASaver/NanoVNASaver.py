@@ -73,6 +73,7 @@ from .Measurement import (
     compute_calibration_identity,
     snapshot_from_datapoints,
 )
+from .ReferenceImpedance import DEFAULT_REFERENCE_IMPEDANCE
 from .RFTools import corr_att_data
 from .Session import (
     SessionError,
@@ -285,6 +286,8 @@ class NanoVNASaver(QWidget):
         self._preset_parameters: dict = {}
         #: Cached device calibration state; never queried from a redraw.
         self._device_calibration = "unknown"
+        #: Reference impedance the calibration and derived displays assume.
+        self.reference_impedance = DEFAULT_REFERENCE_IMPEDANCE
         #: Limit sets loaded in this session (LIMIT-03).  Reports freeze the
         #: active set together with its results, so changing the selection
         #: never alters an already built report.
@@ -756,6 +759,28 @@ class NanoVNASaver(QWidget):
             name = self.sweep.properties.name or "nanovna"
             self.sweepSource = f"{name}_{time}"
 
+    def adopt_reference_impedance(self, value) -> None:
+        """Adopt the reference impedance a loaded file was measured at.
+
+        Charts, markers and analysis all derive impedance from a reflection
+        coefficient, so they must be told the reference those coefficients
+        belong to.  A value that cannot be used leaves the current one alone
+        rather than silently reverting to 50 ohm mid-session.
+        """
+        from .ReferenceImpedance import (
+            ReferenceImpedanceError,
+            require_reference_impedance,
+        )
+
+        try:
+            self.reference_impedance = require_reference_impedance(value)
+        except ReferenceImpedanceError:
+            logger.warning(
+                "Ignoring unusable reference impedance %r; keeping %s ohm",
+                value,
+                self.reference_impedance,
+            )
+
     def markerUpdated(self, marker: Marker):
         with self.dataLock:
             marker.findLocation(self.data.s11)
@@ -770,6 +795,7 @@ class NanoVNASaver(QWidget):
                 if self.ref_data:
                     m2 = Marker("Reference")
                     m2.location = self.markers[0].location
+                    m2.set_reference_impedance(self.reference_impedance)
                     m2.resetLabels()
                     m2.updateLabels(self.ref_data.s11, self.ref_data.s21)
                 else:
@@ -781,6 +807,9 @@ class NanoVNASaver(QWidget):
             if m2 is None:
                 logger.error("No data for delta, missing marker or reference")
             else:
+                self.delta_marker.set_reference_impedance(
+                    self.reference_impedance
+                )
                 self.delta_marker.set_markers(m1, m2)
                 self.delta_marker.resetLabels()
                 with contextlib.suppress(IndexError):
@@ -819,14 +848,17 @@ class NanoVNASaver(QWidget):
             s21 = self.data.s21[:]
 
         for m in self.markers:
+            m.set_reference_impedance(self.reference_impedance)
             m.resetLabels()
             m.updateLabels(s11, s21)
 
+        # Every chart inherits the reference impedance the data was measured
+        # at (RF-02): a 75 ohm file must not be drawn as if it were 50 ohm.
         for c in self.s11charts:
-            c.setData(s11)
+            c.setData(s11, self.reference_impedance)
 
         for c in self.s21charts:
-            c.setData(s21)
+            c.setData(s21, self.reference_impedance)
 
         for c in self.combinedCharts:
             c.setCombinedData(s11, s21)
@@ -881,8 +913,12 @@ class NanoVNASaver(QWidget):
         if sample.sweep_id != self.worker.sweep_id:
             logger.debug("Ignoring sample from stale sweep %s", sample.sweep_id)
             return
-        self.saveData(list(sample.s11), list(sample.s21))
         snapshot = sample.snapshot
+        if snapshot is not None:
+            # The display follows the data on screen: a live sweep replaces
+            # whatever reference an opened file had set (RF-02).
+            self.adopt_reference_impedance(snapshot.reference_impedance)
+        self.saveData(list(sample.s11), list(sample.s21))
         self._live_snapshot = snapshot
         self.mark_session_changed("sweep")
         if snapshot is not None:
@@ -1710,6 +1746,7 @@ class NanoVNASaver(QWidget):
             self.trace_control.refresh()
             self._last_complete = None
             self._live_snapshot = None
+            self.reference_impedance = DEFAULT_REFERENCE_IMPEDANCE
             self._coverage = None
             self._after_sweep = None
             self._preset_analyses = ()
@@ -1828,6 +1865,11 @@ class NanoVNASaver(QWidget):
             # in the archive.
             first = _displayed_snapshot_of(document, snapshots)
             self._live_snapshot = first
+            self.reference_impedance = (
+                first.reference_impedance
+                if first is not None
+                else DEFAULT_REFERENCE_IMPEDANCE
+            )
             with self.dataLock:
                 if first is None:
                     self.data.s11 = []

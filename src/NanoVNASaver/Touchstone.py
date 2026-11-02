@@ -25,6 +25,11 @@ from typing import Callable, ClassVar, List
 
 from scipy.interpolate import interp1d
 
+from .ReferenceImpedance import (
+    ReferenceImpedanceError,
+    format_reference_impedance,
+    require_reference_impedance,
+)
 from .RFTools import Datapoint
 
 logger = logging.getLogger(__name__)
@@ -99,6 +104,16 @@ class NonFiniteValueError(TouchstoneExportError, ValueError):
     """A sample that would be written is NaN or infinite."""
 
 
+class InvalidReferenceImpedanceError(TypeError, ValueError):
+    """The option line's ``R`` keyword does not name a usable impedance.
+
+    Subclasses both :class:`TypeError` (so a lenient load still logs and
+    drops the file, as it does for every other malformed option line) and
+    :class:`ValueError` (so a caller that inspects the error itself, such as
+    the import path, can report it).
+    """
+
+
 class Options:
     # Fun fact: In Touchstone 1.1 spec all params are optional unordered.
     # Just the line has to start with "#"
@@ -117,17 +132,24 @@ class Options:
         unit: str = "GHZ",
         parameter: str = "S",
         t_format: str = "ma",
-        resistance: int = 50,
+        resistance: float = 50,
     ):
         # set defaults
         assert unit.lower() in Options.VALID_UNITS
         assert parameter.lower() in Options.VALID_PARAMETERS
         assert t_format.lower() in Options.VALID_FORMATS
-        assert resistance > 0
+        # A usable reference impedance is checked here as well as on parse:
+        # an option line is written from this object, and an unusable value
+        # would make every exported file unreadable.
+        try:
+            self.resistance = require_reference_impedance(
+                resistance, source="the reference impedance"
+            )
+        except ReferenceImpedanceError as error:
+            raise InvalidReferenceImpedanceError(str(error)) from None
         self.unit = unit.lower()
         self.parameter = parameter.lower()
         self.format = t_format.lower()
-        self.resistance = resistance
 
     @property
     def factor(self) -> int:
@@ -135,10 +157,20 @@ class Options:
 
     def __str__(self) -> str:
         return (
-            f"# {self.unit} {self.parameter} {self.format} r {self.resistance}"
+            f"# {self.unit} {self.parameter} {self.format}"
+            f" r {format_reference_impedance(self.resistance)}"
         ).upper()
 
     def parse(self, line: str):
+        """Read an option line.
+
+        The Touchstone 1.1 option line is an unordered set of keywords, so
+        ``R`` is accepted wherever it appears, including before the unit or
+        the format.  ``R`` takes a value; a missing, non-positive or
+        non-finite one is refused instead of being replaced by the 50 ohm
+        default, because silently reading a 75 ohm file as 50 ohm would
+        mislabel every impedance derived from it.
+        """
         if not line.startswith("#"):
             raise TypeError(f"Not an option line: {line}")
         punit = pparam = pformat = presist = False
@@ -154,20 +186,37 @@ class Options:
                 self.format = p
                 pformat = True
             elif p == "r" and not presist:
-                rstr = next(params)
-                try:
-                    self.resistance = int(rstr)
-                except ValueError:
-                    # Keep the exact value: the writer emits the reference
-                    # impedance of the measurement, which need not be an
-                    # integer.
-                    logger.warning("Non integer resistance value: %s", rstr)
-                    value = float(rstr)
-                    self.resistance = (
-                        int(value) if value.is_integer() else value
-                    )
+                self.resistance = self._parse_resistance(next(params, None))
+                presist = True
             else:
                 raise TypeError(f"Illegal option line: {line}")
+
+    @staticmethod
+    def _parse_resistance(text):
+        """Validate the value of the ``R`` keyword."""
+        if text is None:
+            raise InvalidReferenceImpedanceError(
+                "the option line has an R keyword with no value"
+            )
+        try:
+            value = float(text)
+        except ValueError:
+            raise InvalidReferenceImpedanceError(
+                f"the R keyword needs a number, not {text!r}"
+            ) from None
+        try:
+            require_reference_impedance(value, source="the R keyword")
+        except ReferenceImpedanceError as error:
+            raise InvalidReferenceImpedanceError(str(error)) from None
+        try:
+            return int(text)
+        except ValueError:
+            # The spec writes R as an integer, but a value such as "50.0"
+            # or "75.5" is readable and the exact value is kept: the
+            # writer emits the reference impedance of the measurement,
+            # which need not be an integer.
+            logger.warning("Non integer resistance value: %s", text)
+            return int(value) if value.is_integer() else value
 
 
 class Touchstone:
@@ -222,7 +271,8 @@ class Touchstone:
         self.sdata[3] = value
 
     @property
-    def r(self) -> int:
+    def r(self) -> float:
+        """Reference impedance the file's S-parameters are normalized to."""
         return self.opts.resistance
 
     def s(self, name: str) -> list[Datapoint]:
@@ -489,17 +539,21 @@ class Touchstone:
         return channels
 
     def _option_line(self) -> str:
-        """Option line for the data actually written (hertz, real/imag)."""
-        resistance = float(self.opts.resistance)
-        if not math.isfinite(resistance) or resistance <= 0:
+        """Option line for the data actually written (hertz, real/imag).
+
+        The reference impedance is written from ``self.opts.resistance``,
+        so a 75 ohm measurement is exported as a 75 ohm file.  It is
+        validated first: an unusable value would produce a file that every
+        consumer would read against a different reference than the one the
+        numbers were computed against.
+        """
+        try:
+            value = format_reference_impedance(self.opts.resistance)
+        except ReferenceImpedanceError as error:
             raise TouchstoneExportError(
                 "Reference impedance must be a positive finite number,"
                 f" not {self.opts.resistance!r}"
-            )
-        if resistance.is_integer():
-            value = str(int(resistance))
-        else:
-            value = f"{resistance:g}"
+            ) from error
         return f"# HZ S RI R {value}"
 
     def _comment_lines(self, parameter_count: int) -> list[str]:

@@ -29,4 +29,6 @@ class CapacitanceChart(FrequencyChart):
         self.minDisplayValue = 0
         self.maxDisplayValue = 100
         self.name_unit = "F"
-        self.value_function = lambda x: x.capacitiveEquivalent()
+        self.value_function = lambda x: x.capacitiveEquivalent(
+            self.reference_impedance
+        )

@@ -29,4 +29,6 @@ class InductanceChart(FrequencyChart):
         self.minDisplayValue = 0
         self.maxDisplayValue = 100
         self.name_unit = "H"
-        self.value_function = lambda x: x.inductiveEquivalent()
+        self.value_function = lambda x: x.inductiveEquivalent(
+            self.reference_impedance
+        )

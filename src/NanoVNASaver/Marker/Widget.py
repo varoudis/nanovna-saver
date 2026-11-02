@@ -103,6 +103,10 @@ class Marker(QtCore.QObject, Value):
         self.name = name
         self.color = QtGui.QColor()
         self.index = 0
+        #: Reference impedance the displayed data was measured against
+        #: (RF-02).  Every impedance-derived readout uses it rather than a
+        #: literal 50, so a 75 ohm file is not reported in 50 ohm terms.
+        self.reference_impedance: float = 50.0
 
         if self.qsettings:
             Marker._instances += 1
@@ -321,6 +325,10 @@ class Marker(QtCore.QObject, Value):
         for v in self.label.values():
             v.setText("")
 
+    def set_reference_impedance(self, value) -> None:
+        """Adopt the reference the displayed data belongs to."""
+        self.reference_impedance = float(value)
+
     def updateLabels(
         self, s11: list[RFTools.Datapoint], s21: list[RFTools.Datapoint]
     ):
@@ -343,7 +351,7 @@ class Marker(QtCore.QObject, Value):
         self.frequencyInput.setText(str(_s11.freq))
         self.store(self.location, s11, s21)
 
-        imp = _s11.impedance()
+        imp = _s11.impedance(self.reference_impedance)
         cap_str = format_capacitance(
             RFTools.impedance_to_capacitance(imp, _s11.freq)
         )
@@ -382,7 +390,9 @@ class Marker(QtCore.QObject, Value):
             f"{round(abs(_s11.z), 2)!s}∠{format_phase(_s11.phase)}"
         )
 
-        self.label["s11q"].setText(format_q_factor(_s11.qFactor()))
+        self.label["s11q"].setText(
+            format_q_factor(_s11.qFactor(self.reference_impedance))
+        )
         self.label["s11z"].setText(format_resistance(abs(imp)))
         self.label["serc"].setText(cap_str)
         self.label["serl"].setText(ind_str)
@@ -402,14 +412,24 @@ class Marker(QtCore.QObject, Value):
                 f"{round(abs(_s21.z), 2)!s}∠{format_phase(_s21.phase)}"
             )
             self.label["s21magshunt"].setText(
-                format_magnitude(abs(_s21.shuntImpedance()))
+                format_magnitude(
+                    abs(_s21.shuntImpedance(self.reference_impedance))
+                )
             )
             self.label["s21magseries"].setText(
-                format_magnitude(abs(_s21.seriesImpedance()))
+                format_magnitude(
+                    abs(_s21.seriesImpedance(self.reference_impedance))
+                )
             )
             self.label["s21realimagshunt"].setText(
-                format_complex_imp(_s21.shuntImpedance(), allow_negative=True)
+                format_complex_imp(
+                    _s21.shuntImpedance(self.reference_impedance),
+                    allow_negative=True,
+                )
             )
             self.label["s21realimagseries"].setText(
-                format_complex_imp(_s21.seriesImpedance(), allow_negative=True)
+                format_complex_imp(
+                    _s21.seriesImpedance(self.reference_impedance),
+                    allow_negative=True,
+                )
             )

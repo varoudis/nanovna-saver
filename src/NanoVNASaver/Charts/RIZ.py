@@ -112,4 +112,4 @@ class RealImaginaryZChart(RealImaginaryChart):
         return self.impedance(p)
 
     def impedance(self, p: Datapoint) -> complex:
-        return p.impedance()
+        return p.impedance(self.reference_impedance)

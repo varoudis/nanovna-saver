@@ -25,6 +25,5 @@ logger = logging.getLogger(__name__)
 
 
 class MagnitudeZShuntChart(MagnitudeZChart):
-    @staticmethod
-    def magnitude(p: Datapoint) -> float:
-        return abs(p.shuntImpedance())
+    def magnitude(self, p: Datapoint) -> float:
+        return abs(p.shuntImpedance(self.reference_impedance))

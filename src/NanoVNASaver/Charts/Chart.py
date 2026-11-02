@@ -165,6 +165,10 @@ class Chart(QtWidgets.QWidget):
 
         self.data: list[Datapoint] = []
         self.reference: list[Datapoint] = []
+        #: Reference impedance the data was measured against (RF-02).  Every
+        #: impedance-derived chart computes from this rather than from a
+        #: literal 50, so a 75 ohm file is not silently read as 50 ohm.
+        self.reference_impedance: float = 50.0
         #: Active coverage, or ``None`` when nothing is known (CAL-02.2).
         self.coverage = None
         #: Additional named traces drawn on top of the primary data
@@ -194,8 +198,17 @@ class Chart(QtWidgets.QWidget):
         self.reference = []
         self.update()
 
-    def setData(self, data) -> None:
+    def setData(self, data, reference_impedance=None) -> None:
+        """Adopt ``data``, optionally with the impedance it was measured at.
+
+        ``reference_impedance`` is the single fixing point for every chart:
+        a chart that derives an impedance from a reflection coefficient asks
+        the chart, not a constant, so a renormalized or 75 ohm trace is
+        drawn on the same scale as the data it came with.
+        """
         self.data = data
+        if reference_impedance is not None:
+            self.reference_impedance = float(reference_impedance)
         self.update()
 
     def setTraces(self, traces) -> None:

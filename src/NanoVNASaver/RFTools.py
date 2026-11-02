@@ -133,6 +133,30 @@ def reflection_coefficient(z: complex, ref_impedance: float = 50) -> complex:
     return (z - ref_impedance) / (z + ref_impedance)
 
 
+def impedance_to_gamma(z: complex, ref_impedance: float = 50) -> complex:
+    """Calculate the reflection coefficient of ``z`` against a reference.
+
+    The exact inverse of :func:`gamma_to_impedance` for a positive, finite
+    reference impedance, and the form the textbook uses:
+    ``G = (Z - Z0) / (Z + Z0)``.  A reference impedance that is not positive
+    and finite, or an impedance that is not finite, is refused: either would
+    return a number that looks like a reflection coefficient but describes
+    no physical load.  ``z == -ref_impedance`` is an infinite reflection
+    coefficient, reported as infinity rather than raised.
+    """
+    if not math.isfinite(ref_impedance) or ref_impedance <= 0:
+        raise ValueError(
+            "reference impedance must be a positive finite number,"
+            f" not {ref_impedance!r}"
+        )
+    if not (math.isfinite(z.real) and math.isfinite(z.imag)):
+        raise ValueError(f"impedance must be finite, not {z!r}")
+    try:
+        return (z - ref_impedance) / (z + ref_impedance)
+    except ZeroDivisionError:
+        return complex(math.inf, math.inf)
+
+
 def serial_to_parallel(z: complex) -> complex:
     """Convert serial impedance to parallel impedance equivalent"""
     z_sq_sum = z.real**2 + z.imag**2

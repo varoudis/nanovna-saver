@@ -47,6 +47,16 @@ class Analysis:
         self._widget = QtWidgets.QWidget()
         self._widget.setLayout(self.layout)
 
+    def _reference(self) -> float:
+        """Reference impedance of the displayed data (RF-02).
+
+        Analyses derive resistance and reactance from a reflection
+        coefficient, so they must use the reference the data was measured
+        against.  It is read from the application on every call rather than
+        cached, because importing a file can change it mid-session.
+        """
+        return float(getattr(self.app, "reference_impedance", 50.0) or 50.0)
+
     def widget(self) -> QtWidgets.QWidget:
         return self._widget
 

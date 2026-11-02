@@ -26,4 +26,4 @@ logger = logging.getLogger(__name__)
 
 class RealImaginaryZShuntChart(RealImaginaryZChart):
     def impedance(self, p: Datapoint) -> complex:
-        return p.shuntImpedance()
+        return p.shuntImpedance(self.reference_impedance)

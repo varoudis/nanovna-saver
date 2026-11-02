@@ -59,8 +59,9 @@ class DeltaMarker(Marker):
         s11_a = a.s11[1]
         s11_b = b.s11[1]
 
-        imp_a = s11_a.impedance()
-        imp_b = s11_b.impedance()
+        reference = self.reference_impedance
+        imp_a = s11_a.impedance(reference)
+        imp_b = s11_b.impedance(reference)
         imp = imp_b - imp_a
 
         cap_str = format_capacitance(
@@ -120,7 +121,10 @@ class DeltaMarker(Marker):
             f"{format_phase(s11_b.phase - s11_a.phase)}"
         )
         self.label["s11q"].setText(
-            format_q_factor(s11_b.qFactor() - s11_a.qFactor(), True)
+            format_q_factor(
+                s11_b.qFactor(reference) - s11_a.qFactor(reference),
+                True,
+            )
         )
         self.label["s11z"].setText(format_resistance(abs(imp)))
         self.label["serc"].setText(cap_str)

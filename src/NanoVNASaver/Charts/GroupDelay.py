@@ -63,8 +63,10 @@ class GroupDelayChart(FrequencyChart):
         self.reference = data
         self.calculateGroupDelay()
 
-    def setData(self, data):
+    def setData(self, data, reference_impedance=None):
         self.data = data
+        if reference_impedance is not None:
+            self.reference_impedance = float(reference_impedance)
         self.calculateGroupDelay()
 
     def calculateGroupDelay(self):

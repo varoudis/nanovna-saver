@@ -53,7 +53,7 @@ class QualityFactorChart(FrequencyChart):
         else:
             maxQ = 0.0
             for d in self.data:
-                Q = d.qFactor()
+                Q = d.qFactor(self.reference_impedance)
                 maxQ = max(maxQ, Q)
             scale = 0
             if maxQ > 0:
@@ -125,7 +125,7 @@ class QualityFactorChart(FrequencyChart):
         self.drawMarkers(qp)
 
     def getYPosition(self, d: Datapoint) -> int:
-        Q = d.qFactor()
+        Q = d.qFactor(self.reference_impedance)
         return self.topMargin + int(
             (self.maxQ - Q) / self.span * self.dim.height
         )

@@ -47,7 +47,10 @@ class EFHWAnalysis(ResonanceAnalysis):
     def do_resonance_analysis(self):
         s11 = self.app.data.s11
         maximums = sorted(
-            At.maxima([d.impedance().real for d in s11], threshold=500)
+            At.maxima(
+                [d.impedance(self._reference()).real for d in s11],
+                threshold=500,
+            )
         )
         extended_data = {}
         logger.info("TO DO: find near data")
@@ -81,7 +84,8 @@ class EFHWAnalysis(ResonanceAnalysis):
                 f"{format_frequency_short(s11[idx].freq)}",
                 QtWidgets.QLabel(
                     f" ({diff[i]['freq']})"
-                    f" {format_complex_imp(s11[idx].impedance())}"
+                    " "
+                    f"{format_complex_imp(s11[idx].impedance(self._reference()))}"
                     f" ({diff[i]['r']}) {diff[i]['lambda']} m"
                 ),
             )

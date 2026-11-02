@@ -337,8 +337,16 @@ class TDRWindow(QtWidgets.QWidget):
         step_response = step_response + step_response_rev
 
         # calculate step response based on the format that the user selected
-        step_Z = 50 * (1 + step_response) / (1 - step_response)
-        step_refl_coefficient = np.abs((step_Z - 50) / (step_Z + 50))
+        # The step response is the reflection coefficient the data was
+        # measured at, so the impedance it maps to uses that reference, not
+        # a literal 50 (RF-02).
+        reference = float(
+            getattr(self.app, "reference_impedance", 50.0) or 50.0
+        )
+        step_Z = reference * (1 + step_response) / (1 - step_response)
+        step_refl_coefficient = np.abs(
+            (step_Z - reference) / (step_Z + reference)
+        )
         if tdr_format == "|Z| (lowpass)":
             self.step_response_Z = np.abs(step_Z)
             return td

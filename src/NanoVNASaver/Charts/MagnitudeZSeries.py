@@ -25,6 +25,5 @@ logger = logging.getLogger(__name__)
 
 
 class MagnitudeZSeriesChart(MagnitudeZChart):
-    @staticmethod
-    def magnitude(p: Datapoint) -> float:
-        return abs(p.seriesImpedance())
+    def magnitude(self, p: Datapoint) -> float:
+        return abs(p.seriesImpedance(self.reference_impedance))
