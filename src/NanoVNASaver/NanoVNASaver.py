@@ -73,6 +73,7 @@ from .Measurement import (
     compute_calibration_identity,
     snapshot_from_datapoints,
 )
+from .Processing import ProcessingConfig, RunningAverageState
 from .ReferenceImpedance import DEFAULT_REFERENCE_IMPEDANCE
 from .RFTools import corr_att_data
 from .Session import (
@@ -286,6 +287,14 @@ class NanoVNASaver(QWidget):
         self._preset_parameters: dict = {}
         #: Cached device calibration state; never queried from a redraw.
         self._device_calibration = "unknown"
+        #: Ordered, versioned processing applied after calibration (DSP-01).
+        #: The worker freezes this at the start of a run, so an edit made
+        #: mid-sweep applies to the next run only.
+        self.processing_config = ProcessingConfig()
+        #: Continuous running-average state (DSP-03); reset whenever the
+        #: calibration, grid or source changes, because blending across those
+        #: boundaries would mix incomparable measurements.
+        self.running_average = RunningAverageState()
         #: Reference impedance the calibration and derived displays assume.
         self.reference_impedance = DEFAULT_REFERENCE_IMPEDANCE
         #: Limit sets loaded in this session (LIMIT-03).  Reports freeze the

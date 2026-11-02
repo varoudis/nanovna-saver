@@ -52,6 +52,8 @@ from .Calibration import (
 )
 from .Hardware.VNA import VNA
 from .Measurement import (
+    S11,
+    S21,
     CompletionState,
     CorrectionSource,
     CorrectionState,
@@ -59,6 +61,12 @@ from .Measurement import (
     compute_calibration_identity,
     snapshot_from_datapoints,
 )
+from .Processing import (
+    STAGE_AVERAGE,
+    ProcessingConfig,
+    apply_processing,
+)
+from .ReferenceImpedance import DEFAULT_REFERENCE_IMPEDANCE
 from .RFTools import Datapoint
 from .Settings.Sweep import Sweep, SweepMode
 from .SweepState import (
@@ -67,6 +75,20 @@ from .SweepState import (
     SweepStateMachine,
     estimate_remaining,
 )
+
+
+def _is_identity(config) -> bool:
+    """True when ``config`` describes no work (including "no configuration").
+
+    A missing configuration and an empty one mean the same thing, so callers
+    never have to distinguish "never configured" from "configured to do
+    nothing".
+    """
+    if config is None:
+        return True
+    if isinstance(config, ProcessingConfig):
+        return config.is_identity
+    return True
 
 
 def _apply_offset_delay(
@@ -148,6 +170,10 @@ class SweepCapture:
     averages: int
     truncates: int
     continuous: bool
+    #: Ordered processing configuration frozen at the run boundary.  Held by
+    #: value so an edit made mid-sweep cannot change what the samples already
+    #: published by this run mean (DSP-01/DSP-02).
+    processing: object = None
 
     @property
     def segments(self) -> int:
@@ -445,7 +471,8 @@ class SweepWorker(QThread):
             raise ValueError(f"Cannot start sweep: {exc}") from exc
         # Freeze at the run boundary: the coefficients used by every sample
         # of this run, and the identity published with them, must stay the
-        # ones that were in effect when it started.
+        # ones that were in effect when it started.  The processing
+        # configuration is frozen for the same reason.
         return SweepCapture(
             sweep_id=self.sweep_id,
             sweep=sweep,
@@ -454,6 +481,7 @@ class SweepWorker(QThread):
             averages=averages,
             truncates=sweep.properties.averages[1],
             continuous=sweep.properties.mode == SweepMode.CONTINOUS,
+            processing=getattr(self.app, "processing_config", None),
         )
 
     def _run_loop(self) -> SweepState | None:
@@ -577,6 +605,181 @@ class SweepWorker(QThread):
         self.rawData21 = []
         logger.debug("Init data cleared for sweep %s", self.sweep_id)
 
+    def _apply_processing(
+        self,
+        data11: list[Datapoint],
+        data21: list[Datapoint],
+        capture: "SweepCapture | None",
+    ) -> tuple[list[Datapoint], list[Datapoint], float]:
+        """Apply this run's frozen processing to one segment.
+
+        The raw and calibrated buffers kept by the caller are the acquisition;
+        this returns only the view that is published and snapshotted.  An
+        identity configuration returns the inputs unchanged, so a run without
+        processing behaves exactly as before.
+
+        A stage that fails raises: publishing a half-processed segment would
+        present unprocessed samples as if they had been processed.  The run
+        reports the failure through its normal error path instead.
+
+        The third element is the reference impedance the returned samples are
+        expressed in.  A renormalization stage changes it, so it is returned
+        rather than re-read from the application: the number and the samples
+        must come from the same run.
+        """
+        config = capture.processing if capture is not None else None
+        reference = self._reference_impedance()
+        if _is_identity(config):
+            return data11, data21, reference
+        # A running average is a property of a whole sweep, not of one
+        # segment: each segment has a different frequency grid, so blending
+        # per segment would reset the accumulator every time.  It and every
+        # stage after it run once per pass in ``_blend_whole_sweep`` instead.
+        config = self._segment_config(config)
+        channels: dict[str, list[Datapoint]] = {}
+        if data11:
+            channels[S11] = list(data11)
+        if data21:
+            channels[S21] = list(data21)
+        if not channels:
+            return data11, data21, reference
+        result = apply_processing(
+            channels,
+            config,
+            reference_impedance=reference,
+        )
+        return (
+            list(result.channels.get(S11, ())),
+            list(result.channels.get(S21, ())),
+            float(getattr(result, "reference_impedance", reference)),
+        )
+
+    def _reference_impedance(self) -> float:
+        """The reference the connected device's samples are expressed in.
+
+        This comes from the device, never from the application's display
+        reference: that one follows whatever was last shown, so a 75 ohm file
+        that was opened earlier must not relabel a 50 ohm measurement.
+        """
+        value = getattr(self.app.vna, "reference_impedance", None)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return DEFAULT_REFERENCE_IMPEDANCE
+
+    def _average_context(self, capture: "SweepCapture | None") -> str:
+        """Identity of the data stream an average may blend across.
+
+        A new source, a new calibration or a new grid must not be averaged
+        with the previous one, so the context changes whenever any of those
+        does; ``RunningAverageState`` resets on any context change.  Within
+        one run every segment shares it, which is what lets a running average
+        accumulate across passes of a continuous sweep.
+        """
+        if capture is None:
+            return "no-capture"
+        correction = self._correction_state(capture)
+        device = self.app.vna
+        port = getattr(getattr(device, "serial", None), "port", "")
+        source = (
+            getattr(device, "name", ""),
+            getattr(device, "scenario_key", ""),
+            getattr(device, "provenance_note", ""),
+            port,
+        )
+        return "|".join(
+            (
+                f"source:{source}",
+                f"cal:{correction.identity}",
+                f"delay:{correction.offset_delay!r}",
+                f"grid:{capture.sweep}",
+                f"avg:{capture.averages}",
+            )
+        )
+
+    @staticmethod
+    def _split_at_average(config) -> tuple:
+        """Stages before the running average, and the average onwards.
+
+        The pipeline's declared order applies to whole sweeps too: a stage
+        ordered after the average has to see the averaged samples, or the
+        provenance would describe an order that never ran.
+        """
+        if config is None or config.find(STAGE_AVERAGE) is None:
+            return config, None
+        stages = tuple(config.stages)
+        position = stages.index(config.find(STAGE_AVERAGE))
+        return (
+            ProcessingConfig(
+                stages=stages[:position], format_version=config.format_version
+            ),
+            ProcessingConfig(
+                stages=stages[position:], format_version=config.format_version
+            ),
+        )
+
+    @staticmethod
+    def _segment_config(config):
+        """``config`` without the stages that need a whole sweep."""
+        return SweepWorker._split_at_average(config)[0]
+
+    def _blend_whole_sweep(
+        self, capture: "SweepCapture", reference_impedance: float
+    ) -> None:
+        """Blend one complete pass into the running average (DSP-03).
+
+        Called from :meth:`update_data` when the last segment arrives and
+        before that sample is published, so the accumulator sees complete
+        channels on a single grid and the snapshot holds what its provenance
+        says.  The published buffers are replaced by the blended ones;
+        ``rawData11``/``rawData21`` keep the unprocessed acquisition, so an
+        averaged sample is never presented as a measurement.
+
+        The accumulator is published back to the application only for a
+        complete, non-cancelled pass: a partial pass must not advance the
+        average that the next run continues from.
+        """
+        average = self._split_at_average(capture.processing)[1]
+        if average is None:
+            return
+        channels: dict[str, list[Datapoint]] = {}
+        if self.data11:
+            channels[S11] = list(self.data11)
+        if self.data21:
+            channels[S21] = list(self.data21)
+        if not channels:
+            return
+        result = apply_processing(
+            channels,
+            average,
+            reference_impedance=reference_impedance,
+            running=getattr(self.app, "running_average", None),
+            average_context=self._whole_sweep_context(capture),
+        )
+        self.data11 = list(result.channels.get(S11, ()))
+        self.data21 = list(result.channels.get(S21, ()))
+        if result.running is not None and hasattr(self.app, "running_average"):
+            # Immutable state: publishing it back is what lets the next run
+            # continue this average rather than start a new one.
+            self.app.running_average = result.running
+
+    def _whole_sweep_context(self, capture: "SweepCapture") -> str:
+        """Context for an average blended across whole sweeps.
+
+        It extends the per-segment context with the pipeline identity, so
+        editing any processing stage starts a new accumulation instead of
+        blending samples that mean something different now.
+        """
+        identity = ""
+        config = capture.processing
+        if config is not None:
+            identity = config.identity()
+        return "|".join(
+            (
+                self._average_context(capture),
+                f"proc:{identity}",
+            )
+        )
+
     def update_data(
         self,
         frequencies: list[int],
@@ -606,11 +809,15 @@ class SweepWorker(QThread):
         data11, data21 = self.applyCalibration(
             raw_data11, raw_data21, capture=capture
         )
-        self.data11.extend(data11)
-        self.data21.extend(data21)
+        # Processing is applied to the per-segment view that is published and
+        # snapshotted; the raw and calibrated buffers above keep what was
+        # acquired, so a processed sample never overwrites a measurement.
+        applied = self._apply_processing(data11, data21, capture)
+        applied11, applied21, reference_impedance = applied
+        self.data11.extend(applied11)
+        self.data21.extend(applied21)
         self.rawData11.extend(raw_data11)
         self.rawData21.extend(raw_data21)
-
         simulated = bool(getattr(self.app.vna, "simulated", False))
         scenario = (
             getattr(self.app.vna, "scenario_key", "") if simulated else ""
@@ -625,6 +832,11 @@ class SweepWorker(QThread):
         )
         source = "simulated" if simulated else ""
         complete = capture is not None and index + 1 >= capture.segments
+        if complete:
+            # Every segment is in, so the pass is a whole sweep: this is the
+            # only correct place to blend a running average (DSP-03), and it
+            # has to happen before the sample below is built.
+            self._blend_whole_sweep(capture, reference_impedance)
         completion = (
             CompletionState.COMPLETE if complete else CompletionState.PARTIAL
         )
@@ -642,7 +854,27 @@ class SweepWorker(QThread):
             source=source,
             notes=provenance_note,
             correction=self._correction_state(capture),
+            # The grid was measured against this reference (RF-02), so a
+            # snapshot must state it rather than default to 50 ohm.
+            reference_impedance=reference_impedance,
         )
+        # A partial sample has not been through the whole-sweep stages yet,
+        # so it must not claim them.
+        applied_config = (
+            None
+            if capture is None
+            else capture.processing
+            if complete
+            else self._segment_config(capture.processing)
+        )
+        if not _is_identity(applied_config):
+            # The channels above are the processed ones, so the snapshot's
+            # corrected view already holds them; this records what was
+            # applied.  ``raw`` and the calibration identity are untouched,
+            # so the unprocessed acquisition stays available beside it.
+            snapshot = snapshot.with_processing(
+                applied_config, reference_impedance=reference_impedance
+            )
         sample = SweepSample(
             sweep_id=self.sweep_id,
             segment=index,
