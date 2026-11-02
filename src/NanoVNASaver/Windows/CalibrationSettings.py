@@ -43,6 +43,7 @@ from ..CalibrationKits import (
     kit_from_legacy_values,
     legacy_values,
 )
+from ..RFTools import Datapoint, corr_att_data
 from ..Settings.Sweep import SweepMode
 from ..SweepState import SweepState
 from ..Touchstone import Touchstone
@@ -987,12 +988,56 @@ class CalibrationWindow(QtWidgets.QWidget):
             return False
         return True
 
+    def _standard_samples(self, channel: str) -> list[Datapoint]:
+        """The connected standard as the device measured it.
+
+        ``app.data`` holds the *published* view: it has been corrected and
+        processed (offset delay, smoothing, running average, fixture,
+        reference impedance), so storing it would make every later
+        measurement inherit that processing and be corrected against data
+        that was already transformed.  The acquisition keeps the unprocessed
+        samples beside the published ones, so its channel is used whenever
+        it is what produced the trace on screen.
+
+        One correction does belong in the stored value.  The inline S21
+        attenuator is part of the measurement configuration, not of the
+        processing pipeline: ``saveData`` applies it to every published
+        sweep, so a transmission standard is stored with that same factor to
+        keep the error terms on the unattenuated footing the displayed
+        correction is computed on.  Dropping it here makes the recovered
+        DUT wrong by exactly the attenuator ratio.
+
+        Data that did not come from an acquisition -- a loaded file, or a
+        trace whose published samples no longer match this acquisition --
+        has no raw channel to recover, so it is stored as it is.
+        """
+        with self.app.dataLock:
+            published = list(getattr(self.app.data, channel.lower()))
+        att = self.app.s21att if channel == "S21" else 0.0
+        snapshot = getattr(self.app, "_live_snapshot", None)
+        if snapshot is None:
+            return published
+        raw = snapshot.channel(channel, corrected=False)
+        displayed = snapshot.channel(channel)
+        if not raw or not displayed:
+            return published
+        # ``saveData`` publishes the acquisition's own samples plus the
+        # inline attenuator, so that is the expected difference; anything
+        # else means the trace is no longer this acquisition.
+        expected = corr_att_data(list(displayed), att)
+        if len(expected) != len(published) or any(
+            now.freq != published_point.freq or now.z != published_point.z
+            for now, published_point in zip(expected, published, strict=True)
+        ):
+            return published
+        return corr_att_data(list(raw), att)
+
     def cal_save(self, name: str):
-        if name in {"through", "isolation"}:
-            self.app.calibration.insert(name, self.app.data.s21)
-        else:
-            self.app.calibration.insert(name, self.app.data.s11)
-        self.cal_label[name].setText(_format_cal_label(len(self.app.data.s11)))
+        """Store the standard that is connected, as it was measured."""
+        channel = "S21" if name in {"through", "isolation"} else "S11"
+        data = self._standard_samples(channel)
+        self.app.calibration.insert(name, data)
+        self.cal_label[name].setText(_format_cal_label(len(data)))
 
     def manual_save(self, name: str):
         if self.checkExpertUser():
