@@ -72,6 +72,12 @@ from .Hardware.VNA import VNA
 from .Limits import LimitCatalogue
 from .Marker.Delta import DeltaMarker
 from .Marker.Widget import Marker
+from .MarkerSearch import (
+    SEARCH_CHOICES,
+    SearchKind,
+    band_width_summary,
+    search_for,
+)
 from .Measurement import (
     S11,
     S21,
@@ -594,6 +600,34 @@ class NanoVNASaver(QWidget):
         )
         self.marker_column.addWidget(btn_show_analysis)
 
+        search_box = QtWidgets.QGroupBox("Marker search")
+        search_layout = QtWidgets.QFormLayout(search_box)
+        self.search_kind = QtWidgets.QComboBox()
+        for kind, label in SEARCH_CHOICES:
+            self.search_kind.addItem(label, kind.value)
+        search_layout.addRow("Find", self.search_kind)
+        self.search_target = QtWidgets.QDoubleSpinBox()
+        self.search_target.setRange(-200.0, 200.0)
+        self.search_target.setDecimals(3)
+        self.search_target.setSuffix(" dB / ratio")
+        self.search_target.setToolTip(
+            "Target for a crossing search; ignored by peak and extreme"
+            " searches."
+        )
+        search_layout.addRow("Target", self.search_target)
+        search_buttons = QtWidgets.QHBoxLayout()
+        btn_search = QtWidgets.QPushButton("Place marker")
+        btn_search.clicked.connect(self.place_marker_from_search)
+        btn_bandwidth = QtWidgets.QPushButton("Bandwidth / Q")
+        btn_bandwidth.clicked.connect(self.show_marker_bandwidth)
+        search_buttons.addWidget(btn_search)
+        search_buttons.addWidget(btn_bandwidth)
+        search_layout.addRow(search_buttons)
+        self.label_search = QtWidgets.QLabel("")
+        self.label_search.setWordWrap(True)
+        search_layout.addRow(self.label_search)
+        self.marker_column.addWidget(search_box)
+
         ###############################################################
         # TDR
         ###############################################################
@@ -855,6 +889,59 @@ class NanoVNASaver(QWidget):
                     self.delta_marker.updateLabels()
         self.refresh_marker_comparison()
         self.refresh_marker_coverage()
+
+    def _search_channel(self) -> tuple[str, list]:
+        """The channel a marker search reads: whichever has data."""
+        with self.dataLock:
+            s11 = list(self.data.s11)
+            s21 = list(self.data.s21)
+        if s11:
+            return "S11", s11
+        return "S21", s21
+
+    def place_marker_from_search(self) -> bool:
+        """Move marker 0 to the result of the selected search (ANALYSIS-01).
+
+        The result says whether its frequency was measured or estimated, and
+        that wording is shown verbatim: a marker must not present a fitted
+        location as a measurement.
+        """
+        channel, points = self._search_channel()
+        if not points:
+            self.label_search.setText("No captured data to search yet.")
+            return False
+        kind = SearchKind(str(self.search_kind.currentData()))
+        result = search_for(
+            kind,
+            points,
+            channel=channel,
+            target=float(self.search_target.value()),
+            estimate=True,
+        )
+        if not result.ok or result.frequency is None:
+            self.label_search.setText(f"Search: {result.describe()}")
+            return False
+        if not self.markers:
+            self.label_search.setText("Add a marker first.")
+            return False
+        marker = self.markers[0]
+        # The search names a frequency; the marker then snaps to the nearest
+        # sample exactly as a hand-placed marker does, so both routes agree.
+        marker.location = -1
+        marker.setFrequency(result.frequency)
+        self.markerUpdated(marker)
+        self.label_search.setText(result.describe())
+        return True
+
+    def show_marker_bandwidth(self) -> bool:
+        """Report the -3 dB bandwidth and Q of the searched peak/notch."""
+        channel, points = self._search_channel()
+        if not points:
+            self.label_search.setText("No captured data to measure yet.")
+            return False
+        summary = band_width_summary(points, channel=channel)
+        self.label_search.setText(summary.describe())
+        return summary.ok
 
     def refresh_marker_comparison(self) -> None:
         """Report the trace comparison at the active marker (TRACE-02.4).
