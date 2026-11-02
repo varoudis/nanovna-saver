@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..Hardware.Capability import SweepCapability
 from .Sweep import Properties, Sweep
 
 #: Smallest step the sweep model can express: frequencies are whole hertz.
@@ -97,38 +98,37 @@ class ReplayRangePlan:
         return ""
 
 
+def replay_capability(file_start: int, file_stop: int) -> SweepCapability:
+    """The capability of a source whose samples span the file exactly.
+
+    Only the span is declared: a file carries no Nyquist grid and no point
+    pick list, so nothing else is invented.  Planners use this instead of
+    re-deriving what a file can serve.
+    """
+    return SweepCapability(
+        source_min_frequency=file_start,
+        source_max_frequency=file_stop,
+        cw=file_start == file_stop,
+    )
+
+
 def _fits(plan: ReplayRangePlan, file_start: int, file_stop: int) -> bool:
     """True when the real grid stays in span and repeats nothing per segment.
 
-    Adjacent segments may share their boundary frequency: that is how
-    ``Sweep`` rounds logarithmic segments, and the worker reads each segment
-    separately.  What must never happen is a segment collapsing to repeated
-    samples of one frequency, which would turn a positive-span file into
-    meaningless CW data, or a segment asking outside the file.
+    The check *is* the shared capability validation, so the default range
+    here and every other planner agree on which grids a file can serve:
+    adjacent segments may share their boundary frequency (that is how
+    ``Sweep`` rounds), but no segment may collapse to repeated samples of
+    one frequency, and no segment may ask outside the file.
     """
-    sweep = Sweep(
+    validation = replay_capability(file_start, file_stop).validate_grid(
         plan.start,
         plan.stop,
         plan.points,
         plan.segments,
-        Properties(logarithmic=plan.logarithmic),
+        logarithmic=plan.logarithmic,
     )
-    for index in range(plan.segments):
-        seg_start, seg_stop = sweep.get_index_range(index)
-        if seg_stop < seg_start:
-            return False
-        if seg_start < file_start or seg_stop > file_stop:
-            return False
-        if plan.points > 1:
-            frequencies = {
-                round(
-                    seg_start + (seg_stop - seg_start) * k / (plan.points - 1)
-                )
-                for k in range(plan.points)
-            }
-            if len(frequencies) != plan.points:
-                return False
-    return True
+    return validation.ok
 
 
 def _fit(

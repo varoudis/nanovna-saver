@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 
 from .Analysis.Results import AnalysisKind
+from .Hardware.Capability import SweepCapability
 
 PRESET_FORMAT = "nanovna-saver-preset"
 PRESET_VERSION = 1
@@ -269,15 +270,79 @@ class PresetApplication:
         return False
 
 
-def validate_sweep(
+def preset_capability(
+    *,
+    min_frequency: int = 1,
+    max_frequency: int | None = None,
+    valid_points: Iterable[int] = (),
+    max_segments: int = 1024,
+    capability: SweepCapability | None = None,
+) -> SweepCapability:
+    """The capability a preset is validated against.
+
+    A caller that already holds a device capability (or a source-restricted
+    one, such as a replay file) passes it in and the declared bounds are
+    left alone.  Otherwise one is built from exactly the limits the preset
+    window used to check by hand, so no device is contacted here.
+    """
+    if capability is not None:
+        return capability
+    return SweepCapability(
+        min_frequency=min_frequency,
+        max_frequency=max_frequency,
+        valid_points=tuple(sorted(int(count) for count in valid_points)),
+        min_points=2,
+        max_segments=max_segments,
+    )
+
+
+def _capability_problems(
+    sweep: SweepPreset, capability: SweepCapability
+) -> list[str]:
+    """Problems only the shared capability model can see.
+
+    Called after every hand-written check has passed, so a condition is
+    never reported twice with two different wordings: what remains here is
+    a span outside a loaded source, a grid mode the device cannot do, a
+    point/segment count outside the declared range, and the grid the device
+    really measures (which can collapse or overshoot even when the nominal
+    span is legal).
+    """
+    span = capability.preflight(sweep.start, sweep.end)
+    if span is not None:
+        return [span.message]
+    request = capability.request_problem(
+        sweep.points, sweep.segments, logarithmic=sweep.logarithmic
+    )
+    if request is not None:
+        return [request.message]
+    grid = capability.validate_grid(
+        sweep.start,
+        sweep.end,
+        sweep.points,
+        sweep.segments,
+        logarithmic=sweep.logarithmic,
+    )
+    if not grid.ok:
+        return [grid.problem.message]
+    return []
+
+
+def validate_sweep(  # noqa: PLR0913 - one keyword per declared limit
     sweep: SweepPreset,
     *,
     min_frequency: int = 1,
     max_frequency: int | None = None,
     valid_points: Iterable[int] = (),
     max_segments: int = 1024,
+    capability: SweepCapability | None = None,
 ) -> list[str]:
-    """Return human-readable problems, empty when the sweep is usable."""
+    """Return human-readable problems, empty when the sweep is usable.
+
+    ``capability`` is the authoritative description of what the current
+    source can measure; when omitted, one is derived from the arguments, so
+    old callers keep working unchanged.
+    """
     problems: list[str] = []
     if sweep.start < min_frequency:
         problems.append(
@@ -304,6 +369,19 @@ def validate_sweep(
         problems.append(f"segment count exceeds {max_segments}")
     if sweep.averages < 1:
         problems.append("average count must be at least 1")
+    if not problems:
+        problems.extend(
+            _capability_problems(
+                sweep,
+                preset_capability(
+                    min_frequency=min_frequency,
+                    max_frequency=max_frequency,
+                    valid_points=valid_points,
+                    max_segments=max_segments,
+                    capability=capability,
+                ),
+            )
+        )
     return problems
 
 
@@ -313,6 +391,7 @@ def apply_preset(
     min_frequency: int = 1,
     max_frequency: int | None = None,
     valid_points: Iterable[int] = (),
+    capability: SweepCapability | None = None,
 ) -> PresetApplication:
     """Validate ``preset`` and describe the resulting configuration.
 
@@ -324,6 +403,7 @@ def apply_preset(
         min_frequency=min_frequency,
         max_frequency=max_frequency,
         valid_points=valid_points,
+        capability=capability,
     )
     if problems:
         raise PresetValidationError(

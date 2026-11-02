@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .Formatting import format_frequency, format_gain, format_vswr
+from .Hardware.Capability import SweepCapability
 from .Measurement import (
     CompletionState,
     MeasurementSnapshot,
@@ -95,28 +96,39 @@ class DeviceLimits:
     def from_vna(cls, vna) -> "DeviceLimits":
         """Read the limits the device itself declares.
 
-        ``sweep_max_freq_hz`` is ``0.0`` on devices that do not report a
-        maximum, which must not be mistaken for "no frequencies allowed".
+        Delegates to :meth:`SweepCapability.from_vna`, so the tuning window
+        and the preset/sweep planners read the very same interpretation of
+        ``sweep_max_freq_hz`` (``0.0`` means "no ceiling advertised", never
+        "no frequencies allowed") and of ``valid_datapoints``.
         """
-        raw_max = float(getattr(vna, "sweep_max_freq_hz", 0.0) or 0.0)
-        max_frequency = int(raw_max) if raw_max > 0 else None
+        capability = SweepCapability.from_vna(vna)
         valid = tuple(
-            int(count)
-            for count in getattr(vna, "valid_datapoints", ()) or ()
-            if int(count) >= MIN_POINTS
+            count for count in capability.valid_points if count >= MIN_POINTS
         )
-        try:
-            default_points = int(getattr(vna, "datapoints", 101))
-        except (TypeError, ValueError):
-            default_points = 101
+        default_points = capability.default_points
         if not valid:
             valid = (default_points,)
         return cls(
-            min_frequency=1,
-            max_frequency=max_frequency,
+            min_frequency=capability.min_frequency,
+            max_frequency=capability.max_frequency,
             points=valid,
             default_points=default_points,
             max_segments=MAX_SEGMENTS,
+        )
+
+    def capability(self) -> SweepCapability:
+        """These limits in the shared sweep-capability form.
+
+        Derived from the fields themselves, so limits built by hand (as the
+        tests do) and limits read from a device validate identically.
+        """
+        return SweepCapability(
+            min_frequency=self.min_frequency,
+            max_frequency=self.max_frequency,
+            valid_points=tuple(self.points),
+            default_points=self.default_points,
+            min_points=MIN_POINTS,
+            max_segments=self.max_segments,
         )
 
     def describe(self) -> str:
@@ -272,6 +284,13 @@ def _checked_grid(  # noqa: PLR0913 - keyword-only, internal
             f" {len(set(grid))} distinct frequency(ies); the span is too"
             " narrow for that configuration"
         )
+    # Cross-check the accepted grid against the shared capability model, so
+    # the tuning planner and every other planner agree on what is legal.
+    validation = limits.capability().validate_grid(
+        start, end, points, segments, logarithmic=logarithmic
+    )
+    if not validation.ok:
+        raise SweepPlanError(validation.problem.message)
     return grid
 
 

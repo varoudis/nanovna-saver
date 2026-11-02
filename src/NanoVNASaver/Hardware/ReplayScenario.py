@@ -57,6 +57,7 @@ from pathlib import Path
 
 from ..RFTools import Datapoint
 from ..Touchstone import PARAMETERS, Touchstone
+from .Capability import SourceSpan, SweepCapability
 from .SimulatedScenarios import REFERENCE_IMPEDANCE, ScenarioResult
 
 logger = logging.getLogger(__name__)
@@ -444,3 +445,46 @@ class ReplayScenario:
 
     def provenance_text(self) -> str:
         return self.data.provenance_text()
+
+    def sweep_span(self) -> SourceSpan:
+        """The file's own span, as a capability source.
+
+        The text is reused verbatim in rejection messages, so a planner
+        names the range the user has to stay inside.
+        """
+        return SourceSpan(
+            self.data.start,
+            self.data.stop,
+            name=self.data.name,
+            label="the replay range",
+        )
+
+    def capability(self, vna=None) -> SweepCapability:
+        """The sweep capability of replaying this file.
+
+        The span is the file's own range (never extrapolated), channels are
+        the ones the file really holds, and the file's reference impedance
+        is the one every sample is stated in.  When ``vna`` is given, its
+        declared limits bound the result as well, so a planned range is
+        never wider than the device that will request it.
+        """
+        span = self.sweep_span()
+        if vna is None:
+            return SweepCapability.from_vna(
+                ReplayDeviceLimits(self.data), source=span
+            )
+        return SweepCapability.from_vna(vna, source=span)
+
+
+class ReplayDeviceLimits:
+    """Declared limits of a replay source, in the shape ``from_vna`` reads.
+
+    A file holds no Nyquist grid, so there is no maximum point count to
+    declare; only the span, the channels and the impedance are known.
+    """
+
+    def __init__(self, data: ReplayData) -> None:
+        self.supported_channels = (
+            (CHANNEL_S11, CHANNEL_S21) if data.has_s21 else (CHANNEL_S11,)
+        )
+        self.reference_impedance = data.reference_impedance

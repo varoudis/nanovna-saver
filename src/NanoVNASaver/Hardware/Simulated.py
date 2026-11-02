@@ -43,6 +43,7 @@ from time import sleep
 from typing import Sequence
 
 from ..utils import Version
+from .Capability import SourceSpan, SweepCapability
 from .ReplayScenario import ReplayChannelError
 from .SimulatedScenarios import (
     DEFAULT_SCENARIOS,
@@ -159,11 +160,21 @@ class SimulatedTransport:
         return f"<simulated {self.comment}>"
 
 
+def _scenario_source_span(scenario: Scenario) -> SourceSpan | None:
+    """The file span a replay scenario can serve, if it has one."""
+    span = getattr(scenario, "sweep_span", None)
+    return span() if callable(span) else None
+
+
 class SimulatedDevice:
     """Command-level simulation of an ASCII-protocol NanoVNA."""
 
     name = "Simulated VNA"
     SANE_VERSION = "sim-1.0.0"
+
+    valid_datapoints: tuple[int, ...] = (101, 51, 11, 201, 401)
+    sweep_points_min = 11
+    sweep_points_max = 1024
 
     def __init__(  # noqa: PLR0913
         self,
@@ -386,6 +397,18 @@ class SimulatedDevice:
         finally:
             self.start, self.stop, self.points = previous
 
+    def capability(self) -> SweepCapability:
+        """What this simulated device can honestly sweep.
+
+        The bounds are read from the device on every call (the sweep
+        ceiling is mutable, so caching it would go stale), and a replay
+        scenario adds its file's own span so a plan can never reach past
+        the samples that exist.
+        """
+        return SweepCapability.from_vna(
+            self, source=_scenario_source_span(self.scenario)
+        )
+
 
 class SimulatedVNA:
     """Drop-in replacement for ``VNA`` that wraps ``SimulatedDevice``.
@@ -514,6 +537,9 @@ class SimulatedVNA:
 
     def preflight(self, start: int, stop: int) -> str | None:
         return self.device.preflight(start, stop)
+
+    def capability(self) -> SweepCapability:
+        return self.device.capability()
 
 
 def make_simulated_vna(  # noqa: PLR0913

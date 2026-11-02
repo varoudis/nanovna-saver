@@ -23,6 +23,7 @@ from typing import Iterator
 from PySide6 import QtGui
 
 from ..utils import Version
+from .Capability import SweepCapability
 from .Serial import Interface, drain_serial
 
 logger = logging.getLogger(__name__)
@@ -223,3 +224,13 @@ class VNA:
 
     def getSerialNumber(self) -> str:
         return " ".join(list(self.exec_command("sn")))
+
+    def capability(self) -> SweepCapability:
+        """What this device declares it can sweep.
+
+        Read from the class/instance members the drivers already expose
+        (``sweep_max_freq_hz``, ``valid_datapoints``, ``sweep_points_min``/
+        ``_max``), so a device that declares no ceiling reports an unknown
+        ceiling instead of an invented one.
+        """
+        return SweepCapability.from_vna(self)

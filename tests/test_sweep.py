@@ -19,6 +19,7 @@
 import unittest
 
 # Import targets to be tested
+from NanoVNASaver.Hardware.Capability import SweepCapability
 from NanoVNASaver.Settings.Sweep import Properties, Sweep, SweepMode
 
 
@@ -57,3 +58,28 @@ class TestCases(unittest.TestCase):
         self.assertEqual(sweep.points, 14)
         sweep.set_name("bla")
         self.assertEqual(sweep.properties.name, "bla")
+
+    def test_capability_accepts_the_sweeps_sweep_actually_requests(self):
+        """NEXT-01: the grid ``Sweep`` really produces is the one validated."""
+        capability = SweepCapability(max_frequency=30_000_000)
+        for logarithmic in (False, True):
+            sweep = Sweep(
+                segments=3, properties=Properties(logarithmic=logarithmic)
+            )
+            validation = capability.validate_grid(
+                sweep.start,
+                sweep.end,
+                sweep.points,
+                sweep.segments,
+                logarithmic=logarithmic,
+            )
+            self.assertTrue(
+                validation.ok,
+                None
+                if validation.problem is None
+                else validation.problem.message,
+            )
+            self.assertEqual(
+                list(validation.frequencies),
+                list(sweep.get_frequencies()),
+            )

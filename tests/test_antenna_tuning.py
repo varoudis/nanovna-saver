@@ -660,3 +660,50 @@ class TestExport:
         snapshot = _snapshot()
         assert snapshot.timestamp.tzinfo is not None
         assert snapshot.timestamp.tzinfo == timezone.utc
+
+
+class TestDeviceCapability:
+    """NEXT-01: tuning limits are read from the shared capability model."""
+
+    @staticmethod
+    def test_limits_come_from_a_simulated_device():
+        from NanoVNASaver.Hardware.Simulated import make_simulated_vna
+
+        vna = make_simulated_vna("antenna")
+        limits = DeviceLimits.from_vna(vna)
+        assert limits.min_frequency == 1
+        assert limits.max_frequency == 6_300_000_000
+        assert 101 in limits.points
+        assert limits.default_points == 101
+        assert limits.max_segments == 1024
+        assert "counterfeit" not in limits.describe()
+
+    @staticmethod
+    def test_hand_built_limits_and_a_capability_agree():
+        capability = LIMITS.capability()
+        plan = plan_sweep(7_000_000, 30_000_000, limits=LIMITS, points=401)
+        validation = capability.validate_grid(
+            plan.start, plan.end, plan.points, plan.segments
+        )
+        assert validation.ok
+        # The capability refuses exactly what the planner refuses: a grid
+        # that rounds one step past the device maximum.
+        tight = DeviceLimits(
+            min_frequency=1,
+            max_frequency=200,
+            points=(101,),
+            default_points=101,
+        )
+        assert not tight.capability().validate_grid(1, 200, 101).ok
+        with pytest.raises(SweepPlanError):
+            plan_sweep(1, 200, limits=tight, points=101)
+
+    @staticmethod
+    def test_device_ceiling_change_is_reflected_immediately():
+        from NanoVNASaver.Hardware.Simulated import make_simulated_vna
+
+        vna = make_simulated_vna("antenna")
+        vna.sweep_max_freq_hz = 14_152_000
+        assert DeviceLimits.from_vna(vna).max_frequency == 14_152_000
+        vna.sweep_max_freq_hz = 0.0
+        assert DeviceLimits.from_vna(vna).max_frequency is None
