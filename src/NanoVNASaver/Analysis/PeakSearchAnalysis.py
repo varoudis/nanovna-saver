@@ -17,6 +17,7 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
+import math
 
 import numpy as np
 from PySide6 import QtWidgets
@@ -24,6 +25,7 @@ from PySide6 import QtWidgets
 # pylint: disable=import-error, no-name-in-module
 from scipy.signal import find_peaks, peak_prominences
 
+from .. import AnalyticTools as At
 from ..Formatting import format_frequency_short
 from .Base import QHLine
 from .SimplePeakSearchAnalysis import (
@@ -56,21 +58,32 @@ class PeakSearchAnalysis(SimplePeakSearchAnalysis):
 
         s11 = self.app.data.s11
         data, fmt_fnc = self.data_and_format()
+        # One NaN makes every prominence in the array NaN, so the search
+        # would drop real peaks next to an undefined sample.  Bridge the gaps
+        # for the search and discard peaks that land on one; an infinite VSWR
+        # is a real measurement and is left as it is.
+        values = At.bridged(data)
 
         inverted = False
         if self.button["peak_l"].isChecked():
             inverted = True
-            peaks, _ = find_peaks(
-                -np.array(data), width=3, distance=3, prominence=1
-            )
+            peaks, _ = find_peaks(-values, width=3, distance=3, prominence=1)
         else:
             self.button["peak_h"].setChecked(True)
-            peaks, _ = find_peaks(data, width=3, distance=3, prominence=1)
+            peaks, _ = find_peaks(values, width=3, distance=3, prominence=1)
+        peaks = np.array(
+            [
+                peak
+                for peak in peaks
+                if not math.isnan(float(np.asarray(data, float)[peak]))
+            ],
+            dtype=int,
+        )
 
         # Having found the peaks, get the prominence data
         for i, p in np.ndenumerate(peaks):
             logger.debug("Peak %s at %s", i, p)
-        prominences = peak_prominences(data, peaks)[0]
+        prominences = peak_prominences(values, peaks)[0]
         logger.debug("%d prominences", len(prominences))
 
         # Find the peaks with the most extreme values

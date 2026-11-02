@@ -123,59 +123,48 @@ class EFHWAnalysis(ResonanceAnalysis):
         # 'odict_keys' object is not subscriptable
         new_idx = sorted(new.keys())
         diff = {}
-        i_max = min(len(old_idx), len(new_idx))
-        i_tot = max(len(old_idx), len(new_idx))
 
-        if i_max != i_tot:
+        if len(old_idx) != len(new_idx):
             logger.warning(
                 "resonances changed from %s to %s", len(old_idx), len(new_idx)
             )
 
-        split = 0
+        # Walk both sweeps in frequency order.  ``pos`` is the next unused
+        # old resonance: a new band is paired with it when the two are close
+        # enough, otherwise the cursor stays (a band was added to the new
+        # sweep) or moves on (a band disappeared from it).  Skipping is a
+        # loop, not a single step, so any number of bands may come or go;
+        # it is the offset between the two sweeps, not a lookup index.
+        pos = 0
         max_delta_f = 1_000_000
         for i, k in enumerate(new_idx):
-            if len(old_idx) <= i + split:
-                diff[i] = no_compare()
-                continue
+            new_freq = new[k]["freq"]
+            logger.info("Resonance %s at %s", i, new_freq)
 
-            logger.info("Resonance %s at %s", i, new[k]["freq"])
+            while (
+                pos < len(old_idx)
+                and new_freq - old[old_idx[pos]]["freq"] >= max_delta_f
+            ):
+                logger.debug(
+                    "new is missing band %s",
+                    format_frequency(old[old_idx[pos]]["freq"]),
+                )
+                pos += 1
 
-            delta_f = new[k]["freq"] - old[old_idx[i + split]]["freq"]
-            if abs(delta_f) < max_delta_f:
+            if (
+                pos < len(old_idx)
+                and abs(new_freq - old[old_idx[pos]]["freq"]) < max_delta_f
+            ):
                 logger.debug("can compare")
                 diff[i] = {
-                    desc: fnc(new[k][desc] - old[old_idx[i + split]][desc])
+                    desc: fnc(new[k][desc] - old[old_idx[pos]][desc])
                     for desc, fnc in fields
                 }
                 logger.debug("Deltas %s", diff[i])
-                continue
-
-            logger.debug(
-                "can't compare, %s is too much ", format_frequency(delta_f)
-            )
-
-            if delta_f > 0:
-                logger.debug("possible missing band, ")
-                if len(old_idx) > (i + split + 1):
-                    if (
-                        abs(
-                            new[k]["freq"] - old[old_idx[i + split + 1]]["freq"]
-                        )
-                        < max_delta_f
-                    ):
-                        logger.debug("new is missing band, compare next ")
-                        split += 1
-                        # FIXME: manage 2 or more band missing ?!?
-                        continue
-                    logger.debug("new band, non compare ")
-                    diff[i] = no_compare()
+                pos += 1
                 continue
 
             logger.debug("new band, non compare ")
             diff[i] = no_compare()
-            split -= 1
 
-        for i in range(i_max, i_tot):
-            # add missing in old ... if any
-            diff[i] = no_compare()
         return diff

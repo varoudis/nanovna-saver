@@ -31,6 +31,7 @@ from ..Formatting import (
     format_inductance,
     format_magnitude,
     format_phase,
+    format_polar,
     format_q_factor,
     format_resistance,
     format_vswr,
@@ -117,8 +118,7 @@ class DeltaMarker(Marker):
         )
         self.label["s11phase"].setText(format_phase(s11_b.phase - s11_a.phase))
         self.label["s11polar"].setText(
-            f"{round(abs(s11_b.z) - abs(s11_a.z), 2)}∠"
-            f"{format_phase(s11_b.phase - s11_a.phase)}"
+            format_polar(abs(s11_b.z) - abs(s11_a.z), s11_b.phase - s11_a.phase)
         )
         self.label["s11q"].setText(
             format_q_factor(
@@ -153,6 +153,7 @@ class DeltaMarker(Marker):
                 format_phase(s21_b.phase - s21_a.phase)
             )
             self.label["s21polar"].setText(
-                f"{round(abs(s21_b.z) - abs(s21_a.z), 2)}∠"
-                f"{format_phase(s21_b.phase - s21_a.phase)}"
+                format_polar(
+                    abs(s21_b.z) - abs(s21_a.z), s21_b.phase - s21_a.phase
+                )
             )

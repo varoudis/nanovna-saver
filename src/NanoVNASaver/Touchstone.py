@@ -42,6 +42,39 @@ def _is_finite(value) -> bool:
     return math.isfinite(value)
 
 
+def _require_non_descending(parameter: str, samples: list[Datapoint]) -> None:
+    """Reject a channel whose frequencies go backwards or cannot be ordered.
+
+    Touchstone stores one frequency per data line and expects them not to
+    decrease.  A descending pair would be written as-is, which a conforming
+    reader may reject or silently reorder, and a NaN cannot be ordered at
+    all; both are refused.  An *equal* neighbour is accepted: a segmented
+    logarithmic sweep is built with each segment ending on the next one's
+    start frequency (``Sweep.get_index_range``), so refusing repeats would
+    make every such sweep unexportable.  The repeat is still written to the
+    file -- see the open defect recorded in the development plan.
+    """
+    for index, sample in enumerate(samples):
+        current = sample.freq
+        if math.isnan(current):
+            after = "" if index == 0 else f", after index {index - 1}"
+            raise NonAscendingFrequencyError(
+                f"Channel {parameter} frequency at index {index} is not a"
+                f" number{after}: Touchstone data must be in ascending (or"
+                " equal) frequency order"
+            )
+        if index == 0:
+            continue
+        previous = samples[index - 1].freq
+        if current < previous:
+            raise NonAscendingFrequencyError(
+                f"Channel {parameter} frequency {current} Hz at index"
+                f" {index} is below {previous} Hz at index {index - 1}:"
+                " Touchstone data must be in ascending (or equal)"
+                " frequency order, never descending"
+            )
+
+
 #: Canonical Touchstone column order for two-port data.
 PARAMETERS: tuple[str, ...] = ("S11", "S21", "S12", "S22")
 
@@ -102,6 +135,22 @@ class FrequencyMismatchError(TouchstoneExportError, LookupError):
 
 class NonFiniteValueError(TouchstoneExportError, ValueError):
     """A sample that would be written is NaN or infinite."""
+
+
+class NonAscendingFrequencyError(TouchstoneExportError, ValueError):
+    """A channel's frequencies decrease, or one of them is not a number.
+
+    Touchstone expects the data lines in non-descending frequency order, so
+    a descending pair cannot be written without producing a file that a
+    conforming reader may reject or silently reorder, and a NaN cannot be
+    ordered at all.  A *repeated* frequency is accepted: a segmented
+    logarithmic sweep deliberately ends each segment on the next one's
+    start, so refusing repeats would make those sweeps unexportable.
+
+    The name is kept for the callers and tests that already use it; the
+    condition it reports is now "not non-descending" rather than "not
+    strictly ascending".
+    """
 
 
 class InvalidReferenceImpedanceError(TypeError, ValueError):
@@ -508,6 +557,9 @@ class Touchstone:
             )
 
         reference = self.channel("S11")
+        # Every written column shares the S11 grid (enforced below) and the
+        # placeholders are built from it, so one check covers the file.
+        _require_non_descending("S11", reference)
         channels: dict[str, list[Datapoint]] = {}
         for parameter in PARAMETERS_BY_COUNT[parameter_count]:
             samples = self.channel(parameter)
@@ -660,6 +712,8 @@ class Touchstone:
             ChannelLengthMismatchError: two channels differ in length.
             FrequencyMismatchError: two channels use different frequency
                 grids; also a ``LookupError``.
+            NonAscendingFrequencyError: a channel's frequencies decrease,
+                or one of them is NaN.  A repeated frequency is accepted.
             NonFiniteValueError: a written sample is NaN or infinite.
             TouchstoneExportError: common base class of all of the above.
         """

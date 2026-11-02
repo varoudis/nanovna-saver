@@ -17,6 +17,7 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
+import math
 
 from .. import AnalyticTools as At
 from .BandPassAnalysis import BandPassAnalysis
@@ -31,7 +32,17 @@ class BandStopAnalysis(BandPassAnalysis):
         self.set_titel("Band stop filter analysis")
 
     def find_center(self, gains: list[float]) -> int:
-        return max(enumerate(gains), key=lambda i: i[1])[0]
+        # The highest *measured* gain.  ``max`` over the raw list returns the
+        # first NaN it meets, which would make the stopband centre undefined.
+        measured = [
+            (index, gain)
+            for index, gain in enumerate(gains)
+            if not math.isnan(gain)
+        ]
+        if not measured:
+            self.set_result("No measured S21 magnitudes")
+            return -1
+        return max(measured, key=lambda item: item[1])[0]
 
     def find_bounderies(
         self, gains: list[float], _: int, peak_db: float

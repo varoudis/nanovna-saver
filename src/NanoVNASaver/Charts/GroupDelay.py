@@ -19,14 +19,26 @@
 import logging
 import math
 
-import numpy as np
 from PySide6 import QtGui
 
 from ..RFTools import Datapoint
 from .Chart import Chart
 from .Frequency import FrequencyChart
+from .phase_unwrap import unwrap_degrees
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_delay_range(delays) -> tuple[float, float]:
+    """Whole-second delay range from the finite entries of ``delays``.
+
+    Skipping the undefined entries matters: ``floor(NaN)`` raises, and an
+    infinite delay would stretch the axis past every real value.
+    """
+    finite = [delay for delay in delays if math.isfinite(delay)]
+    if not finite:
+        return (0.0, 0.0)
+    return (math.floor(min(finite)), math.ceil(max(finite)))
 
 
 class GroupDelayChart(FrequencyChart):
@@ -78,10 +90,15 @@ class GroupDelayChart(FrequencyChart):
         data_len = len(data)
         if data_len <= 1:
             return []
-        unwrapped = np.degrees(np.unwrap([d.phase for d in data]))
+        unwrapped = unwrap_degrees(d.phase for d in data)
         delay_data = []
         for i, d in enumerate(data):
             # TODO: Replace with call to RFTools.groupDelay
+            if not math.isfinite(d.phase):
+                # A sample without a phase has no delay of its own, even
+                # though its neighbours could produce a number for it.
+                delay_data.append(math.nan)
+                continue
             if i == 0:
                 phase_change = unwrapped[1] - unwrapped[i]
                 freq_change = data[1].freq - d.freq
@@ -108,12 +125,14 @@ class GroupDelayChart(FrequencyChart):
         min_delay = self.minDisplayValue
         max_delay = self.maxDisplayValue
         if not self.fixedValues:
-            if self.data:
-                min_delay = math.floor(np.min(self.groupDelay))
-                max_delay = math.ceil(np.max(self.groupDelay))
-            elif self.reference:
-                min_delay = math.floor(np.min(self.groupDelayReference))
-                max_delay = math.ceil(np.max(self.groupDelayReference))
+            # A delay derived from an undefined sample is not a delay: it is
+            # skipped here and drawn as a gap, exactly like the base chart.
+            if self.data and self.groupDelay:
+                min_delay, max_delay = _finite_delay_range(self.groupDelay)
+            elif self.reference and self.groupDelayReference:
+                min_delay, max_delay = _finite_delay_range(
+                    self.groupDelayReference
+                )
 
         span = float(max_delay - min_delay)
         self.minDelay = min_delay
@@ -198,7 +217,7 @@ class GroupDelayChart(FrequencyChart):
                     qp.drawLine(prevx, prevy, new_x, new_y)
                 qp.setPen(pen)
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
         # TODO: Find a faster way than these expensive "d in data" lookups
         try:
             delay = self.groupDelay[self.data.index(d)]
@@ -209,7 +228,9 @@ class GroupDelayChart(FrequencyChart):
                 delay = 0
         return self.getYPositionFromDelay(delay)
 
-    def getYPositionFromDelay(self, delay: Datapoint) -> int:
+    def getYPositionFromDelay(self, delay: float) -> int | None:
+        if not math.isfinite(delay):
+            return None
         return self.topMargin + int(
             (self.maxDelay - delay) / self.span * self.dim.height
         )

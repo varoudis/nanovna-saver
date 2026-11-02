@@ -342,6 +342,105 @@ class TestOutputs:
         leftovers = [p for p in os.listdir(tmp_path) if p.endswith(".part")]
         assert leftovers == []
 
+    @staticmethod
+    def _descending_frequency_file(tmp_path):
+        """A capture whose frequencies go backwards: never exportable."""
+        path = tmp_path / "descending.s1p"
+        path.write_text(
+            "# HZ S RI R 50\n"
+            "3000000 0.1 0.0\n"
+            "2000000 0.2 0.0\n"
+            "1000000 0.3 0.0\n",
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _repeated_frequency_file(tmp_path):
+        """What a two-segment logarithmic sweep writes at its boundary."""
+        path = tmp_path / "repeated.s1p"
+        path.write_text(
+            "# HZ S RI R 50\n"
+            "1000000 0.1 0.0\n"
+            "2000000 0.2 0.0\n"
+            "2000000 0.3 0.0\n"
+            "3000000 0.4 0.0\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_a_repeated_frequency_capture_is_written(self, tmp_path):
+        """A segmented log sweep repeats its boundary; that must export.
+
+        ``Sweep.get_index_range`` ends each segment on the next one's
+        start, so refusing repeats made every log-mode multi-segment sweep
+        unexportable.  The repeat is written through unchanged.
+        """
+        out = tmp_path / "export.s1p"
+        result = run(
+            "--input",
+            str(self._repeated_frequency_file(tmp_path)),
+            "--touchstone",
+            str(out),
+        )
+        assert result.returncode == EXIT_OK, result.stderr
+        frequencies = [
+            line.split()[0]
+            for line in out.read_text(encoding="utf-8").splitlines()
+            if line and line[0].isdigit()
+        ]
+        assert frequencies == ["1000000", "2000000", "2000000", "3000000"]
+
+    def test_a_repeated_frequency_capture_replaces_the_output(self, tmp_path):
+        out = tmp_path / "existing.s1p"
+        out.write_text("existing", encoding="utf-8")
+        result = run(
+            "--input",
+            str(self._repeated_frequency_file(tmp_path)),
+            "--touchstone",
+            str(out),
+            "--overwrite",
+        )
+        assert result.returncode == EXIT_OK, result.stderr
+        assert out.read_text(encoding="utf-8").startswith("!")
+
+    def test_a_repeated_frequency_capture_writes_the_json(self, tmp_path):
+        out = tmp_path / "export.s1p"
+        payload = tmp_path / "export.json"
+        result = run(
+            "--input",
+            str(self._repeated_frequency_file(tmp_path)),
+            "--touchstone",
+            str(out),
+            "--json",
+            str(payload),
+        )
+        assert result.returncode == EXIT_OK, result.stderr
+        assert out.exists()
+        assert payload.exists()
+
+    def test_a_descending_capture_is_sorted_by_the_loader(self, tmp_path):
+        """The CLI never sees a descending grid: loading reorders it.
+
+        ``Touchstone.loads`` sorts a file whose lines decrease, so the
+        export check that refuses a descending *in-memory* channel is not
+        reachable from ``--input``.  The written file is ascending.
+        """
+        out = tmp_path / "sorted.s1p"
+        result = run(
+            "--input",
+            str(self._descending_frequency_file(tmp_path)),
+            "--touchstone",
+            str(out),
+        )
+        assert result.returncode == EXIT_OK, result.stderr
+        frequencies = [
+            line.split()[0]
+            for line in out.read_text(encoding="utf-8").splitlines()
+            if line and line[0].isdigit()
+        ]
+        assert frequencies == ["1000000", "2000000", "3000000"]
+
 
 class TestChannels:
     @staticmethod

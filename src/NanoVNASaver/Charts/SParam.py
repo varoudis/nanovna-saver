@@ -17,6 +17,7 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
+import math
 
 from PySide6 import QtGui
 
@@ -123,19 +124,22 @@ class SParameterChart(FrequencyChart):
         self.drawMarkers(qp, y_function=self.getReYPosition)
         self.drawMarkers(qp, y_function=self.getImYPosition)
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
+        return self.getReYPosition(d)
+
+    def getReYPosition(self, d: Datapoint) -> int | None:
+        # A non-finite real part has no position on the axis: it is a gap in
+        # the trace, never a point at the top or bottom edge.
+        if not math.isfinite(d.re):
+            return None
         return int(
             self.topMargin
             + (self.maxValue - d.re) / self.span * self.dim.height
         )
 
-    def getReYPosition(self, d: Datapoint) -> int:
-        return int(
-            self.topMargin
-            + (self.maxValue - d.re) / self.span * self.dim.height
-        )
-
-    def getImYPosition(self, d: Datapoint) -> int:
+    def getImYPosition(self, d: Datapoint) -> int | None:
+        if not math.isfinite(d.im):
+            return None
         return int(
             self.topMargin
             + (self.maxValue - d.im) / self.span * self.dim.height

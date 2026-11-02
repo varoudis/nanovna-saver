@@ -140,8 +140,11 @@ class RealImaginaryChart(FrequencyChart):
                 y_re = self.getReYPosition(self.data[m.location])
                 y_im = self.getImYPosition(self.data[m.location])
 
-                self.drawMarker(x, y_re, qp, m.color, self.markers.index(m) + 1)
-                self.drawMarker(x, y_im, qp, m.color, self.markers.index(m) + 1)
+                number = self.markers.index(m) + 1
+                if y_re is not None:
+                    self.drawMarker(x, y_re, qp, m.color, number)
+                if y_im is not None:
+                    self.drawMarker(x, y_im, qp, m.color, number)
 
     def _draw_ri_labels(self, qp: QtGui.QPainter, is_reference=False) -> None:
         c1, c2 = (
@@ -284,7 +287,10 @@ class RealImaginaryChart(FrequencyChart):
         for d in self.data:
             imp = self.value(d)
             re, im = imp.real, imp.imag
-            if math.isinf(re):  # Avoid infinite scales
+            # Avoid infinite scales. The imaginary part needs the same
+            # check: an undefined reactive value would drag both bounds to
+            # infinity and leave the finite samples as a flat line.
+            if not (math.isfinite(re) and math.isfinite(im)):
                 continue
             max_real = max(max_real, re)
             min_real = min(min_real, re)
@@ -296,7 +302,10 @@ class RealImaginaryChart(FrequencyChart):
                 continue
             imp = self.value(d)
             re, im = imp.real, imp.imag
-            if math.isinf(re):  # Avoid infinite scales
+            # Avoid infinite scales. The imaginary part needs the same
+            # check: an undefined reactive value would drag both bounds to
+            # infinity and leave the finite samples as a flat line.
+            if not (math.isfinite(re) and math.isfinite(im)):
                 continue
             max_real = max(max_real, re)
             min_real = min(min_real, re)
@@ -341,20 +350,23 @@ class RealImaginaryChart(FrequencyChart):
                 max_imag = num_max * (min_imag / num_min) * -1
         return min_imag, max_imag
 
-    def getImYPosition(self, d: Datapoint) -> int:
+    def getImYPosition(self, d: Datapoint) -> int | None:
         im = self.value(d).imag
+        if not math.isfinite(im):
+            # Undefined value: a gap, never the top edge.
+            return None
         return int(
             self.topMargin
             + (self.max_imag - im) / self.span_imag * self.dim.height
         )
 
-    def getReYPosition(self, d: Datapoint) -> int:
+    def getReYPosition(self, d: Datapoint) -> int | None:
         re = self.value(d).real
+        if not math.isfinite(re):
+            return None
         return int(
             self.topMargin
             + (self.max_real - re) / self.span_real * self.dim.height
-            if math.isfinite(re)
-            else self.topMargin
         )
 
     def valueAtPosition(self, y) -> list[float]:
@@ -393,8 +405,15 @@ class RealImaginaryChart(FrequencyChart):
             mx, _ = self.getPosition(self.data[m.location])
             myr = self.getReYPosition(self.data[m.location])
             myi = self.getImYPosition(self.data[m.location])
+            if mx is None or (myr is None and myi is None):
+                # Nothing to measure a distance to.
+                continue
             dx = abs(x - mx)
-            dy = min(abs(y - myr), abs(y - myi))
+            dy = min(
+                abs(y - candidate)
+                for candidate in (myr, myi)
+                if candidate is not None
+            )
             distance = math.sqrt(dx**2 + dy**2)
             if distance < shortest:
                 shortest = distance

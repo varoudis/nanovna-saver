@@ -52,6 +52,7 @@ from .Hardware.ScanCapability import ScanPreferences
 from .Measurement import (
     S11,
     S21,
+    UNKNOWN_DEVICE,
     CompletionState,
     MeasurementSnapshot,
     snapshot_from_datapoints,
@@ -476,12 +477,27 @@ class DeviceSession:
                 Datapoint(freq, value.real / count, value.imag / count)
                 for freq, value in zip(frequencies, values, strict=True)
             ]
+        # Derived the way the interactive worker derives it
+        # (``SweepWorker.update_data``): the scenario and its note only
+        # exist for simulated data, so an automated sweep can never carry a
+        # scenario, or a note about one, that did not produce its samples.
+        simulated = bool(self.simulated)
+        scenario = ""
+        provenance_note = ""
+        if simulated:
+            scenario = str(getattr(self.device, "scenario_key", "") or "")
+            provenance_note = str(
+                getattr(self.device, "provenance_note", "") or ""
+            )
         snapshot = snapshot_from_datapoints(
             corrected.get(S11),
             corrected.get(S21),
             name=request.name or "automated sweep",
             source="automation",
-            simulated=self.simulated,
+            simulated=simulated,
+            device=str(getattr(self.device, "name", "") or UNKNOWN_DEVICE),
+            simulator_scenario=scenario,
+            notes=provenance_note,
             reference_impedance=self.reference_impedance,
             completion=CompletionState.COMPLETE,
         )

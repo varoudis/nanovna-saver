@@ -88,7 +88,7 @@ class LogMagChart(FrequencyChart):
             max_val = -100.0
             for d in self.data:
                 logmag = self.logMag(d)
-                if math.isinf(logmag):
+                if not math.isfinite(logmag):
                     continue
                 max_val = max(max_val, logmag)
                 min_val = min(min_val, logmag)
@@ -98,7 +98,7 @@ class LogMagChart(FrequencyChart):
                 if d.freq < self.fstart or d.freq > self.fstop:
                     continue
                 logmag = self.logMag(d)
-                if math.isinf(logmag):
+                if not math.isfinite(logmag):
                     continue
                 max_val = max(max_val, logmag)
                 min_val = min(min_val, logmag)
@@ -156,10 +156,11 @@ class LogMagChart(FrequencyChart):
             qp.drawLine(self.leftMargin, y, self.leftMargin + self.dim.width, y)
             qp.drawText(self.leftMargin + 3, y - 1, f"VSWR: {vswr}")
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
         logMag = self.logMag(d)
-        if math.isinf(logMag):
-            return self.topMargin
+        if not math.isfinite(logMag):
+            # Undefined gain has no magnitude: a gap, not the top edge.
+            return None
         return self.topMargin + int(
             (self.maxValue - logMag) / self.span * self.dim.height
         )

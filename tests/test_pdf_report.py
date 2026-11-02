@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 
+import numpy
 import pytest
 
 from NanoVNASaver.Limits import (
@@ -68,19 +69,85 @@ def _pages(path):
 
 
 def _bbox_words(path):
-    """Words with their A4 point coordinates, per page."""
+    """Words with their A4 point coordinates, per page.
+
+    ``pdftotext -bbox`` writes the attributes as ``xMin, yMin, xMax,
+    yMax``, so ``xMax`` is followed by ``yMax`` before the tag closes.
+    """
     pages = []
     for chunk in _pdf_text(path, "-bbox").split("<page")[1:]:
         pages.append(
             [
                 (float(xmin), float(xmax), text)
                 for xmin, xmax, text in re.findall(
-                    r'xMin="([\d.]+)".*?xMax="([\d.]+)">([^<]*)</word>',
+                    r'xMin="([\d.]+)".*?xMax="([\d.]+)"[^>]*>([^<]*)</word>',
                     chunk,
                 )
             ]
         )
     return pages
+
+
+PDFTOPPM = shutil.which("pdftoppm") or "/opt/homebrew/bin/pdftoppm"
+needs_pdftoppm = pytest.mark.skipif(
+    not shutil.os.path.exists(PDFTOPPM),
+    reason=f"pdftoppm is not installed at {PDFTOPPM}",
+)
+
+
+def _page_pixels(path, dpi=150, page=1):
+    """Page ``page`` of ``path`` rasterised to an ``(h, w, 4)`` RGB32 array.
+
+    ``QImage`` is already the renderer's own type, so this needs no image
+    library beyond PySide6; the array is ``.height()`` rows of BGRA bytes in
+    native order, which is what ``Format_RGB32`` stores on every platform
+    this project builds for.
+    """
+    from PySide6 import QtGui
+
+    prefix = path.with_suffix(f".page{page}")
+    for stale in path.parent.glob(f"{prefix.name}*.png"):
+        stale.unlink()
+    subprocess.run(
+        [
+            PDFTOPPM,
+            "-r",
+            str(dpi),
+            "-png",
+            "-f",
+            str(page),
+            "-l",
+            str(page),
+            str(path),
+            str(prefix),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    produced = sorted(path.parent.glob(f"{prefix.name}*.png"))
+    assert produced, f"pdftoppm produced no raster of page {page}"
+    image = QtGui.QImage(str(produced[0]))
+    assert not image.isNull(), f"could not read raster of page {page}"
+    image = image.convertToFormat(QtGui.QImage.Format.Format_RGB32)
+    pixels = numpy.frombuffer(
+        image.constBits(), dtype=numpy.uint8, count=image.sizeInBytes()
+    )
+    return pixels.reshape(image.height(), image.bytesPerLine() // 4, 4)
+
+
+def _colour_pixels(pixels, colour, tolerance=40):
+    """Coordinates of pixels within ``tolerance`` of an ``#rrggbb`` colour."""
+    red, green, blue = (
+        int(colour[index : index + 2], 16) for index in (1, 3, 5)
+    )
+    # Format_RGB32 is 0xffRRGGBB, little endian: blue, green, red, alpha.
+    mask = (
+        (numpy.abs(pixels[..., 2].astype(int) - red) <= tolerance)
+        & (numpy.abs(pixels[..., 1].astype(int) - green) <= tolerance)
+        & (numpy.abs(pixels[..., 0].astype(int) - blue) <= tolerance)
+    )
+    rows, columns = numpy.nonzero(mask)
+    return list(zip(columns.tolist(), rows.tolist(), strict=True))
 
 
 def _snapshot(name="trace", *, s21=True):
@@ -331,6 +398,104 @@ class TestUnicodeAndLongValues:
             assert value in html_text
         # The same rule and verdict reach the CSV.
         assert "limit:match,fail" in csv_summary(model)
+
+
+def _coloured_traces(colours):
+    """A trace per ``(colour, name)`` pair, with that colour set on it."""
+    collection = TraceCollection()
+    traces = []
+    for index, (colour, name) in enumerate(colours):
+        trace = collection.add(_snapshot(f"trace {index}"), name=name)
+        collection.set_color(trace.id, colour)
+        traces.append(trace)
+    return traces
+
+
+@needs_pdftoppm
+class TestTraceColourSwatches:
+    """The colour key is drawn, not merely described in the markup.
+
+    The markup alone proves nothing here: Qt's HTML engine paints a span's
+    background from the box of its text, so the HTML export's empty
+    ``<span class="swatch"></span>`` used to render as *nothing at all* in
+    the PDF (measured: zero pixels of either trace colour on the page).
+    These tests therefore rasterise the produced PDF and count pixels.
+    """
+
+    COLOURS = (("#ff0000", "Red trace"), ("#0000ff", "Blue trace"))
+
+    @staticmethod
+    def test_each_trace_colour_is_painted_on_the_page(tmp_path):
+        model = build_report(
+            "swatches", _coloured_traces(TestTraceColourSwatches.COLOURS)
+        )
+        path = _report(tmp_path, "swatch.pdf", model)
+        pixels = _page_pixels(path)
+
+        for colour, name in TestTraceColourSwatches.COLOURS:
+            painted = _colour_pixels(pixels, colour)
+            # A 10 px swatch at 150 dpi is ~21 x 21 px; 300 px leaves room
+            # for anti-aliasing and for a slightly different box, while a
+            # few stray pixels from text or a badge could not reach it.
+            assert len(painted) >= 300, (
+                f"the {colour} swatch of {name!r} is not painted "
+                f"({len(painted)} matching pixels)"
+            )
+
+        # A colour no trace uses must not appear, so the count above is not
+        # satisfied by something unrelated on the page.
+        assert not _colour_pixels(pixels, "#00ff00")
+
+    @staticmethod
+    def test_the_swatch_sits_before_its_own_trace_name(tmp_path):
+        """Each colour appears in its own trace's block, not just anywhere."""
+        model = build_report(
+            "swatches", _coloured_traces(TestTraceColourSwatches.COLOURS)
+        )
+        path = _report(tmp_path, "swatch-placement.pdf", model)
+        pixels = _page_pixels(path)
+        names = [
+            (xmin, text)
+            for xmin, _xmax, text in _bbox_words(path)[0]
+            if text in {"Red", "Blue"}
+        ]
+        assert len(names) == 2
+
+        for colour, name in TestTraceColourSwatches.COLOURS:
+            painted = _colour_pixels(pixels, colour)
+            assert painted
+            right = max(x for x, _y in painted) * 72.0 / 150.0
+            top = min(y for _x, y in painted) * 72.0 / 150.0
+            bottom = max(y for _x, y in painted) * 72.0 / 150.0
+            word_x, word = next(
+                (x, text) for x, text in names if name.startswith(text)
+            )
+            # Left of the name, and on the same line as it.
+            assert right <= word_x + 1.0, (name, word, right, word_x)
+            assert bottom - top <= 24.0, (name, bottom - top)
+
+
+class TestSwatchPrintMarkup:
+    @staticmethod
+    def test_the_print_markup_fills_a_swatch_so_it_can_paint():
+        model = build_report("swatches", _coloured_traces([("#ff0000", "Red")]))
+        markup = print_html(model, include_plots=False)
+
+        assert (
+            '<span class="swatch" style="background:#ff0000">'
+            "&nbsp;&nbsp;&nbsp;</span>&nbsp;Red</h3>" in markup
+        )
+
+    @staticmethod
+    def test_the_html_export_keeps_its_empty_swatch():
+        """Print-only: the browser paints the empty span; it stays as is."""
+        model = build_report("swatches", _coloured_traces([("#ff0000", "Red")]))
+        document = render_html(model, include_plots=False)
+
+        assert '<span class="swatch" style="background:#ff0000"></span>Red' in (
+            document
+        )
+        assert "&nbsp;" not in document
 
 
 class TestPrintMarkup:

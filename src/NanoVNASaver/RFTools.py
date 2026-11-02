@@ -27,6 +27,18 @@ FMT_SHORT = Format(max_nr_digits=4)
 FMT_SWEEP = Format(max_nr_digits=9, allow_strip=True)
 
 
+def _magnitude(point: "Datapoint") -> float:
+    """Magnitude of a sample, NaN included.
+
+    ``abs()`` on a complex is implemented with the C library's ``hypot`` and
+    converts a stale ``errno`` of ``ERANGE`` into ``OverflowError``.  Qt
+    leaves exactly that behind after loading a font, so the builtin raised on
+    an undefined sample instead of answering NaN.  ``math.hypot`` performs
+    the same arithmetic and never raises.
+    """
+    return math.hypot(point.re, point.im)
+
+
 class Datapoint(NamedTuple):
     freq: int
     re: float
@@ -44,12 +56,22 @@ class Datapoint(NamedTuple):
 
     @property
     def gain(self) -> float:
-        mag = abs(self.z)
+        mag = _magnitude(self)
+        if math.isnan(mag):
+            # Nothing was measured; ``log10(nan)`` is NaN but the guard
+            # below would turn it into ``-inf``, the value of silence.
+            return math.nan
         return 20 * math.log10(mag) if mag > 0 else -math.inf
 
     @property
     def vswr(self) -> float:
-        mag = abs(self.z)
+        mag = _magnitude(self)
+        if not math.isfinite(mag):
+            # An undefined reflection coefficient has no ratio.  Falling
+            # through the comparison below would report ``inf`` — the value
+            # of a *total* reflection — for a measurement that never
+            # happened.
+            return math.nan
         return (1 + mag) / (1 - mag) if mag < 1 else math.inf
 
     @property

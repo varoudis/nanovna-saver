@@ -382,12 +382,25 @@ class ComparisonResult:
                 f" {self.reference_trace} unavailable{detail}"
             )
         values = self.values()
+        # Undefined samples define no range: ``min``/``max`` would answer NaN
+        # whenever one sits at the start of the sweep, so the summary would
+        # depend on sweep order.  Infinities stay -- a zero magnitude really
+        # is an infinite dB difference.
+        measured = [value for value in values if not math.isnan(value)]
         interpolation = " (interpolated)" if self.interpolated else ""
-        return (
+        prefix = (
             f"{self.parameter} {self.kind.label}:"
             f" {self.source_trace} - {self.reference_trace}"
-            f"{interpolation}: min {min(values):.4g} {self.unit},"
-            f" max {max(values):.4g} {self.unit},"
+            f"{interpolation}"
+        )
+        if not measured:
+            return (
+                f"{prefix}: no measured values,"
+                f" {len(values)} points, {self.span_label()}"
+            )
+        return (
+            f"{prefix}: min {min(measured):.4g} {self.unit},"
+            f" max {max(measured):.4g} {self.unit},"
             f" {len(values)} points, {self.span_label()}"
         )
 

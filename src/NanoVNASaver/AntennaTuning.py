@@ -53,7 +53,7 @@ from .Measurement import (
 )
 from .RFTools import Datapoint
 from .Settings.Sweep import Properties, Sweep, SweepMode
-from .Touchstone import Touchstone
+from .Touchstone import Touchstone, TouchstoneExportError
 
 #: Point counts below this cannot describe a frequency span, so a sweep
 #: that must contain a minimum needs at least this many samples.
@@ -980,7 +980,14 @@ def write_s1p(
             " replacement"
         )
     touchstone = measurement_touchstone(snapshot, minimum)
-    payload = touchstone.saves(1)
+    try:
+        payload = touchstone.saves(1)
+    except TouchstoneExportError as exc:
+        # ``write_s1p`` promises ``AntennaExportError``, and its GUI caller
+        # catches only that and ``OSError``; letting an export refusal
+        # escape would show it as an unhandled exception instead of an
+        # "Unable to export" message.  Nothing has been written yet.
+        raise AntennaExportError(str(exc)) from exc
     target.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         "w",

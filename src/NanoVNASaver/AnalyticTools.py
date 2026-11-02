@@ -31,6 +31,9 @@ from .RFTools import Datapoint
 def zero_crossings(data: list[float]) -> list[int]:
     """find zero crossings
 
+    Undefined samples are skipped: a NaN never equals zero and never changes
+    sign, so leaving one in place hides the crossings that sit next to it.
+
     Args:
         data (list[float]): data list execute
 
@@ -40,18 +43,44 @@ def zero_crossings(data: list[float]) -> list[int]:
     if not data:
         return []
 
-    np_data = np.array(data)
+    np_data = np.array(data, dtype=float)
+    undefined = np.isnan(np_data)
 
     # start with real zeros (ignore first and last element)
     real_zeros = [
-        n for n in np.where(np_data == 0.0)[0] if n not in {0, np_data.size - 1}
+        int(n)
+        for n in np.where(np_data == 0.0)[0]
+        if n not in {0, np_data.size - 1}
     ]
-    # now multipy elements to find change in signess
+    # now multiply neighbours to find a change in signess, but only where
+    # both of them were measured
+    pairs = np.where(
+        ~undefined[:-1] & ~undefined[1:] & ((np_data[:-1] * np_data[1:]) < 0.0)
+    )[0]
     crossings = [
-        n if abs(np_data[n]) < abs(np_data[n + 1]) else n + 1
-        for n in np.where((np_data[:-1] * np_data[1:]) < 0.0)[0]
+        int(n if abs(np_data[n]) < abs(np_data[n + 1]) else n + 1)
+        for n in pairs
     ]
     return sorted(real_zeros + crossings)
+
+
+def bridged(data: list[float]) -> np.ndarray:
+    """``data`` with its NaN gaps filled by linear interpolation.
+
+    An undefined sample carries no shape: leaving the NaN in place makes
+    ``find_peaks`` drop every peak whose support window touches it, so one
+    undefined sample silently hid a real resonance next to it.  Bridging
+    keeps the curve continuous for the search; the caller then discards the
+    peaks that land on a gap.  Infinities are left alone -- an infinite VSWR
+    is a real measurement and must stay a peak.
+    """
+    values = np.array(data, dtype=float)
+    gaps = np.isnan(values)
+    if not gaps.any() or gaps.all():
+        return values
+    positions = np.arange(values.size)
+    values[gaps] = np.interp(positions[gaps], positions[~gaps], values[~gaps])
+    return values
 
 
 def maxima(data: list[float], threshold: float = 0.0) -> list[int]:
@@ -61,10 +90,13 @@ def maxima(data: list[float], threshold: float = 0.0) -> list[int]:
         data (list[float]): data list to execute
 
     Returns:
-        list[int]: indices of maxima
+        list[int]: indices of maxima, never an undefined sample
     """
-    peaks = find_peaks(data, width=2, distance=3, prominence=1)[0].tolist()
-    return [i for i in peaks if data[i] > threshold] if threshold else peaks
+    original = np.array(data, dtype=float)
+    values = bridged(data)
+    peaks = find_peaks(values, width=2, distance=3, prominence=1)[0].tolist()
+    peaks = [i for i in peaks if not np.isnan(original[i])]
+    return [i for i in peaks if values[i] > threshold] if threshold else peaks
 
 
 def minima(data: list[float], threshold: float = 0.0) -> list[int]:
@@ -74,12 +106,15 @@ def minima(data: list[float], threshold: float = 0.0) -> list[int]:
         data (list[float]): data list to execute
 
     Returns:
-        list[int]: indices of minima
+        list[int]: indices of minima, never an undefined sample
     """
-    bottoms = find_peaks(-np.array(data), width=2, distance=3, prominence=1)[
-        0
-    ].tolist()
-    return [i for i in bottoms if data[i] < threshold] if threshold else bottoms
+    original = np.array(data, dtype=float)
+    values = bridged(data)
+    bottoms = find_peaks(-values, width=2, distance=3, prominence=1)[0].tolist()
+    bottoms = [i for i in bottoms if not np.isnan(original[i])]
+    return (
+        [i for i in bottoms if values[i] < threshold] if threshold else bottoms
+    )
 
 
 def take_from_idx(
@@ -124,7 +159,12 @@ def center_from_idx(gains: list[float], idx: int, delta: float = 3.0) -> int:
     """
     peak_db = gains[idx]
     rng = take_from_idx(gains, idx, lambda i: abs(peak_db - i[1]) < delta)
-    return max(rng, key=lambda i: gains[i]) if rng else -1
+    # A NaN gain compares as unordered, so ``max`` would return it whenever
+    # it is the first candidate and then report an unusable centre.  The
+    # search is over the measured samples only; if none of them is usable
+    # the caller's existing "not found" path (-1) applies.
+    usable = [i for i in rng if not math.isnan(gains[i])]
+    return max(usable, key=lambda i: gains[i]) if usable else -1
 
 
 def cut_off_left(

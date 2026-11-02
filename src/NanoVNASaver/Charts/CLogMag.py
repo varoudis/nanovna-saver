@@ -163,7 +163,7 @@ class CombinedLogMagChart(LogMagChart):
             max_val = -100.0
             for d in self.data11 + self.data21:
                 logmag = self.logMag(d)
-                if math.isinf(logmag):
+                if not math.isfinite(logmag):
                     continue
                 max_val = max(max_val, logmag)
                 min_val = min(min_val, logmag)
@@ -172,7 +172,7 @@ class CombinedLogMagChart(LogMagChart):
                 if d.freq < self.fstart or d.freq > self.fstop:
                     continue
                 logmag = self.logMag(d)
-                if math.isinf(logmag):
+                if not math.isfinite(logmag):
                     continue
                 max_val = max(max_val, logmag)
                 min_val = min(min_val, logmag)

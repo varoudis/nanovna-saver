@@ -172,6 +172,90 @@ def test_inconsistent_data_is_reported_and_nothing_written(
     assert not target.exists()
 
 
+def test_non_ascending_data_is_reported_and_nothing_written(
+    files_window, tmp_path, monkeypatch
+):
+    """Bug 5: descending samples are refused, not sorted or truncated."""
+    from PySide6 import QtWidgets
+
+    app = files_window.app
+    app.data.s11 = [Datapoint(3, 0.1, 0.0), Datapoint(1, 0.2, 0.0)]
+    target = tmp_path / "descending.s1p"
+    target.write_text("sentinel\n", encoding="utf-8")
+
+    warnings = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "exec",
+        lambda self: QtWidgets.QFileDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog, "selectedFiles", lambda self: [str(target)]
+    )
+
+    files_window.exportFile(1)
+
+    assert warnings, "the failure must be reported to the user"
+    assert "never descending" in warnings[0][2]
+    assert target.read_text(encoding="utf-8") == "sentinel\n"
+
+
+@pytest.fixture(scope="module")
+def _log_sweep_frequencies():
+    """Frequencies of a real two-segment logarithmic sweep.
+
+    ``Sweep.get_index_range`` makes each segment end on the next one's
+    start, so the grid holds its boundary frequency twice -- the shape the
+    export used to refuse.
+    """
+    from NanoVNASaver.Settings.Sweep import Properties, Sweep
+
+    sweep = Sweep(14_000_000, 14_300_000, 101, 2, Properties(logarithmic=True))
+    return list(sweep.get_frequencies())
+
+
+def test_a_log_sweep_repeat_is_exported_not_refused(
+    files_window, tmp_path, monkeypatch, _log_sweep_frequencies
+):
+    """Bug 5 regression: a repeated boundary must not block the export."""
+    from PySide6 import QtWidgets
+
+    app = files_window.app
+    app.data.s11 = [Datapoint(f, 0.5, 0.1) for f in _log_sweep_frequencies]
+    target = tmp_path / "log.s1p"
+
+    warnings = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "exec",
+        lambda self: QtWidgets.QFileDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog, "selectedFiles", lambda self: [str(target)]
+    )
+
+    files_window.exportFile(1)
+
+    assert warnings == []
+    written = [
+        line
+        for line in target.read_text(encoding="utf-8").splitlines()
+        if line and line[0].isdigit()
+    ]
+    assert len(written) == len(_log_sweep_frequencies)
+    assert written[100].split()[0] == written[101].split()[0]
+
+
 def test_s1p_export_keeps_only_s11(files_window, tmp_path, monkeypatch):
     from PySide6 import QtWidgets
 

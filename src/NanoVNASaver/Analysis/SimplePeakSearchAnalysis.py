@@ -17,9 +17,9 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
+import math
 from typing import Callable
 
-import numpy as np
 from PySide6 import QtWidgets
 
 from ..Formatting import (
@@ -90,11 +90,24 @@ class SimplePeakSearchAnalysis(Analysis):
         s11 = self.app.data.s11
         data, fmt_fnc = self.data_and_format()
 
+        # ``argmin``/``argmax`` return the index of a NaN as soon as one is
+        # present, at either end of the sweep, so the peak would be reported
+        # at an undefined sample.  The search covers the measured samples.
+        # An infinite VSWR is a real measurement and stays a candidate.
+        usable = [
+            index for index, value in enumerate(data) if not math.isnan(value)
+        ]
+        if not usable:
+            self.label["peak_freq"].setText("")
+            self.label["peak_db"].setText("")
+            self.set_result("No measured samples to search")
+            return
+
         if self.button["peak_l"].isChecked():
-            idx_peak = np.argmin(data)
+            idx_peak = min(usable, key=lambda index: data[index])
         else:
             self.button["peak_h"].setChecked(True)
-            idx_peak = np.argmax(data)
+            idx_peak = max(usable, key=lambda index: data[index])
 
         self.label["peak_freq"].setText(format_frequency(s11[idx_peak].freq))
         self.label["peak_db"].setText(fmt_fnc(data[idx_peak]))

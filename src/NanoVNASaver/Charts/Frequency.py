@@ -612,6 +612,39 @@ class FrequencyChart(Chart):
         self.drawMarkers(qp)
         self.drawTraceLegend(qp)
 
+    def _scaling_values(self) -> list[float]:
+        """Finite values of every point the automatic range has to cover."""
+        values = []
+        for d in self.data:
+            val = self.value_function(d)
+            if math.isfinite(val):
+                values.append(val)
+        for d in self.reference:  # Also check min/max for the reference sweep
+            if d.freq < self.fstart or d.freq > self.fstop:
+                continue
+            val = self.value_function(d)
+            if math.isfinite(val):
+                values.append(val)
+        return values
+
+    def _scaling_range(self, values: list[float]) -> tuple[float, float]:
+        """Range covering ``values``, starting from the default bounds.
+
+        The default bounds are in the range because the chart has always
+        shown them when every measurement fits inside; widening is the only
+        thing a measurement can do here.
+        """
+        min_value = self.minDisplayValue / 10e11
+        max_value = self.maxDisplayValue / 10e11
+        for val in values:
+            min_value = min(min_value, val)
+            max_value = max(max_value, val)
+        return (min_value, max_value)
+
+    def _fixed_range(self) -> tuple[float, float]:
+        """The range the fixed-span mode pins the axis to."""
+        return (self.minDisplayValue / 10e11, self.maxDisplayValue / 10e11)
+
     def _find_scaling(self) -> tuple[float, float]:
         """Value range to draw, using finite values only.
 
@@ -619,25 +652,9 @@ class FrequencyChart(Chart):
         range would stretch the axis to infinity and make every real value
         indistinguishable.  It is skipped here and later left as a gap.
         """
-        min_value = self.minDisplayValue / 10e11
-        max_value = self.maxDisplayValue / 10e11
         if self.fixedValues:
-            return (min_value, max_value)
-        for d in self.data:
-            val = self.value_function(d)
-            if not math.isfinite(val):
-                continue
-            min_value = min(min_value, val)
-            max_value = max(max_value, val)
-        for d in self.reference:  # Also check min/max for the reference sweep
-            if d.freq < self.fstart or d.freq > self.fstop:
-                continue
-            val = self.value_function(d)
-            if not math.isfinite(val):
-                continue
-            min_value = min(min_value, val)
-            max_value = max(max_value, val)
-        return (min_value, max_value)
+            return self._fixed_range()
+        return self._scaling_range(self._scaling_values())
 
     def drawFrequencyTicks(self, qp):
         fspan = self.fstop - self.fstart

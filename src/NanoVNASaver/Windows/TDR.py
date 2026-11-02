@@ -376,6 +376,25 @@ class TDRWindow(QtWidgets.QWidget):
             points.append((position, float(weight)))
         return points
 
+    def _clear_result(self) -> None:
+        """Drop the transform, so no trace is drawn for unusable data.
+
+        The chart decides whether it has a result with ``hasattr(...,
+        "td")``, so discarding the arrays is what makes it draw an empty
+        graph; leaving a previous sweep's arrays in place would keep a
+        stale trace under a label that no longer describes it.
+        """
+        for name in ("td", "windowed_s11", "distance_axis", "step_response_Z"):
+            try:
+                delattr(self, name)
+            except AttributeError:
+                pass
+        self.tdr_result_label.setText("")
+        self.app.tdr_result_label.setText("")
+        # Gating reports the non-finite samples itself, and an empty
+        # distance axis removes the overlay.
+        self._refresh_gated_trace()
+
     def _refresh_gated_trace(self) -> None:
         trace = self.gated_trace()
         self.app.tdr_chart.overlay = self.overlay_points()
@@ -445,6 +464,15 @@ class TDRWindow(QtWidgets.QWidget):
             return
 
         s11 = np.array([complex(d.re, d.im) for d in self.app.data.s11])
+        # A non-finite sample makes every bin of the transform non-finite,
+        # so the convolution and the impedance division below compute
+        # nothing but warnings and the peak search reports a cable length
+        # of 0 m.  There is no TDR result for such a sweep: drop the
+        # previous one instead of drawing it as if it described this data.
+        if not np.all(np.isfinite(s11)):
+            self._clear_result()
+            logger.info("Cannot compute TDR from a non-finite S11 sample")
+            return
 
         # In lowpass mode, the frequency is measured down to DC. Because the
         # impulse response is real, we can flip over the frequency data so

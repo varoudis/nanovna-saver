@@ -29,6 +29,7 @@ from NanoVNASaver.Touchstone import (
     ChannelLengthMismatchError,
     FrequencyMismatchError,
     MissingParameterError,
+    NonAscendingFrequencyError,
     NonFiniteValueError,
     Touchstone,
     TouchstoneExportError,
@@ -333,6 +334,7 @@ class TestExportValidation:
             MissingParameterError,
             ChannelLengthMismatchError,
             FrequencyMismatchError,
+            NonAscendingFrequencyError,
             NonFiniteValueError,
         ):
             assert issubclass(error, TouchstoneExportError)
@@ -366,6 +368,216 @@ class TestValidationBeforeWriting:
         touchstone.filename = str(target)
         touchstone.save(4)
         assert target.read_text(encoding="utf-8") == touchstone.saves(4)
+
+
+class TestAscendingFrequency:
+    """Bug 5: a file whose samples decrease is not Touchstone.
+
+    Touchstone 1.1 expects the data lines in non-descending frequency
+    order, so a descending pair produces a file a conforming reader may
+    reject or silently reorder, and a NaN cannot be ordered at all.
+    ``saves``/``save`` must refuse both like every other inconsistency,
+    before any file is opened.  A *repeat* is deliberately allowed: a
+    segmented logarithmic sweep is built with each segment ending on the
+    next one's start (``Sweep.get_index_range``), so refusing it made every
+    such sweep unexportable.
+    """
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "frequencies,expected",
+        [
+            ([3_000_000, 2_000_000, 1_000_000], "never descending"),
+            ([1_000_000, 3_000_000, 2_000_000], "never descending"),
+            ([1_000_000, 2_000_000, math.nan], "not a number"),
+            ([math.nan, 2_000_000, 3_000_000], "not a number"),
+        ],
+        ids=["descending", "out-of-order", "nan-last", "nan-first"],
+    )
+    def test_a_decreasing_or_unordered_frequency_is_refused(
+        frequencies, expected
+    ):
+        touchstone = Touchstone()
+        touchstone.s11 = [Datapoint(freq, 0.1, 0.2) for freq in frequencies]
+        with pytest.raises(NonAscendingFrequencyError, match=expected):
+            touchstone.saves(1)
+
+    @staticmethod
+    def test_the_error_names_the_offending_index_and_frequency():
+        touchstone = Touchstone()
+        touchstone.s11 = [
+            Datapoint(1_000_000, 0.1, 0.2),
+            Datapoint(2_000_000, 0.1, 0.2),
+            Datapoint(1_500_000, 0.1, 0.2),
+        ]
+        with pytest.raises(NonAscendingFrequencyError) as info:
+            touchstone.saves(1)
+        message = str(info.value)
+        assert "index 2" in message
+        assert "1500000" in message
+        assert "2000000" in message
+
+    @staticmethod
+    def test_the_rejection_is_a_touchstone_export_error():
+        assert issubclass(NonAscendingFrequencyError, TouchstoneExportError)
+        assert issubclass(NonAscendingFrequencyError, ValueError)
+
+    @staticmethod
+    def test_a_two_port_export_is_checked_too():
+        touchstone = Touchstone()
+        touchstone.s11 = [
+            Datapoint(3e6, 0.1, 0.2),
+            Datapoint(2e6, 0.1, 0.2),
+            Datapoint(1e6, 0.1, 0.2),
+        ]
+        touchstone.s21 = list(touchstone.s11)
+        with pytest.raises(NonAscendingFrequencyError, match="S11"):
+            touchstone.saves(4)
+
+    @staticmethod
+    def test_a_single_sample_is_ascending():
+        touchstone = Touchstone()
+        touchstone.s11 = [Datapoint(1_000_000, 0.1, 0.2)]
+        assert touchstone.saves(1).splitlines()[-1] == "1000000 0.1 0.2"
+
+    @staticmethod
+    def test_save_refuses_before_opening_the_file(tmp_path):
+        target = tmp_path / "descending.s1p"
+        touchstone = Touchstone()
+        touchstone.s11 = [
+            Datapoint(3_000_000, 0.1, 0.2),
+            Datapoint(1_000_000, 0.1, 0.2),
+        ]
+        touchstone.filename = str(target)
+        with pytest.raises(NonAscendingFrequencyError):
+            touchstone.save(1)
+        assert not target.exists()
+
+    @staticmethod
+    def test_save_leaves_an_existing_file_untouched(tmp_path):
+        target = tmp_path / "existing.s1p"
+        target.write_text("sentinel\n", encoding="utf-8")
+        touchstone = Touchstone()
+        touchstone.s11 = [
+            Datapoint(3_000_000, 0.1, 0.2),
+            Datapoint(1_000_000, 0.1, 0.2),
+        ]
+        touchstone.filename = str(target)
+        with pytest.raises(NonAscendingFrequencyError):
+            touchstone.save(1)
+        assert target.read_text(encoding="utf-8") == "sentinel\n"
+
+    @staticmethod
+    def test_an_ascending_dataset_still_round_trips(tmp_path):
+        target = tmp_path / "ascending.s2p"
+        touchstone = _s11_s21(points=3)
+        touchstone.filename = str(target)
+        touchstone.save(4)
+
+        reloaded = Touchstone(str(target))
+        reloaded.load()
+        assert [dp.freq for dp in reloaded.s11] == [
+            1_000_000,
+            2_000_000,
+            3_000_000,
+        ]
+        assert [dp.freq for dp in reloaded.s21] == [
+            1_000_000,
+            2_000_000,
+            3_000_000,
+        ]
+
+    @staticmethod
+    def test_a_repeated_frequency_is_accepted():
+        """A log sweep's segment boundary repeats; that is not an error."""
+        touchstone = Touchstone()
+        touchstone.s11 = [
+            Datapoint(1_000_000, 0.1, 0.2),
+            Datapoint(2_000_000, 0.2, 0.2),
+            Datapoint(2_000_000, 0.3, 0.2),
+            Datapoint(3_000_000, 0.4, 0.2),
+        ]
+        rows = _data_rows(touchstone.saves(1))
+        assert [row.split()[0] for row in rows] == [
+            "1000000",
+            "2000000",
+            "2000000",
+            "3000000",
+        ]
+
+
+def _log_sweep_grid(segments: int) -> list[int]:
+    """Frequencies of a real segmented logarithmic ``Sweep``."""
+    from NanoVNASaver.Settings.Sweep import Properties, Sweep
+
+    sweep = Sweep(
+        14_000_000,
+        14_300_000,
+        101,
+        segments,
+        Properties(logarithmic=True),
+    )
+    return list(sweep.get_frequencies())
+
+
+def _data_rows(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line[:1].isdigit()]
+
+
+class TestLogarithmicSweepExport:
+    """Bug 5 regression: log-mode sweeps repeat each segment boundary."""
+
+    @staticmethod
+    @pytest.mark.parametrize("segments", [2, 3])
+    def test_a_log_sweep_is_exported(segments):
+        frequencies = _log_sweep_grid(segments)
+        touchstone = Touchstone()
+        touchstone.s11 = [Datapoint(f, 0.5, 0.1) for f in frequencies]
+
+        rows = _data_rows(touchstone.saves(1))
+
+        assert [int(row.split()[0]) for row in rows] == frequencies
+
+    @staticmethod
+    @pytest.mark.parametrize("segments", [2, 3])
+    def test_the_file_contains_each_repeated_boundary(segments):
+        """Open defect: the export writes the repeat instead of dropping it."""
+        frequencies = _log_sweep_grid(segments)
+        touchstone = Touchstone()
+        touchstone.s11 = [Datapoint(f, 0.5, 0.1) for f in frequencies]
+
+        rows = _data_rows(touchstone.saves(1))
+        repeats = [
+            rows[i]
+            for i in range(1, len(rows))
+            if rows[i].split()[0] == rows[i - 1].split()[0]
+        ]
+
+        assert len(repeats) == segments - 1
+
+    @staticmethod
+    def test_one_log_sweep_round_trips(tmp_path):
+        frequencies = _log_sweep_grid(2)
+        touchstone = Touchstone()
+        touchstone.s11 = [Datapoint(f, 0.5, 0.1) for f in frequencies]
+        target = tmp_path / "log.s1p"
+        touchstone.filename = str(target)
+        touchstone.save(1)
+
+        reloaded = Touchstone(str(target))
+        reloaded.load()
+
+        assert [dp.freq for dp in reloaded.s11] == frequencies
+
+    @staticmethod
+    def test_a_log_sweep_that_decreases_is_still_refused():
+        """Allowing a repeat must not allow a reversal."""
+        frequencies = list(reversed(_log_sweep_grid(2)))
+        touchstone = Touchstone()
+        touchstone.s11 = [Datapoint(f, 0.5, 0.1) for f in frequencies]
+
+        with pytest.raises(NonAscendingFrequencyError, match="never"):
+            touchstone.saves(1)
 
 
 class TestSimulatedProvenance:

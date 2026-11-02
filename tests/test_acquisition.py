@@ -361,6 +361,77 @@ class TestProvenance:
             result = session.sweep(request(name="band check"))
         assert result.snapshot.name == "band check"
 
+    @staticmethod
+    def test_a_simulated_scenario_reaches_the_snapshot():
+        from NanoVNASaver.Hardware.Simulated import make_simulated_vna
+
+        vna = make_simulated_vna("filter", reverse=True, seed=3)
+        with open_device(vna) as session:
+            snapshot = session.sweep(
+                SweepRequest(1_000_000, 50_000_000, 11)
+            ).snapshot
+        assert vna.scenario_key == "filter_reversed"
+        assert snapshot.simulated is True
+        assert snapshot.provenance.simulator_scenario == "filter_reversed"
+        # The note names the layers that changed the numbers, exactly as
+        # the interactive worker records it.
+        assert snapshot.provenance.notes == vna.provenance_note
+        assert "ports exchanged" in snapshot.provenance.notes
+        assert snapshot.provenance.device == vna.name
+        # The automation transport keeps its own documented label.
+        assert snapshot.provenance.source == "automation"
+
+    @staticmethod
+    def test_a_plain_simulated_scenario_adds_no_note():
+        from NanoVNASaver.Hardware.Simulated import make_simulated_vna
+
+        vna = make_simulated_vna("filter", seed=3)
+        with open_device(vna) as session:
+            snapshot = session.sweep(
+                SweepRequest(1_000_000, 50_000_000, 11)
+            ).snapshot
+        assert snapshot.provenance.simulator_scenario == "filter"
+        assert snapshot.provenance.notes == ""
+        assert snapshot.provenance.device == "Simulated VNA"
+
+    @staticmethod
+    def test_a_physical_device_carries_no_simulator_provenance():
+        class Physical(FakeDevice):
+            simulated = False
+            name = "NanoVNA-H"
+            # Even a device that happens to expose these must not make the
+            # automation API call physical data simulated.
+            scenario_key = "filter"
+            provenance_note = "replay of somewhere.s2p"
+
+        device = Physical()
+        with open_device(device) as session:
+            snapshot = session.sweep(request()).snapshot
+        assert snapshot.simulated is False
+        assert snapshot.provenance.simulated is False
+        # Same (empty) field the interactive worker writes for a device
+        # that is not simulated: no scenario is claimed at all.
+        assert snapshot.provenance.simulator_scenario == ""
+        assert snapshot.provenance.notes == ""
+        assert snapshot.provenance.device == "NanoVNA-H"
+        assert snapshot.provenance.source == "automation"
+
+    @staticmethod
+    def test_a_physical_touchstone_export_carries_no_simulated_label():
+        from NanoVNASaver.Measurement import snapshot_to_touchstone
+
+        class Physical(FakeDevice):
+            simulated = False
+            name = "NanoVNA-H"
+            scenario_key = "filter"
+            provenance_note = "replay of somewhere.s2p"
+
+        with open_device(Physical()) as session:
+            snapshot = session.sweep(request()).snapshot
+        comments = snapshot_to_touchstone(snapshot).comments
+        assert not any("simulated" in line.lower() for line in comments)
+        assert "! source: automation" in comments
+
 
 class TestHeadless:
     @staticmethod

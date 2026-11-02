@@ -549,7 +549,27 @@ def analyse_cable(
         )
     impedances = [dp.impedance(snapshot.reference_impedance) for dp in points]
     magnitudes = [abs(z) for z in impedances]
-    mean_z = sum(magnitudes) / len(magnitudes)
+    # An undefined sample has no |Z|.  Leaving it in makes ``sum`` NaN and
+    # lets ``min``/``max`` pick it whenever it comes first, so the reported
+    # range depends on sweep order.  Search the measured samples instead;
+    # no usable sample is reported as the existing "unavailable" state.
+    measured = [
+        (index, magnitude)
+        for index, magnitude in enumerate(magnitudes)
+        if not math.isnan(magnitude)
+    ]
+    if not measured:
+        return _unavailable(
+            AnalysisKind.CABLE,
+            trace_id,
+            trace_name,
+            S11,
+            "no measured S11 magnitudes",
+            {"velocity_factor": velocity_factor},
+        )
+    mean_z = sum(magnitude for _, magnitude in measured) / len(measured)
+    lowest = min(measured, key=lambda item: item[1])
+    highest = max(measured, key=lambda item: item[1])
     return AnalysisResult(
         kind=AnalysisKind.CABLE,
         trace_id=trace_id,
@@ -559,20 +579,21 @@ def analyse_cable(
             AnalysisValue("Mean |Z|", float(mean_z), "ohm"),
             AnalysisValue(
                 "Min |Z|",
-                float(min(magnitudes)),
+                float(lowest[1]),
                 "ohm",
-                points[magnitudes.index(min(magnitudes))].freq,
+                points[lowest[0]].freq,
             ),
             AnalysisValue(
                 "Max |Z|",
-                float(max(magnitudes)),
+                float(highest[1]),
                 "ohm",
-                points[magnitudes.index(max(magnitudes))].freq,
+                points[highest[0]].freq,
             ),
         ),
         parameters={
             "velocity_factor": velocity_factor,
             "reference_impedance": snapshot.reference_impedance,
+            "points": len(measured),
         },
     )
 

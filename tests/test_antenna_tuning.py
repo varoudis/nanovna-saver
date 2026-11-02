@@ -649,6 +649,27 @@ class TestExport:
             write_s1p(snapshot, tmp_path / "empty.s1p")
 
     @staticmethod
+    def test_a_dataset_touchstone_refuses_is_reported_as_an_export_error(
+        tmp_path,
+    ):
+        """The documented error type is the one the GUI catches.
+
+        ``write_s1p`` promises ``AntennaExportError``, and
+        ``Windows/AntennaTuning`` catches only that and ``OSError``, so a
+        Touchstone refusal escaping unchanged would surface as an
+        unhandled exception rather than an "Unable to export" message.
+        """
+        samples = [
+            Datapoint(3_000_000, 0.1, 0.2),
+            Datapoint(1_000_000, 0.1, 0.2),
+        ]
+        snapshot = snapshot_from_datapoints(samples, None, name="antenna")
+        target = tmp_path / "descending.s1p"
+        with pytest.raises(AntennaExportError, match="never descending"):
+            write_s1p(snapshot, target)
+        assert not target.exists()
+
+    @staticmethod
     def test_extension_is_forced_to_s1p(tmp_path):
         target = write_s1p(_snapshot(), tmp_path / "antenna.txt")
         assert target.suffix == ".s1p"

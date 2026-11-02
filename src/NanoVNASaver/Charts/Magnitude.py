@@ -54,26 +54,29 @@ class MagnitudeChart(FrequencyChart):
             max_value = float(self.maxDisplayValue)
             min_value = float(self.minDisplayValue)
         else:
-            # Find scaling
+            # Find scaling.  An undefined value has no magnitude, so it is
+            # skipped here and later left as a gap (see
+            # Frequency._find_scaling): letting it into the range would
+            # stretch the axis to infinity and flatten every real value.
             min_value = 100
             max_value = 0
             for d in self.data:
                 mag = self.magnitude(d)
+                if not math.isfinite(mag):
+                    continue
                 max_value = max(max_value, mag)
                 min_value = min(min_value, mag)
             # Also check min/max for the reference sweep
             for d in self.reference:
                 if d.freq < self.fstart or d.freq > self.fstop:
                     continue
+                mag = self.magnitude(d)
+                if not math.isfinite(mag):
+                    continue
                 max_value = max(max_value, mag)
                 min_value = min(min_value, mag)
             min_value = 10 * math.floor(min_value / 10)
             max_value = 10 * math.ceil(max_value / 10)
-
-        self.maxValue = max_value
-        self.minValue = min_value
-
-        self.span = (max_value - min_value) or 0.01
 
         target_ticks = int(self.dim.height // 60)
         for i in range(target_ticks):
@@ -120,8 +123,11 @@ class MagnitudeChart(FrequencyChart):
         self.drawData(qp, self.reference, Chart.color.reference)
         self.drawMarkers(qp)
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
         mag = self.magnitude(d)
+        if not math.isfinite(mag):
+            # Undefined magnitude: a gap, never zero and never an edge.
+            return None
         return self.topMargin + int(
             (self.maxValue - mag) / self.span * self.dim.height
         )

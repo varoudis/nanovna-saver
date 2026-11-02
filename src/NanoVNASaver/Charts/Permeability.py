@@ -30,6 +30,27 @@ from .Frequency import FrequencyChart
 logger = logging.getLogger(__name__)
 
 
+def _scaled(d: Datapoint, reference: float, *, imaginary: bool) -> float | None:
+    """One scaled axis value of ``d``; ``None`` when it is not a number.
+
+    ``re * 10e6 / freq`` is this chart's own scale factor, and ``inf / inf``
+    or ``0 * inf`` would turn a defined reading into NaN, so the finite
+    check happens after the scaling.
+    """
+    imp = d.impedance(reference)
+    value = (imp.imag if imaginary else imp.real) * 10e6 / d.freq
+    return value if math.isfinite(value) else None
+
+
+def _permeability_values(d: Datapoint, reference: float) -> list[float]:
+    """The finite real and imaginary axis values of ``d``."""
+    values = [
+        _scaled(d, reference, imaginary=False),
+        _scaled(d, reference, imaginary=True),
+    ]
+    return [value for value in values if value is not None]
+
+
 class PermeabilityChart(FrequencyChart):
     def __init__(self, name=""):
         super().__init__(name)
@@ -94,27 +115,20 @@ class PermeabilityChart(FrequencyChart):
         else:
             min_val = 1000.0
             max_val = -1000.0
+            # An undefined impedance has no magnitude: skipping it keeps the
+            # axis finite and leaves that sample as a gap (see
+            # Frequency._find_scaling).
             for d in self.data:
-                imp = d.impedance(self.reference_impedance)
-                re, im = imp.real, imp.imag
-                re = re * 10e6 / d.freq
-                im = im * 10e6 / d.freq
-                max_val = max(max_val, re)
-                max_val = max(max_val, im)
-                min_val = min(min_val, re)
-                min_val = min(min_val, im)
+                for value in _permeability_values(d, self.reference_impedance):
+                    max_val = max(max_val, value)
+                    min_val = min(min_val, value)
             # Also check min/max for the reference sweep
             for d in self.reference:
                 if d.freq < self.fstart or d.freq > self.fstop:
                     continue
-                imp = d.impedance(self.reference_impedance)
-                re, im = imp.real, imp.imag
-                re = re * 10e6 / d.freq
-                im = im * 10e6 / d.freq
-                max_val = max(max_val, re)
-                max_val = max(max_val, im)
-                min_val = min(min_val, re)
-                min_val = min(min_val, im)
+                for value in _permeability_values(d, self.reference_impedance):
+                    max_val = max(max_val, value)
+                    min_val = min(min_val, value)
 
         if self.logarithmicY:
             min_val = max(0.01, min_val)
@@ -287,18 +301,23 @@ class PermeabilityChart(FrequencyChart):
                 y_re = self.getReYPosition(self.data[m.location])
                 y_im = self.getImYPosition(self.data[m.location])
 
-                self.drawMarker(x, y_re, qp, m.color, self.markers.index(m) + 1)
-                self.drawMarker(x, y_im, qp, m.color, self.markers.index(m) + 1)
+                number = self.markers.index(m) + 1
+                if y_re is not None:
+                    self.drawMarker(x, y_re, qp, m.color, number)
+                if y_im is not None:
+                    self.drawMarker(x, y_im, qp, m.color, number)
 
-    def getImYPosition(self, d: Datapoint) -> int:
-        im = d.impedance(self.reference_impedance).imag
-        im = im * 10e6 / d.freq
+    def getImYPosition(self, d: Datapoint) -> int | None:
+        im = _scaled(d, self.reference_impedance, imaginary=True)
+        if im is None:
+            return None
         if self.logarithmicY:
             min_val = self.max - self.span
             if self.max > 0 and min_val > 0 and im > 0:
                 span = math.log(self.max) - math.log(min_val)
             else:
-                return -1
+                # Not on a logarithmic axis: a gap, not an edge.
+                return None
             return int(
                 self.topMargin
                 + (math.log(self.max) - math.log(im)) / span * self.dim.height
@@ -307,15 +326,17 @@ class PermeabilityChart(FrequencyChart):
             self.topMargin + (self.max - im) / self.span * self.dim.height
         )
 
-    def getReYPosition(self, d: Datapoint) -> int:
-        re = d.impedance(self.reference_impedance).real
-        re = re * 10e6 / d.freq
+    def getReYPosition(self, d: Datapoint) -> int | None:
+        re = _scaled(d, self.reference_impedance, imaginary=False)
+        if re is None:
+            return None
         if self.logarithmicY:
             min_val = self.max - self.span
             if self.max > 0 and min_val > 0 and re > 0:
                 span = math.log(self.max) - math.log(min_val)
             else:
-                return -1
+                # Not on a logarithmic axis: a gap, not an edge.
+                return None
             return int(
                 self.topMargin
                 + (math.log(self.max) - math.log(re)) / span * self.dim.height
@@ -347,8 +368,15 @@ class PermeabilityChart(FrequencyChart):
             mx, _ = self.getPosition(self.data[m.location])
             myr = self.getReYPosition(self.data[m.location])
             myi = self.getImYPosition(self.data[m.location])
+            if mx is None or (myr is None and myi is None):
+                # Nothing to measure a distance to.
+                continue
             dx = abs(x - mx)
-            dy = min(abs(y - myr), abs(y - myi))
+            dy = min(
+                abs(y - candidate)
+                for candidate in (myr, myi)
+                if candidate is not None
+            )
             distance = math.sqrt(dx**2 + dy**2)
             if distance < shortest:
                 shortest = distance

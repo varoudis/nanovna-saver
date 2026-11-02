@@ -71,13 +71,24 @@ class SquareChart(Chart):
 
         qp.setPen(pen)
         prev_x = self.getXPosition(data[0])
-        prev_y = int(self.height() / 2 + data[0].im * -1 * self.dim.height / 2)
+        prev_y = self.getYPosition(data[0])
         for i, d in enumerate(data):
             x = self.getXPosition(d)
-            y = int(self.height() / 2 + d.im * -1 * self.dim.height / 2)
+            y = self.getYPosition(d)
+            # A point with an undefined coordinate has no place on the
+            # plane: it is a gap, and neither the dot nor either line
+            # segment touching it is drawn.
+            if x is None or y is None:
+                prev_x, prev_y = x, y
+                continue
             if d.freq > fstart and d.freq < fstop:
                 qp.drawPoint(x, y)
-                if self.flag.draw_lines and i > 0:
+                if (
+                    self.flag.draw_lines
+                    and i > 0
+                    and prev_x is not None
+                    and prev_y is not None
+                ):
                     qp.setPen(line_pen)
                     qp.drawLine(x, y, prev_x, prev_y)
                     qp.setPen(pen)
@@ -101,10 +112,9 @@ class SquareChart(Chart):
         for m in self.markers:
             if m.location != -1 and m.location < len(self.data):
                 x = self.getXPosition(self.data[m.location])
-                y = int(
-                    self.height() // 2
-                    - self.data[m.location].im * self.dim.height // 2
-                )
+                y = self.getYPosition(self.data[m.location])
+                if x is None or y is None:
+                    continue
                 self.drawMarker(x, y, qp, m.color, self.markers.index(m) + 1)
 
     def resizeEvent(self, a0: QtGui.QResizeEvent) -> None:
@@ -138,29 +148,29 @@ class SquareChart(Chart):
         a0.accept()
 
         target = self.data or self.reference
-        positions = []
+        nearest = None
+        shortest = math.inf
+        for index, d in enumerate(target):
+            px, py = self.getPosition(d)
+            if px is None or py is None:
+                # An undefined point has no position to snap to.
+                continue
+            distance = math.hypot(x - px, y - py)
+            if distance < shortest:
+                shortest = distance
+                nearest = index
 
-        dim_x_2 = self.dim.width / 2
-        dim_y_2 = self.dim.height / 2
-        width_2 = self.width() / 2
-        height_2 = self.height() / 2
+        if nearest is not None and (m := self.getActiveMarker()):
+            m.setFrequency(str(round(target[nearest].freq)))
 
-        positions = [
-            math.sqrt(
-                (x - (width_2 + d.re * dim_x_2)) ** 2
-                + (y - (height_2 - d.im * dim_y_2)) ** 2
-            )
-            for d in target
-        ]
-
-        minimum_position = positions.index(min(positions))
-        if m := self.getActiveMarker():
-            m.setFrequency(str(round(target[minimum_position].freq)))
-
-    def getXPosition(self, d: Datapoint) -> int:
+    def getXPosition(self, d: Datapoint) -> int | None:
+        if not math.isfinite(d.re):
+            return None
         return int(self.width() / 2 + d.re * self.dim.width / 2)
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
+        if not math.isfinite(d.im):
+            return None
         return int(self.height() / 2 + d.im * -1 * self.dim.height / 2)
 
     def zoomTo(self, x1, y1, x2, y2):

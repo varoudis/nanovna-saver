@@ -12,10 +12,32 @@ enforces for a lowpass time-domain transform.
 
 from __future__ import annotations
 
+import math
+import warnings
+
 import pytest
 
 from NanoVNASaver.Hardware.Simulated import make_simulated_vna
 from NanoVNASaver.RFTools import Datapoint
+
+
+def _with_bad_sample(points, index=3):
+    """The same sweep, with one sample that cannot be transformed."""
+    broken = list(points)
+    broken[index] = Datapoint(broken[index].freq, math.nan, math.nan)
+    return broken
+
+
+def _sweep_points(start: int, stop: int, scenario: str = "cable"):
+    vna = make_simulated_vna(scenario)
+    vna.setSweep(start, stop)
+    frequencies = list(vna.read_frequencies())
+    s11 = list(vna.readValues("data 0"))
+    return [
+        Datapoint(int(f), c.real, c.imag)
+        for f, c in zip(frequencies, s11, strict=True)
+    ]
+
 
 START = 0
 STOP = 900_000_000
@@ -253,3 +275,61 @@ class TestReferenceImpedance:
         tdr.updateTDR()
 
         assert changed_peak != pytest.approx(default_peak)
+
+
+class TestNonFiniteSweep:
+    """A sweep the transform cannot use has no TDR result.
+
+    One NaN sample makes every bin of the inverse transform non-finite, so
+    the convolution emits a ``RuntimeWarning`` and the peak search reports
+    ``0.0m`` -- a cable length pruned out of numbers that were never
+    computed.  The window must say nothing instead of drawing that.
+    """
+
+    @staticmethod
+    def test_a_non_finite_sample_produces_no_result(tdr):
+        wiped = _with_bad_sample(_sweep_points(START, STOP))
+        tdr.app.saveData(wiped, [])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            tdr.updateTDR()
+            tdr.app.tdr_chart.repaint()
+        assert not caught, [str(w.message) for w in caught]
+        assert tdr.tdr_result_label.text() == ""
+        assert tdr.app.tdr_result_label.text() == ""
+        assert not hasattr(tdr, "td")
+
+    @staticmethod
+    def test_a_previous_result_is_dropped_not_left_stale(tdr):
+        _load(tdr.app, START, STOP)
+        assert tdr.tdr_result_label.text()
+        assert hasattr(tdr, "td")
+
+        tdr.app.saveData(_with_bad_sample(_sweep_points(START, STOP)), [])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            tdr.updateTDR()
+        # The chart draws a graph only when the window holds a transform,
+        # so discarding it is what keeps the previous sweep off the screen.
+        assert not hasattr(tdr, "td")
+        assert tdr.tdr_result_label.text() == ""
+
+    @staticmethod
+    def test_a_gate_cannot_use_a_non_finite_sweep(tdr):
+        tdr.app.saveData(_with_bad_sample(_sweep_points(START, STOP)), [])
+        tdr.gate_start.setValue(0.0)
+        tdr.gate_stop.setValue(2.0)
+        tdr.gate_enabled.setChecked(True)
+        assert tdr.gated_trace() == ()
+        assert "non-finite" in tdr.gate_status.text()
+        assert tdr.app.tdr_chart.overlay == []
+
+    @staticmethod
+    def test_a_finite_sweep_afterwards_still_produces_a_result(tdr):
+        tdr.app.saveData(_with_bad_sample(_sweep_points(START, STOP)), [])
+        tdr.updateTDR()
+        assert not hasattr(tdr, "td")
+
+        _load(tdr.app, START, STOP)
+        assert tdr.tdr_result_label.text()
+        assert hasattr(tdr, "td")

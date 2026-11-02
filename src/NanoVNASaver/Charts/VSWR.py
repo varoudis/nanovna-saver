@@ -70,6 +70,11 @@ class VSWRChart(FrequencyChart):
             maxVSWR = 3.0
             for d in self.data:
                 vswr = d.vswr
+                # An infinite VSWR is a property of |Gamma| >= 1, not a
+                # number to scale an axis to; skipping it keeps the axis
+                # finite and that sample a gap (see Frequency._find_scaling).
+                if not math.isfinite(vswr):
+                    continue
                 maxVSWR = max(vswr, maxVSWR)
             try:
                 maxVSWR = min(self.maxDisplayValue, math.ceil(maxVSWR))
@@ -109,6 +114,8 @@ class VSWRChart(FrequencyChart):
             for i in range(target_ticks):
                 vswr = minVSWR + i * self.span / target_ticks
                 y = self.getYPositionFromValue(vswr)
+                if y is None:
+                    continue
                 qp.setPen(Chart.color.text)
                 if vswr != 0:
                     digits = max(
@@ -134,6 +141,8 @@ class VSWRChart(FrequencyChart):
         qp.setPen(Chart.color.swr)
         for vswr in self.swrMarkers:
             y = self.getYPositionFromValue(vswr)
+            if y is None:
+                continue
             qp.drawLine(self.leftMargin, y, self.leftMargin + self.dim.width, y)
             qp.drawText(self.leftMargin + 3, y - 1, str(vswr))
 
@@ -142,26 +151,26 @@ class VSWRChart(FrequencyChart):
         self.drawData(qp, self.reference, Chart.color.reference)
         self.drawMarkers(qp)
 
-    def getYPositionFromValue(self, vswr) -> int:
+    def getYPositionFromValue(self, vswr) -> int | None:
+        if not math.isfinite(vswr):
+            # Undefined VSWR: a gap on the trace, never zero or an edge.
+            return None
         if self.logarithmicY:
             min_val = self.maxVSWR - self.span
             if self.maxVSWR > 0 and min_val > 0 and vswr > 0:
                 span = math.log(self.maxVSWR) - math.log(min_val)
             else:
-                return -1
+                return None
             return self.topMargin + int(
                 (math.log(self.maxVSWR) - math.log(vswr))
                 / span
                 * self.dim.height
             )
-        try:
-            return self.topMargin + int(
-                (self.maxVSWR - vswr) / self.span * self.dim.height
-            )
-        except OverflowError:
-            return self.topMargin
+        return self.topMargin + int(
+            (self.maxVSWR - vswr) / self.span * self.dim.height
+        )
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
         return self.getYPositionFromValue(d.vswr)
 
     def valueAtPosition(self, y) -> list[float]:

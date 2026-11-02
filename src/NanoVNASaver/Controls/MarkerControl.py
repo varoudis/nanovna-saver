@@ -112,16 +112,28 @@ class MarkerControl(Control):
         settings(self.app.marker_frame.isHidden())
 
     def toggle_delta(self):
-        self.app.delta_marker_layout.setVisible(self.check_delta.isChecked())
+        visible = self.check_delta.isChecked()
+        self.app.delta_marker_layout.setVisible(visible)
+        # The application only refreshes the delta readout while the panel
+        # is visible, so a mode toggled in the meantime would otherwise be
+        # re-shown blank.
+        if visible and self.app.markers:
+            self.app.markerUpdated(self.app.markers[0])
 
     def toggle_delta_reference(self):
         self.app.marker_ref = bool(self.check_delta_reference.isChecked())
 
         if self.app.marker_ref:
             new_name = "Delta Reference - Marker 1"
-
         else:
             new_name = "Delta Marker 2 - Marker 1"
-            # FIXME: reset
         self.app.delta_marker.group_box.setTitle(new_name)
+
+        # Retitling alone leaves the panel describing the previous mode: its
+        # values are built from the partner this flag selects, and only a
+        # fresh update pairs them again.  Clear them first, so a panel that
+        # is hidden at this moment cannot re-show another mode's numbers,
+        # then rebuild them for the mode the title now names.
         self.app.delta_marker.resetLabels()
+        if self.app.markers:
+            self.app.markerUpdated(self.app.markers[0])

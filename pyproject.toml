@@ -21,6 +21,7 @@ classifiers =[
   'Programming Language :: Python :: 3.11',
   'Programming Language :: Python :: 3.12',
   'Programming Language :: Python :: 3.13',
+  'Programming Language :: Python :: 3.14',
 ]
 keywords = ["Communications", "Ham Radio", "nanovna"]
 dynamic=['version']
@@ -28,8 +29,15 @@ dynamic=['version']
 dependencies=[
   'pyserial~=3.5',
   'pyside6~=6.8',
-  'numpy~=2.1',
-  'scipy~=1.14',
+  # The 3.14 wheels start later than the 3.10 ones: numpy 2.3.2 and scipy
+  # 1.16.1 are the first releases that ship them, and both need Python
+  # >= 3.11.  Splitting by marker keeps 3.10 installable instead of
+  # raising every floor, and keeps the older interpreters on the versions
+  # this project is already tested against.
+  'numpy~=2.1; python_version < "3.14"',
+  'numpy>=2.3.2; python_version >= "3.14"',
+  'scipy~=1.14; python_version < "3.14"',
+  'scipy>=1.16.1; python_version >= "3.14"',
 ]
 
 [dependency-groups]

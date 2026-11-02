@@ -18,6 +18,7 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import contextlib
 import logging
+import math
 import os
 import secrets
 import threading
@@ -1076,8 +1077,14 @@ class NanoVNASaver(QWidget):
         self.sweep_control.progress_bar.setValue(int(self.worker.percentage))
         self.windows["tdr"].updateTDR()
 
-        if s11:
-            min_vswr = min(s11, key=lambda data: data.vswr)
+        # A NaN measurement is "undefined", not "worst": ``min``/``max``
+        # compare it as unordered, so a single undefined sample placed first
+        # in the sweep would win the search and put "undefined" on a label
+        # that is supposed to name the best match.  ``inf`` is kept -- a
+        # total reflection is a real measurement and the honest answer.
+        measured_s11 = [dp for dp in s11 if not math.isnan(dp.vswr)]
+        if measured_s11:
+            min_vswr = min(measured_s11, key=lambda data: data.vswr)
             self.s11_min_swr_label.setText(
                 f"{format_vswr(min_vswr.vswr)} @"
                 f" {format_frequency(min_vswr.freq)}"
@@ -1087,9 +1094,10 @@ class NanoVNASaver(QWidget):
             self.s11_min_swr_label.setText("")
             self.s11_min_rl_label.setText("")
 
-        if s21:
-            min_gain = min(s21, key=lambda data: data.gain)
-            max_gain = max(s21, key=lambda data: data.gain)
+        measured_s21 = [dp for dp in s21 if not math.isnan(dp.gain)]
+        if measured_s21:
+            min_gain = min(measured_s21, key=lambda data: data.gain)
+            max_gain = max(measured_s21, key=lambda data: data.gain)
             self.s21_min_gain_label.setText(
                 f"{format_gain(min_gain.gain)}"
                 f" @ {format_frequency(min_gain.freq)}"

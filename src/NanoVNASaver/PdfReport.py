@@ -23,13 +23,15 @@ The PDF is produced from the same frozen :class:`~NanoVNASaver.Reports
 export itself, printed through ``QTextDocument`` into a ``QPdfWriter``, so
 every value, verdict, provenance label and missing-channel explanation is
 produced by one code path: a PDF can never disagree with the HTML it
-accompanies about what was measured.  Only three things are added for print:
+accompanies about what was measured.  Only four things are added for print:
 
 * a print stylesheet (point sizes, tighter table padding, A4 margins),
 * plots converted from inline SVG into images the PDF writer can embed, each
   starting on its own page so a figure is never split across a page break,
 * header rows promoted to ``<thead>`` so a table that spans pages repeats
-  its column headings, plus a ``Page N of M`` footer.
+  its column headings, plus a ``Page N of M`` footer,
+* an empty trace-colour swatch filled so that it paints (see
+  :func:`_paint_swatches`).
 
 Pagination is explicit: the document is laid out against a body height that
 excludes a footer strip, and each page is painted with a clipped context.
@@ -318,6 +320,42 @@ def _printable_tables(document: str) -> str:
     return _PLAIN_TABLE.sub(_table_to_paragraphs, document)
 
 
+#: The trace-colour swatch of a heading: an empty ``<span>`` whose only
+#: content is a background colour.
+_SWATCH = re.compile(r'(<span class="swatch"[^>]*>)(</span>)')
+
+#: Filler that gives a swatch a glyph box, and so a paintable background.
+#:
+#: ``QTextDocument`` paints a span's background from the box of its *text*,
+#: and an empty span has no text at all: the HTML export's
+#: ``<span class="swatch" ...></span>`` therefore draws nothing in the PDF
+#: (measured: 0 px of the trace colour on a rasterised page, against 875 for
+#: the same span with this filler).  Non-breaking spaces are used rather than
+#: a letter or a table cell because they paint no glyph of their own and
+#: ``pdftotext`` drops them again, so the trace name is still extracted
+#: alone.
+#:
+#: Three of them plus a separating one: Qt sizes the box from the glyphs
+#: inside the span (it ignores an inline span's ``width`` and
+#: ``height``), so one space gives a 4.0 x 17 pt sliver and three give the
+#: 12 x 17 pt block measured here.  The height is the heading's line box and
+#: cannot be reduced from CSS, so three spaces is the closest to the square
+#: the HTML export draws.  The trailing space replaces the
+#: ``margin-right: 5px`` that Qt also ignores: it leaves a 3.7 pt gap before
+#: the name, against 5 px (3.75 pt) in the HTML export.  Sizes measured at
+#: the printed heading size.
+_SWATCH_FILLER = "&nbsp;" * 3
+_SWATCH_GAP = "&nbsp;"
+
+
+def _paint_swatches(document: str) -> str:
+    """Fill every trace-colour swatch so that Qt paints it."""
+    return _SWATCH.sub(
+        lambda match: (f"{match.group(1)}{_SWATCH_FILLER}</span>{_SWATCH_GAP}"),
+        document,
+    )
+
+
 def print_html(model: ReportModel, *, include_plots: bool = True) -> str:
     """The HTML the PDF is drawn from (print stylesheet, plots as images).
 
@@ -337,6 +375,7 @@ def print_html(model: ReportModel, *, include_plots: bool = True) -> str:
                 document = document.replace("</body>", f"{plots}</body>")
     document = _repeat_table_headers(document)
     document = _printable_tables(document)
+    document = _paint_swatches(document)
     return document.replace("</head>", f"<style>{PRINT_CSS}</style></head>")
 
 

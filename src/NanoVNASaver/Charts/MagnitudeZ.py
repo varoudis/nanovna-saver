@@ -110,22 +110,23 @@ class MagnitudeZChart(FrequencyChart):
         self.drawData(qp, self.reference, Chart.color.reference)
         self.drawMarkers(qp)
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
         mag = self.magnitude(d)
         if self.logarithmicY and mag == 0:
             return self.topMargin - self.dim.height
-        if math.isfinite(mag):
-            if self.logarithmicY:
-                span = math.log(self.maxValue) - math.log(self.minValue)
-                return self.topMargin + int(
-                    (math.log(self.maxValue) - math.log(mag))
-                    / span
-                    * self.dim.height
-                )
+        if not math.isfinite(mag):
+            # Undefined magnitude: a gap, not the top edge.
+            return None
+        if self.logarithmicY:
+            span = math.log(self.maxValue) - math.log(self.minValue)
             return self.topMargin + int(
-                (self.maxValue - mag) / self.span * self.dim.height
+                (math.log(self.maxValue) - math.log(mag))
+                / span
+                * self.dim.height
             )
-        return self.topMargin
+        return self.topMargin + int(
+            (self.maxValue - mag) / self.span * self.dim.height
+        )
 
     def valueAtPosition(self, y) -> list[float]:
         absy = y - self.topMargin

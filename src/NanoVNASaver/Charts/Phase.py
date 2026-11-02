@@ -19,14 +19,27 @@
 import logging
 import math
 
-import numpy as np
 from PySide6.QtGui import QAction, QPainter, QPen
 
 from ..RFTools import Datapoint
 from .Chart import Chart
 from .Frequency import FrequencyChart
+from .phase_unwrap import unwrap_degrees
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_angle_range(values) -> tuple[float, float]:
+    """Whole-degree angle range from the finite entries of ``values``.
+
+    An undefined phase has no angle, so it must not set the scale; with
+    nothing finite left the full +-180 degree default is used, which is what
+    the chart shows when there is no unwrapped data at all.
+    """
+    finite = [value for value in values if math.isfinite(value)]
+    if not finite:
+        return (-180, 180)
+    return (math.floor(min(finite)), math.ceil(max(finite)))
 
 
 class PhaseChart(FrequencyChart):
@@ -67,20 +80,18 @@ class PhaseChart(FrequencyChart):
             return
 
         if self.unwrap:
-            rawData = [d.phase for d in self.data]
-            rawReference = [d.phase for d in self.reference]
-            self.unwrappedData = np.degrees(np.unwrap(rawData))
-            self.unwrappedReference = np.degrees(np.unwrap(rawReference))
+            self.unwrappedData = unwrap_degrees(d.phase for d in self.data)
+            self.unwrappedReference = unwrap_degrees(
+                d.phase for d in self.reference
+            )
 
         if self.fixedValues:
             minAngle = self.minDisplayValue
             maxAngle = self.maxDisplayValue
         elif self.unwrap and self.data:
-            minAngle = math.floor(np.min(self.unwrappedData))
-            maxAngle = math.ceil(np.max(self.unwrappedData))
+            minAngle, maxAngle = _finite_angle_range(self.unwrappedData)
         elif self.unwrap and self.reference:
-            minAngle = math.floor(np.min(self.unwrappedReference))
-            maxAngle = math.ceil(np.max(self.unwrappedReference))
+            minAngle, maxAngle = _finite_angle_range(self.unwrappedReference)
         else:
             minAngle = -180
             maxAngle = 180
@@ -136,13 +147,16 @@ class PhaseChart(FrequencyChart):
         self.drawData(qp, self.reference, Chart.color.reference)
         self.drawMarkers(qp)
 
-    def getYPosition(self, d: Datapoint) -> int:
+    def getYPosition(self, d: Datapoint) -> int | None:
         if self.unwrap and d in self.data:
             angle = self.unwrappedData[self.data.index(d)]
         elif self.unwrap and d in self.reference:
             angle = self.unwrappedReference[self.reference.index(d)]
         else:
             angle = math.degrees(d.phase)
+        if not math.isfinite(angle):
+            # Phase is undefined without a finite reflection coefficient.
+            return None
         return self.topMargin + int(
             (self.maxAngle - angle) / self.span * self.dim.height
         )

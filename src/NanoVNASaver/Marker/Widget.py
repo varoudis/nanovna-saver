@@ -36,6 +36,7 @@ from ..Formatting import (
     format_inductance,
     format_magnitude,
     format_phase,
+    format_polar,
     format_q_factor,
     format_resistance,
     format_vswr,
@@ -386,9 +387,7 @@ class Marker(QtCore.QObject, Value):
         )
         self.label["s11mag"].setText(format_magnitude(abs(_s11.z)))
         self.label["s11phase"].setText(format_phase(_s11.phase))
-        self.label["s11polar"].setText(
-            f"{round(abs(_s11.z), 2)!s}∠{format_phase(_s11.phase)}"
-        )
+        self.label["s11polar"].setText(format_polar(abs(_s11.z), _s11.phase))
 
         self.label["s11q"].setText(
             format_q_factor(_s11.qFactor(self.reference_impedance))
@@ -409,7 +408,7 @@ class Marker(QtCore.QObject, Value):
             self.label["s21mag"].setText(format_magnitude(abs(_s21.z)))
             self.label["s21phase"].setText(format_phase(_s21.phase))
             self.label["s21polar"].setText(
-                f"{round(abs(_s21.z), 2)!s}∠{format_phase(_s21.phase)}"
+                format_polar(abs(_s21.z), _s21.phase)
             )
             self.label["s21magshunt"].setText(
                 format_magnitude(
