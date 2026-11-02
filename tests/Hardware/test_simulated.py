@@ -172,7 +172,7 @@ class TestSimulatedDevice:
 
     @staticmethod
     def test_acquire_restores_previous_sweep_range():
-        device = SimulatedDevice("antenna")
+        device = SimulatedDevice("filter")
         device.set_sweep(1_000_000, 2_000_000, 11)
         frequencies, channels = device.acquire(
             3_000_000, 4_000_000, 51, ("data 0", "data 1")
@@ -236,7 +236,7 @@ class TestFaults:
     @staticmethod
     def test_mismatched_lengths_fault():
         device = SimulatedDevice(
-            "antenna", fault=FaultConfig(FaultMode.MISMATCHED_LENGTHS)
+            "filter", fault=FaultConfig(FaultMode.MISMATCHED_LENGTHS)
         )
         assert (
             len(device.read_channel("data 1"))
@@ -272,7 +272,7 @@ class TestFaults:
     @staticmethod
     def test_fail_during_average_after_n_samples():
         device = SimulatedDevice(
-            "antenna",
+            "filter",
             fault=FaultConfig(
                 FaultMode.FAIL_DURING_AVERAGE, fail_after_samples=2
             ),
@@ -336,15 +336,24 @@ class TestNormalSweepPath:
             vna.setSweep(start, stop)
             frequencies = vna.read_frequencies()
             values11 = vna.readValues("data 0")
-            values21 = vna.readValues("data 1")
-            assert len(frequencies) == len(values11) == len(values21)
+            # A one-port scenario has no S21 at all; reading it would be
+            # asking the device for a channel it does not model.
+            values21 = (
+                vna.readValues("data 1")
+                if "data 1" in vna.supported_channels
+                else []
+            )
+            assert len(frequencies) == len(values11)
+            if values21:
+                assert len(frequencies) == len(values21)
             data11.extend(zip(frequencies, values11, strict=True))
-            data21.extend(zip(frequencies, values21, strict=True))
+            if values21:
+                data21.extend(zip(frequencies, values21, strict=True))
         return data11, data21
 
     @staticmethod
     def test_single_segment_sweep_covers_the_span():
-        vna = make_simulated_vna("antenna")
+        vna = make_simulated_vna("filter")
         vna.datapoints = 101
         sweep = Sweep(start=10_000_000, end=20_000_000, points=101)
         data11, data21 = TestNormalSweepPath._collect(vna, sweep)

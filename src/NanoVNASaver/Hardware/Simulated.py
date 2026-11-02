@@ -65,8 +65,12 @@ from .SimulatedScenarios import (
     DEFAULT_SCENARIOS,
     REFERENCE_IMPEDANCE,
     SCENARIO_TYPES,
+    SIMULATION_DISCLAIMER,
+    ErrorModel,
+    ReversedTwoPort,
     Scenario,
     ScenarioResult,
+    VirtualStandards,
     build_scenario,
 )
 
@@ -259,10 +263,15 @@ class SimulatedDevice:
         scenario_kwargs: dict | None = None,
         sweep_start: int | None = None,
         sweep_stop: int | None = None,
+        error_model: ErrorModel | None = None,
+        reverse: bool = False,
     ) -> None:
         if isinstance(scenario, str):
             scenario = build_scenario(scenario, **(scenario_kwargs or {}))
+        if reverse:
+            scenario = ReversedTwoPort(scenario)
         self.scenario: Scenario = scenario
+        self.error_model = error_model
         self.fault = fault or FaultConfig()
         self.seed = seed
         self.noise_floor = noise_floor
@@ -322,10 +331,51 @@ class SimulatedDevice:
         return ("data 0", "data 1")
 
     @property
+    def error_model_active(self) -> bool:
+        """True when a distortion layer is actually in force."""
+        return self.error_model is not None and not self.error_model.is_identity
+
+    @property
     def provenance_note(self) -> str:
-        """Extra provenance text for snapshots (replay source, if any)."""
+        """Extra provenance text for snapshots (replay source, layers, if any).
+
+        Stays ``""`` for a plain analytic scenario: there is nothing extra to
+        say about an ideal model that the simulation label does not already
+        say.  Anything that changes the numbers -- a reversed DUT, an error
+        box -- is named here so the note and the data cannot disagree.
+        """
+        parts: list[str] = []
         note = getattr(self.scenario, "provenance_text", None)
-        return note() if callable(note) else ""
+        if callable(note):
+            text = note()
+            if text:
+                parts.append(str(text))
+        if self.error_model_active:
+            parts.append(self.error_model.describe())
+        return "; ".join(parts)
+
+    def simulation_state(self) -> dict[str, object]:
+        """Machine-readable record of what this device is simulating.
+
+        The firmware banner carries a human summary; this record is what an
+        export or report can keep so the active DUT, error box and standards
+        survive outside the process, always with the disclaimer attached.
+        """
+        state: dict[str, object] = {
+            "simulated": True,
+            "scenario": self.scenario_key,
+            "scenario_name": self.scenario_name,
+            "reference_impedance": REFERENCE_IMPEDANCE,
+            "reversed": isinstance(self.scenario, ReversedTwoPort),
+            "error_model": (
+                None if self.error_model is None else self.error_model.to_dict()
+            ),
+            "disclaimer": SIMULATION_DISCLAIMER,
+        }
+        standards = getattr(self.scenario, "standards", None)
+        if isinstance(standards, VirtualStandards):
+            state["standards"] = standards.acquisition_state()
+        return state
 
     def preflight(self, start: int, stop: int) -> str | None:
         """Scenario-specific sweep preflight; ``None`` means valid."""
@@ -399,9 +449,18 @@ class SimulatedDevice:
             sleep(self.fault.slow_delay)
 
         result = self.scenario(float(freq))
+        if self.error_model_active:
+            # Between the DUT and the instrument, before the noise this
+            # instrument adds.  An identity (or absent) box is skipped
+            # entirely, so the ideal path takes no arithmetic and the seeded
+            # noise draws keep their order and count.
+            result = self.error_model.apply(result)
         if self.noise_floor:
             result = ScenarioResult(
-                self._add_noise(result.s11), self._add_noise(result.s21)
+                self._add_noise(result.s11),
+                self._add_noise(result.s21),
+                result.s12,
+                result.s22,
             )
         return result
 
@@ -464,11 +523,17 @@ class SimulatedDevice:
         return "simulated calibration state: none"
 
     def read_info(self) -> str:
-        return (
-            f"Simulated device {self.SANE_VERSION}\n"
-            f"scenario: {self.scenario_name}\n"
-            f"reference impedance: {REFERENCE_IMPEDANCE:g} ohm"
-        )
+        lines = [
+            f"Simulated device {self.SANE_VERSION}",
+            f"scenario: {self.scenario_name}",
+            f"reference impedance: {REFERENCE_IMPEDANCE:g} ohm",
+        ]
+        note = self.provenance_note
+        if note:
+            # The active layers are named here as well as in the snapshot
+            # note, so a reader of the device banner sees the same story.
+            lines.append(f"simulation layers: {note}")
+        return "\n".join(lines)
 
     def read_serial_number(self) -> str:
         return "SIM-0000-0000"
@@ -535,6 +600,8 @@ class SimulatedVNA:
         scenario_kwargs: dict | None = None,
         sweep_start: int | None = None,
         sweep_stop: int | None = None,
+        error_model: ErrorModel | None = None,
+        reverse: bool = False,
     ) -> None:
         self.device = device or SimulatedDevice(
             scenario,
@@ -545,6 +612,8 @@ class SimulatedVNA:
             scenario_kwargs=scenario_kwargs,
             sweep_start=sweep_start,
             sweep_stop=sweep_stop,
+            error_model=error_model,
+            reverse=reverse,
         )
         self.name = "Simulated VNA"
         self.valid_datapoints = (101, 51, 11, 201, 401)
@@ -641,6 +710,9 @@ class SimulatedVNA:
     def provenance_note(self) -> str:
         return self.device.provenance_note
 
+    def simulation_state(self) -> dict[str, object]:
+        return self.device.simulation_state()
+
     def preflight(self, start: int, stop: int) -> str | None:
         return self.device.preflight(start, stop)
 
@@ -658,8 +730,20 @@ def make_simulated_vna(  # noqa: PLR0913
     scenario_kwargs: dict | None = None,
     sweep_start: int | None = None,
     sweep_stop: int | None = None,
+    error_model: ErrorModel | None = None,
+    reverse: bool = False,
 ) -> SimulatedVNA:
-    """Factory used by the connection control for demonstration mode."""
+    """Factory used by the connection control for demonstration mode.
+
+    ``latency`` is the nominal cost of one data read (see
+    :class:`SimulatedDevice`); it must be finite and ``>= 0`` or the call
+    raises ``ValueError``.  ``FaultMode.SLOW``/``TIMEOUT`` replace it rather
+    than stacking on top of it.
+
+    ``error_model`` and ``reverse`` are the SIM-01 layers.  Both are off by
+    default, and with neither set the samples are exactly what this factory
+    produced before the layers existed.
+    """
     return SimulatedVNA(
         scenario=scenario,
         seed=seed,
@@ -669,4 +753,6 @@ def make_simulated_vna(  # noqa: PLR0913
         scenario_kwargs=scenario_kwargs,
         sweep_start=sweep_start,
         sweep_stop=sweep_stop,
+        error_model=error_model,
+        reverse=reverse,
     )

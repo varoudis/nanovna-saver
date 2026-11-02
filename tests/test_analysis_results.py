@@ -43,12 +43,18 @@ def _acquire(scenario, start, stop, points=201):
     vna.setSweep(start, stop)
     frequencies = vna.read_frequencies()
     s11 = vna.readValues("data 0")
-    s21 = vna.readValues("data 1")
+    # A one-port DUT declares only "data 0"; asking it for S21 is an error,
+    # not an empty result.
+    s21 = (
+        vna.readValues("data 1")
+        if "data 1" in getattr(vna, "supported_channels", ("data 0",))
+        else []
+    )
     convert = lambda values: [  # noqa: E731
         Datapoint(freq, value.real, value.imag)
         for freq, value in zip(frequencies, values, strict=True)
     ]
-    return snapshot_from_datapoints(convert(s11), convert(s21))
+    return snapshot_from_datapoints(convert(s11), convert(s21) if s21 else [])
 
 
 class TestResonanceAnalysis:

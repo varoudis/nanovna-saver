@@ -681,11 +681,16 @@ def _run_worker(app):
 
 
 class TestDeclaredChannels:
-    """A device that declares S21 must never be published as one-port."""
+    """A device that declares S21 must never be published as one-port.
+
+    These use the two-port cable scenario: an antenna is a one-port device
+    and now says so, which is the behaviour being protected here, not
+    circumvented.
+    """
 
     @staticmethod
     def test_empty_declared_s21_fails_and_publishes_nothing():
-        vna = make_simulated_vna("antenna")
+        vna = make_simulated_vna("cable")
         original = vna.readValues
 
         def read(channel):
@@ -706,7 +711,7 @@ class TestDeclaredChannels:
 
     @staticmethod
     def test_short_declared_s21_fails_and_publishes_nothing():
-        vna = make_simulated_vna("antenna")
+        vna = make_simulated_vna("cable")
         original = vna.readValues
 
         def read(channel):
@@ -724,7 +729,7 @@ class TestDeclaredChannels:
 
     @staticmethod
     def test_a_retry_that_keeps_failing_never_publishes_partial_data():
-        vna = make_simulated_vna("antenna")
+        vna = make_simulated_vna("cable")
         original = vna.readValues
         attempts = []
 

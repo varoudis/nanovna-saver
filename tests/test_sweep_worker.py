@@ -165,7 +165,9 @@ class TestCompletedSweep:
 
     @staticmethod
     def test_published_samples_are_complete_and_labelled():
-        worker, record = _make_worker(_app())
+        # A two-port scenario: an antenna declares only ``data 0``, so its
+        # snapshot must not claim an S21 it never measured.
+        worker, record = _make_worker(_app("filter"))
         worker.run_once()
         assert record.sample_ready
         final = record.sample_ready[-1]
@@ -173,6 +175,14 @@ class TestCompletedSweep:
         assert final.completion is CompletionState.COMPLETE
         assert len(final.s11) == 101
         assert final.snapshot.available == ("S11", "S21")
+
+    @staticmethod
+    def test_a_one_port_scenario_publishes_only_the_channel_it_measured():
+        worker, record = _make_worker(_app("antenna"))
+        worker.run_once()
+        final = record.sample_ready[-1]
+        assert final.snapshot.available == ("S11",)
+        assert final.s21 == ()
 
     @staticmethod
     def test_no_preallocated_zeros_are_published():
