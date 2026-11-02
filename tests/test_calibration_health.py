@@ -434,6 +434,15 @@ class TestWindow:
         panel.verifyConnectedStandard()
         assert "Connect a device" in panel.health_verification_label.text()
 
+    def test_a_refused_sweep_leaves_no_token_behind(self, window, monkeypatch):
+        panel = _prepare(window, -1)
+        monkeypatch.setattr(window, "showError", lambda _message: None)
+        borrowed = window._lend_device_to_service()
+        panel.verifyConnectedStandard()
+        borrowed.disconnect()
+        assert panel._verification_pending is None
+        assert window.worker._request_token is None
+
     def test_the_reminder_setting_reaches_the_sweep_panel(self, window):
         panel = _prepare(window, -1)
         # The panel only states a calibration status for data on screen.

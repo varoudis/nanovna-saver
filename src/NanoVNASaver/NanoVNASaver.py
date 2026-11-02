@@ -19,6 +19,7 @@
 import contextlib
 import logging
 import os
+import secrets
 import threading
 from dataclasses import replace
 from time import localtime, strftime
@@ -28,6 +29,7 @@ from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QWidget
 
 from .About import VERSION
+from .Acquisition import BorrowedDevice
 from .Analysis.Results import AnalysisKind
 from .Calibration import Calibration
 from .CalibrationCoverage import coverage_from_calibration
@@ -314,6 +316,12 @@ class NanoVNASaver(QWidget):
         #: ``cancelled``/``timed out``); a background attempt has no return
         #: value, so the outcome is recorded when its signal arrives.
         self.last_connection_status = ""
+        #: Guards who may read the device: a sweep, or one service run.
+        self._device_lease_lock = threading.Lock()
+        self._device_lent = False
+        #: The local automation service (AUTO-04), created only when the
+        #: operator starts it; nothing listens on import or at startup.
+        self.web_service = None
         #: The combined forward/reverse S-matrix, when one was captured.
         self.s_matrix = None
         #: Analysis kinds requested by the last applied preset.
@@ -695,6 +703,35 @@ class NanoVNASaver(QWidget):
         left_column.addWidget(reversal_control_box)
 
         ###############################################################
+        #  Local automation service (AUTO-04)
+        ###############################################################
+
+        service_control_box = QtWidgets.QGroupBox()
+        service_control_box.setTitle("Automation service")
+        service_control_layout = QtWidgets.QFormLayout()
+        service_control_box.setLayout(service_control_layout)
+
+        self.service_label = QtWidgets.QLabel("Stopped")
+        self.service_label.setWordWrap(True)
+        # Scripts need the token, so it has to be copyable.
+        self.service_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.service_label.setMinimumHeight(20)
+        self.service_label.setToolTip(
+            "A loopback-only HTTP/WebSocket endpoint for scripting. It is"
+            " off until you start it and stops when the window closes."
+        )
+        service_control_layout.addRow(self.service_label)
+
+        self.service_button = QtWidgets.QPushButton("Start service")
+        self.service_button.setMinimumHeight(20)
+        self.service_button.clicked.connect(self.toggle_web_service)
+        service_control_layout.addRow(self.service_button)
+
+        left_column.addWidget(service_control_box)
+
+        ###############################################################
         #  Spacer
         ###############################################################
 
@@ -840,19 +877,28 @@ class NanoVNASaver(QWidget):
         if self.worker.isRunning():
             logger.debug("Ignoring sweep start while a sweep is active")
             return
-        self._sweep_had_data = False
-        self._sweep_control(start=True)
+        with self._device_lease_lock:
+            refused = self._device_lent
+            if not refused:
+                self._sweep_had_data = False
+                self._sweep_control(start=True)
 
-        for m in self.markers:
-            m.resetLabels()
-        self.s11_min_rl_label.setText("")
-        self.s11_min_swr_label.setText("")
-        self.s21_min_gain_label.setText("")
-        self.s21_max_gain_label.setText("")
-        self.tdr_result_label.setText("")
+                for m in self.markers:
+                    m.resetLabels()
+                self.s11_min_rl_label.setText("")
+                self.s11_min_swr_label.setText("")
+                self.s21_min_gain_label.setText("")
+                self.s21_max_gain_label.setText("")
+                self.tdr_result_label.setText("")
 
-        logger.debug("Starting worker thread")
-        self.worker.start()
+                logger.debug("Starting worker thread")
+                self.worker.start()
+        if refused:
+            self.showError(
+                "The automation service is using the device. Wait for its"
+                " run to finish, or cancel it, and try again."
+            )
+            return
         # TODO: Rewrite to make worker a qrunnable with worker signals
         # https://www.pythonguis.com/tutorials/multithreading-pyqt6-applications-qthreadpool/
         # self.threadpool.start(self.worker)
@@ -1203,6 +1249,68 @@ class NanoVNASaver(QWidget):
         self.reversal_label.setText(
             "Forward: measure the DUT as it is now, then turn it around"
         )
+
+    def toggle_web_service(self) -> bool:
+        """Start or stop the local automation service (AUTO-04).
+
+        Nothing listens until this is called: the endpoint exists so a
+        script can drive sweeps, and a desktop application that opened a
+        socket on startup would be doing something the operator never asked
+        for.  The bind is loopback-only; a remote bind has to be requested
+        deliberately through the API, not from this button.
+        """
+        if self.web_service is not None:
+            self.stop_web_service()
+            return False
+        from .WebService import MeasurementService, ServiceConfig
+
+        try:
+            # A generated token keeps out other accounts on this machine,
+            # which can reach a loopback port just as this one can.
+            token = secrets.token_urlsafe(24)
+            service = MeasurementService(
+                ServiceConfig(token=token),
+                device_factory=self._lend_device_to_service,
+            )
+            service.app_version = NanoVNASaver.version
+            host, port = service.start_server()
+        except Exception as error:
+            self.service_label.setText(f"Could not start: {error}")
+            logger.exception("Automation service failed to start")
+            return False
+        self.web_service = service
+        self.service_label.setText(f"Listening on {host}:{port}, token {token}")
+        self.service_button.setText("Stop service")
+        return True
+
+    def _lend_device_to_service(self) -> BorrowedDevice:
+        """Hand the connected device to one service run (service thread).
+
+        The application and the service never read the device at once: a run
+        is refused while a sweep is active, and :meth:`sweep_start` refuses
+        while a run holds it.  Both decide under the same lock.
+        """
+        with self._device_lease_lock:
+            if self._device_lent:
+                raise RuntimeError("the device is already lent to a run")
+            if not self.vna.connected():
+                raise RuntimeError("no device is connected in the application")
+            if self.worker.isRunning():
+                raise RuntimeError("the application is running a sweep")
+            self._device_lent = True
+            return BorrowedDevice(self.vna, on_release=self._device_returned)
+
+    def _device_returned(self) -> None:
+        with self._device_lease_lock:
+            self._device_lent = False
+
+    def stop_web_service(self) -> None:
+        service, self.web_service = self.web_service, None
+        if service is not None:
+            service.stop()
+        if hasattr(self, "service_label"):
+            self.service_label.setText("Stopped")
+            self.service_button.setText("Start service")
 
     def cancel_reversal_capture(self) -> None:
         if self.reversal_capture is not None:
@@ -2370,6 +2478,8 @@ class NanoVNASaver(QWidget):
         # A connection attempt runs off the GUI thread (PERF-01); cancel it
         # and wait, so no worker outlives the window it would report to.
         self.serial_control.shutdown(WORKING_KILL_TIME_MS)
+        # An automation endpoint must not outlive the window it reads from.
+        self.stop_web_service()
         for marker in self.markers:
             marker.update_settings()
         self.settings.sync()
