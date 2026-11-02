@@ -18,12 +18,33 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging
+import os
+from dataclasses import replace
 from functools import partial
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..Calibration import Calibration
+from ..CalibrationHealth import (
+    DEFAULT_REMINDER_HOURS,
+    DEFAULT_TOLERANCE,
+    VERIFIABLE_STANDARDS,
+    VerificationError,
+    verify_standard,
+)
+from ..CalibrationKits import (
+    BUILTIN_NAMES,
+    COEFFICIENT_FIELDS,
+    MODEL_FILE,
+    MODEL_IDEAL,
+    CalibrationKit,
+    CalibrationKitError,
+    KitLibrary,
+    kit_from_legacy_values,
+    legacy_values,
+)
 from ..Settings.Sweep import SweepMode
+from ..SweepState import SweepState
 from ..Touchstone import Touchstone
 from .Defaults import make_scrollable
 from .ui import get_window_icon
@@ -40,6 +61,11 @@ def getFloatValue(text: str) -> float:
         return float(text)
     except (TypeError, ValueError):
         return 0.0
+
+
+def formatCoefficient(value: float) -> str:
+    """Format a coefficient for a text field without float noise."""
+    return f"{value:.15g}"
 
 
 class CalibrationWindow(QtWidgets.QWidget):
@@ -147,6 +173,7 @@ class CalibrationWindow(QtWidgets.QWidget):
         calibration_notes_layout.addWidget(self.notes_textedit)
 
         left_layout.addWidget(calibration_notes_group)
+        left_layout.addWidget(self._buildHealthGroup())
 
         file_box = QtWidgets.QGroupBox("Files")
         file_layout = QtWidgets.QFormLayout(file_box)
@@ -266,6 +293,43 @@ class CalibrationWindow(QtWidgets.QWidget):
         cal_standard_layout.addWidget(self.cal_load_box)
         cal_standard_layout.addWidget(self.cal_through_box)
 
+        self.cal_kit_box = QtWidgets.QGroupBox("Calibration kit")
+        cal_kit_layout = QtWidgets.QVBoxLayout(self.cal_kit_box)
+        self.cal_kit_selector = QtWidgets.QComboBox()
+        self.cal_kit_selector.setMinimumHeight(20)
+        self.cal_kit_selector.activated.connect(self.kitSelected)
+        cal_kit_layout.addWidget(self.cal_kit_selector)
+        self.cal_kit_detail = QtWidgets.QLabel("")
+        self.cal_kit_detail.setWordWrap(True)
+        cal_kit_layout.addWidget(self.cal_kit_detail)
+        kit_button_layout = QtWidgets.QHBoxLayout()
+        self.kitApplyButton = QtWidgets.QPushButton("Apply")
+        self.kitSaveButton = QtWidgets.QPushButton("Save")
+        self.kitDuplicateButton = QtWidgets.QPushButton("Duplicate")
+        self.kitRenameButton = QtWidgets.QPushButton("Rename")
+        self.kitDeleteButton = QtWidgets.QPushButton("Delete")
+        for button, slot in (
+            (self.kitApplyButton, self.applyCalibrationKit),
+            (self.kitSaveButton, self.saveCalibrationKit),
+            (self.kitDuplicateButton, self.duplicateCalibrationKit),
+            (self.kitRenameButton, self.renameCalibrationKit),
+            (self.kitDeleteButton, self.deleteCalibrationKit),
+        ):
+            button.setMinimumHeight(20)
+            button.clicked.connect(slot)
+            kit_button_layout.addWidget(button)
+        cal_kit_layout.addLayout(kit_button_layout)
+        kit_transfer_layout = QtWidgets.QHBoxLayout()
+        btn_import_kit = QtWidgets.QPushButton("Import kit")
+        btn_import_kit.setMinimumHeight(20)
+        btn_import_kit.clicked.connect(self.importCalibrationKit)
+        btn_export_kit = QtWidgets.QPushButton("Export kit")
+        btn_export_kit.setMinimumHeight(20)
+        btn_export_kit.clicked.connect(self.exportCalibrationKit)
+        kit_transfer_layout.addWidget(btn_import_kit)
+        kit_transfer_layout.addWidget(btn_export_kit)
+        cal_kit_layout.addLayout(kit_transfer_layout)
+        cal_standard_layout.addWidget(self.cal_kit_box)
         self.cal_standard_save_box = QtWidgets.QGroupBox("Saved settings")
         cal_standard_save_layout = QtWidgets.QVBoxLayout(
             self.cal_standard_save_box
@@ -296,6 +360,604 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.open_touchstone = None
         self.short_touchstone = None
         self.load_touchstone = None
+
+        # The legacy "Calibration standards" keys, in the order they are
+        # shown; kits are written into and read back from these fields.
+        self.coefficientFields = {
+            "ShortL0": self.short_l0_input,
+            "ShortL1": self.short_l1_input,
+            "ShortL2": self.short_l2_input,
+            "ShortL3": self.short_l3_input,
+            "ShortDelay": self.short_length,
+            "OpenC0": self.open_c0_input,
+            "OpenC1": self.open_c1_input,
+            "OpenC2": self.open_c2_input,
+            "OpenC3": self.open_c3_input,
+            "OpenDelay": self.open_length,
+            "LoadR": self.load_resistance,
+            "LoadL": self.load_inductance,
+            "LoadC": self.load_capacitance,
+            "LoadDelay": self.load_length,
+            "ThroughDelay": self.through_length,
+        }
+
+        self._pending_element: (
+            tuple[object, dict[str, str], object, str, str] | None
+        ) = None
+        self._kit_load_error = ""
+        self.kit_library = KitLibrary()
+        try:
+            self.kit_library.load()
+        except (CalibrationKitError, OSError) as exc:
+            # A broken library file must not stop the calibration window
+            # from opening; it is reported by the selector detail label.
+            logger.warning(
+                "Could not read the calibration kit library: %s", exc
+            )
+            self._kit_load_error = str(exc)
+        self.migrateLegacyStandards()
+        self.refreshKitSelector()
+
+    # -- calibration health (CAL-02) -----------------------------------
+    def _buildHealthGroup(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Calibration age and verification")
+        layout = QtWidgets.QFormLayout(group)
+        self.health_age_label = QtWidgets.QLabel("No calibration applied")
+        self.health_age_label.setWordWrap(True)
+        layout.addRow("Age:", self.health_age_label)
+        self.health_metadata_label = QtWidgets.QLabel("")
+        self.health_metadata_label.setWordWrap(True)
+        layout.addRow("Made with:", self.health_metadata_label)
+
+        self.operator_input = QtWidgets.QLineEdit()
+        self.operator_input.setPlaceholderText("Optional")
+        self.operator_input.editingFinished.connect(self.operatorEdited)
+        layout.addRow("Operator:", self.operator_input)
+
+        self.reminder_input = QtWidgets.QDoubleSpinBox()
+        self.reminder_input.setRange(0.0, 8760.0)
+        self.reminder_input.setDecimals(1)
+        self.reminder_input.setSuffix(" h")
+        self.reminder_input.setSpecialValueText("Off")
+        self.reminder_input.setToolTip(
+            "Remind me after this long. There is no fixed age at which a"
+            " calibration expires, so this is off until you choose one."
+        )
+        self.reminder_input.setValue(
+            float(
+                self.app.settings.value(
+                    "CalibrationAgeReminderHours",
+                    DEFAULT_REMINDER_HOURS,
+                    type=float,
+                )
+            )
+        )
+        self.reminder_input.valueChanged.connect(self.reminderChanged)
+        layout.addRow("Remind after:", self.reminder_input)
+
+        self.verify_standard_input = QtWidgets.QComboBox()
+        for name in VERIFIABLE_STANDARDS:
+            self.verify_standard_input.addItem(name.capitalize(), name)
+        layout.addRow("Connected standard:", self.verify_standard_input)
+
+        self.verify_tolerance_input = QtWidgets.QDoubleSpinBox()
+        self.verify_tolerance_input.setRange(0.001, 2.0)
+        self.verify_tolerance_input.setDecimals(3)
+        self.verify_tolerance_input.setSingleStep(0.005)
+        self.verify_tolerance_input.setToolTip(
+            "Largest accepted |ΔΓ| between the corrected standard and the"
+            " model this calibration assumes. Your pass/fail threshold, not"
+            " an uncertainty."
+        )
+        self.verify_tolerance_input.setValue(
+            float(
+                self.app.settings.value(
+                    "CalibrationVerifyTolerance", DEFAULT_TOLERANCE, type=float
+                )
+            )
+        )
+        layout.addRow("Tolerance:", self.verify_tolerance_input)
+
+        self.verify_button = QtWidgets.QPushButton("Sweep and verify")
+        self.verify_button.clicked.connect(self.verifyConnectedStandard)
+        layout.addRow(self.verify_button)
+        self.health_verification_label = QtWidgets.QLabel("Not verified")
+        self.health_verification_label.setWordWrap(True)
+        layout.addRow("Result:", self.health_verification_label)
+        self._verification_pending: (
+            tuple[str, object, float, Calibration, int] | None
+        ) = None
+        return group
+
+    def refreshHealth(self) -> None:
+        """Show age, metadata and verification, each in its own row."""
+        calibration = self.app.calibration
+        age = self.app.calibration_age_now()
+        self.health_age_label.setText(
+            "No calibration applied" if age is None else age.describe()
+        )
+        metadata = calibration.metadata
+        self.health_metadata_label.setText(
+            metadata.describe() or "Not recorded"
+        )
+        if self.operator_input.text() != metadata.operator:
+            self.operator_input.setText(metadata.operator)
+        results = [
+            calibration.verifications[name].describe()
+            for name in VERIFIABLE_STANDARDS
+            if name in calibration.verifications
+        ]
+        self.health_verification_label.setText(
+            "\n".join(results) if results else "Not verified"
+        )
+
+    def recordMetadata(self) -> None:
+        """Note what a calibration measured here was measured with.
+
+        A loaded file keeps what it recorded: the device connected now is not
+        evidence of which one measured those standards.
+        """
+        calibration = self.app.calibration
+        if not calibration.measured_here:
+            return
+        device = self.app.vna
+        calibration.metadata = replace(
+            calibration.metadata,
+            device=device.name if device.connected() else "",
+            operator=self.operator_input.text().strip(),
+        )
+
+    def operatorEdited(self) -> None:
+        calibration = self.app.calibration
+        calibration.metadata = replace(
+            calibration.metadata, operator=self.operator_input.text().strip()
+        )
+        self.refreshHealth()
+
+    def reminderChanged(self, hours: float) -> None:
+        self.app.settings.setValue("CalibrationAgeReminderHours", float(hours))
+        self.refreshHealth()
+        self.app.refreshCoverage()
+
+    def verifyConnectedStandard(self) -> None:
+        """Sweep the connected standard, then check it (see ``_verified``)."""
+        if self._verification_pending is not None:
+            return
+        problem = ""
+        if not self.app.calibration.isCalculated:
+            problem = "Apply a calibration before verifying it."
+        elif not self.app.vna.connected():
+            problem = "Connect a device to re-measure the standard."
+        elif self.app.worker.isRunning():
+            problem = "Stop the running sweep before verifying."
+        elif self.app.sweep.properties.mode == SweepMode.CONTINOUS:
+            problem = "Verification needs a single sweep, not a continuous one."
+        if problem:
+            self.health_verification_label.setText(problem)
+            return
+        tolerance = float(self.verify_tolerance_input.value())
+        self.app.settings.setValue("CalibrationVerifyTolerance", tolerance)
+        token = object()
+        self._verification_pending = (
+            str(self.verify_standard_input.currentData()),
+            token,
+            tolerance,
+            self.app.calibration,
+            self.app.calibration.revision,
+        )
+        self.app.worker.signals.run_request_finished.connect(self._verified)
+        self.app.worker.bind_next_run(token)
+        self.health_verification_label.setText("Measuring...")
+        self.app.sweep_start()
+        if not self.app.worker.isRunning():
+            # Refused, for example because the automation service holds the
+            # device.  An unused token must not attach to some later run.
+            self.app.worker.bind_next_run(None)
+            self._endVerification()
+            self.refreshHealth()
+
+    def _endVerification(self) -> None:
+        self._verification_pending = None
+        self.app.worker.signals.run_request_finished.disconnect(self._verified)
+
+    def _verified(self, terminal, token) -> None:
+        pending = self._verification_pending
+        if pending is None or token is not pending[1]:
+            return
+        standard, _token, tolerance, calibration, revision = pending
+        self._endVerification()
+        if terminal is not SweepState.COMPLETED:
+            self.health_verification_label.setText(
+                f"The {standard} sweep did not complete, so nothing was"
+                " verified."
+            )
+            return
+        if (
+            self.app.calibration is not calibration
+            or calibration.revision != revision
+        ):
+            self.health_verification_label.setText(
+                "The calibration changed during the sweep, so this result"
+                " does not describe it. Verify again."
+            )
+            return
+        capture = self.app.worker.capture
+        snapshot = self.app._live_snapshot
+        try:
+            result = verify_standard(
+                capture.calibration,
+                standard,
+                snapshot.raw.get("S11", ()),
+                tolerance=tolerance,
+                simulated=snapshot.simulated,
+            )
+        except VerificationError as exc:
+            self.health_verification_label.setText(str(exc))
+            return
+        calibration.verifications[standard] = result
+        self.refreshHealth()
+
+    # -- calibration kit library ---------------------------------------
+    def migrateLegacyStandards(self):
+        """Show the saved "Calibration standards" entries as kits.
+
+        The legacy ``QSettings`` array is read only: entries become
+        in-memory kits so they can be applied and exported with the same
+        code as any other kit.  The settings themselves are never written,
+        moved or deleted, so an older build keeps seeing its standards.
+        """
+
+        self.kit_library.clear_transient()
+        settings = self.app.settings
+        count = settings.beginReadArray("CalibrationStandards")
+        try:
+            entries = []
+            for index in range(count):
+                settings.setArrayIndex(index)
+                entries.append(
+                    (
+                        settings.value("Name", ""),
+                        {
+                            key: settings.value(key)
+                            for key in (
+                                "ShortL0",
+                                "ShortL1",
+                                "ShortL2",
+                                "ShortL3",
+                                "ShortDelay",
+                                "OpenC0",
+                                "OpenC1",
+                                "OpenC2",
+                                "OpenC3",
+                                "OpenDelay",
+                                "LoadR",
+                                "LoadL",
+                                "LoadC",
+                                "LoadDelay",
+                                "ThroughDelay",
+                            )
+                        },
+                    )
+                )
+        finally:
+            settings.endArray()
+
+        for index, (name, values) in enumerate(entries):
+            if not str(name).strip():
+                logger.warning(
+                    "Skipping saved calibration standard %d: it has no name",
+                    index,
+                )
+                continue
+            try:
+                kit = kit_from_legacy_values(str(name), values)
+            except CalibrationKitError as exc:
+                logger.warning(
+                    "Skipping saved calibration standard %r: %s", name, exc
+                )
+                continue
+            self.kit_library.register_transient(kit)
+
+    def reloadLegacyKits(self):
+        """Re-read the saved standards after the legacy array changed."""
+
+        self.migrateLegacyStandards()
+        self.refreshKitSelector()
+
+    def refreshKitSelector(self):
+        """Rebuild the kit list, keeping the current choice when possible."""
+
+        previous = self.cal_kit_selector.currentText()
+        self.cal_kit_selector.blockSignals(True)
+        try:
+            self.cal_kit_selector.clear()
+            for kit in self.kit_library.all_kits():
+                self.cal_kit_selector.addItem(kit.name)
+            index = self.cal_kit_selector.findText(previous)
+            if index < 0:
+                index = self.cal_kit_selector.findText(BUILTIN_NAMES[0])
+            if index >= 0:
+                self.cal_kit_selector.setCurrentIndex(index)
+        finally:
+            self.cal_kit_selector.blockSignals(False)
+        self.kitComboSync()
+
+    def kitComboSync(self):
+        """Keep the detail label and the button states in step."""
+
+        kit = self.currentKit()
+        if self._kit_load_error:
+            self.cal_kit_detail.setText(
+                f"Calibration kit library unreadable: {self._kit_load_error}"
+            )
+        elif kit is None:
+            self.cal_kit_detail.setText("No calibration kit selected")
+        else:
+            suffix = (
+                "" if kit.source != "legacy-settings" else " (saved settings)"
+            )
+            self.cal_kit_detail.setText(f"{kit.describe()}{suffix}")
+        builtin = kit is not None and kit.name in BUILTIN_NAMES
+        editable = kit is not None and not builtin
+        self.kitSaveButton.setEnabled(kit is not None)
+        self.kitRenameButton.setEnabled(editable)
+        self.kitDeleteButton.setEnabled(editable)
+        self.kitApplyButton.setEnabled(kit is not None)
+
+    def currentKit(self) -> CalibrationKit | None:
+        name = self.cal_kit_selector.currentText()
+        if not name:
+            return None
+        return self.kit_library.get(name)
+
+    def kitSelected(self, _index: int):
+        self.kitComboSync()
+
+    def _kitButtonFor(self, kit: CalibrationKit):
+        """The standard-source radio button that matches ``kit``."""
+        models = {
+            kit.standards[name].model for name in ("short", "open", "load")
+        }
+        if models == {MODEL_IDEAL}:
+            return self.use_ideal_values
+        if models == {MODEL_FILE}:
+            return self.use_s1p_files
+        return self.use_coefficients
+
+    def applyCalibrationKit(self):
+        """Install the selected kit and recalculate through ``calculate()``.
+
+        The element built from the kit is handed to :meth:`calculate`, which
+        keeps its exact stored coefficients instead of re-reading them from
+        the decimal text fields.  Editing any coefficient field drops the
+        pending element, so a hand-edited field always wins from then on.
+        """
+
+        kit = self.currentKit()
+        if kit is None:
+            return
+        try:
+            element = kit.apply_to(
+                self.app.calibration,
+                base_dir=os.path.dirname(self.kit_library.filename),
+            )
+        except CalibrationKitError as exc:
+            self.app.showError(f"Cannot apply the calibration kit: {exc}")
+            return
+        self.app.calibration.metadata = replace(
+            self.app.calibration.metadata,
+            kit=kit.name,
+            connector=" ".join(
+                part
+                for part in (kit.connector.type, kit.connector.sex)
+                if part and part != "unknown"
+            ),
+        )
+        self.populateStandardsFromKit(kit, element)
+        button = self._kitButtonFor(kit)
+        button.setChecked(True)
+        self.calStandardChanged(button)
+        self._pending_element = (
+            element,
+            {
+                key: field.text()
+                for key, field in self.coefficientFields.items()
+            },
+            button,
+            kit.name,
+            kit.calibration_identity(),
+        )
+        self.calculate()
+
+    def populateStandardsFromKit(
+        self, kit: CalibrationKit, element=None
+    ) -> None:
+        """Show the kit's coefficients in the standard entry fields."""
+
+        if element is None:
+            element = kit.to_cal_element(
+                base_dir=os.path.dirname(self.kit_library.filename)
+            )
+        for legacy_key, value in legacy_values(kit).items():
+            self.coefficientFields[legacy_key].setText(formatCoefficient(value))
+        for standard_name in ("short", "open", "load"):
+            setattr(
+                self,
+                f"{standard_name}_touchstone",
+                getattr(element, f"{standard_name}_touchstone", None)
+                if kit.standards[standard_name].model == MODEL_FILE
+                else None,
+            )
+
+    def pendingCalElement(self):
+        """The exact element an applied kit produced, if still valid.
+
+        Returns ``None`` once any coefficient field or the standard-source
+        radio button no longer matches what the kit produced, so a manual
+        edit is never silently overridden.
+        """
+
+        pending = self._pending_element
+        if pending is None:
+            return None
+        element, texts, button, _name, _identity = pending
+        current = {
+            key: field.text() for key, field in self.coefficientFields.items()
+        }
+        if current != texts or self.radio_group.checkedButton() is not button:
+            self._pending_element = None
+            return None
+        return element
+
+    def saveCalibrationKit(self):
+        kit = self.currentKit()
+        if kit is None:
+            return
+        default_name = (
+            kit.name if kit.name not in BUILTIN_NAMES else f"{kit.name} copy"
+        )
+        name, accepted = QtWidgets.QInputDialog.getText(
+            self, "Save calibration kit", "Kit name", text=default_name
+        )
+        if not accepted or not name.strip():
+            return
+        name = name.strip()
+        if name in BUILTIN_NAMES:
+            self.app.showError(
+                f"{name!r} is a built-in kit name. Choose another name."
+            )
+            return
+        replace = False
+        if self.kit_library.get(name) is not None:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Replace calibration kit?",
+                f"A calibration kit named {name!r} already exists. Replace it?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            replace = True
+        candidate = CalibrationKit.from_cal_element(
+            self.app.calibration.cal_element,
+            name=name,
+            description=kit.description,
+            connector=kit.connector,
+            reference_impedance=kit.reference_impedance,
+            valid_span=kit.valid_span,
+            source="user",
+            base_dir=os.path.dirname(self.kit_library.filename),
+        )
+        try:
+            self.kit_library.add(candidate, replace=replace)
+            self.kit_library.save()
+        except (CalibrationKitError, OSError) as exc:
+            self.app.showError(f"Could not save the calibration kit: {exc}")
+            return
+        self.refreshKitSelector()
+        self.cal_kit_selector.setCurrentText(name)
+        self.kitComboSync()
+
+    def duplicateCalibrationKit(self):
+        kit = self.currentKit()
+        if kit is None:
+            return
+        name, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "Duplicate calibration kit",
+            "New kit name",
+            text=f"{kit.name} copy",
+        )
+        if not accepted or not name.strip():
+            return
+        try:
+            copy = self.kit_library.duplicate(kit.name, name.strip())
+            self.kit_library.save()
+        except (CalibrationKitError, OSError) as exc:
+            self.app.showError(
+                f"Could not duplicate the calibration kit: {exc}"
+            )
+            return
+        self.refreshKitSelector()
+        self.cal_kit_selector.setCurrentText(copy.name)
+        self.kitComboSync()
+
+    def renameCalibrationKit(self):
+        kit = self.currentKit()
+        if kit is None:
+            return
+        name, accepted = QtWidgets.QInputDialog.getText(
+            self, "Rename calibration kit", "New kit name", text=kit.name
+        )
+        if not accepted or not name.strip() or name.strip() == kit.name:
+            return
+        try:
+            renamed = self.kit_library.rename(kit.name, name.strip())
+            self.kit_library.save()
+        except (CalibrationKitError, OSError) as exc:
+            self.app.showError(f"Could not rename the calibration kit: {exc}")
+            return
+        if self.app.calibration.kit_name == kit.name:
+            self.app.calibration.kit_name = renamed.name
+        self.refreshKitSelector()
+        self.cal_kit_selector.setCurrentText(renamed.name)
+        self.kitComboSync()
+
+    def deleteCalibrationKit(self):
+        kit = self.currentKit()
+        if kit is None:
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Delete calibration kit?",
+            f"Delete the calibration kit {kit.name!r}?",
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            removed = self.kit_library.delete(kit.name)
+            if removed:
+                self.kit_library.save()
+        except (CalibrationKitError, OSError) as exc:
+            self.app.showError(f"Could not delete the calibration kit: {exc}")
+            return
+        self.refreshKitSelector()
+
+    def importCalibrationKit(self):
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import calibration kit",
+            "",
+            "Calibration kit files (*.json *.calkit);;All files (*.*)",
+        )
+        if not filename:
+            return
+        try:
+            kits = self.kit_library.import_file(filename)
+            self.kit_library.save()
+        except (CalibrationKitError, OSError) as exc:
+            self.app.showError(f"Could not import the calibration kit: {exc}")
+            return
+        self.refreshKitSelector()
+        if kits:
+            self.cal_kit_selector.setCurrentText(kits[0].name)
+            self.kitComboSync()
+
+    def exportCalibrationKit(self):
+        kit = self.currentKit()
+        if kit is None:
+            return
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export calibration kit",
+            f"{kit.name}.json",
+            "Calibration kit files (*.json *.calkit);;All files (*.*)",
+        )
+        if not filename:
+            return
+        try:
+            self.kit_library.export_kit(kit.name, filename)
+        except (CalibrationKitError, OSError) as exc:
+            self.app.showError(f"Could not export the calibration kit: {exc}")
 
     def checkExpertUser(self):
         if not self.app.settings.value("ExpertCalibrationUser", False, bool):
@@ -392,6 +1054,7 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.app.settings.sync()
         self.listCalibrationStandards()
         self.cal_standard_save_selector.setCurrentText(name)
+        self.reloadLegacyKits()
 
     def loadCalibrationStandard(self):
         if self.cal_standard_save_selector.currentData() == -1:
@@ -426,6 +1089,9 @@ class CalibrationWindow(QtWidgets.QWidget):
         )
 
         self.app.settings.endArray()
+        self.reloadLegacyKits()
+        self.cal_kit_selector.setCurrentText(str(name))
+        self.kitComboSync()
 
     def deleteCalibrationStandard(self):
         if self.cal_standard_save_selector.currentData() == -1:
@@ -523,6 +1189,7 @@ class CalibrationWindow(QtWidgets.QWidget):
 
         self.app.settings.sync()
         self.listCalibrationStandards()
+        self.reloadLegacyKits()
 
     def reset(self):
         self.app.calibration = Calibration()
@@ -531,9 +1198,11 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.calibration_status_label.setText("Device calibration")
         self.calibration_source_label.setText("Device")
         self.notes_textedit.clear()
+        self.refreshHealth()
         self.short_touchstone = None
         self.open_touchstone = None
         self.load_touchstone = None
+        self._pending_element = None
 
         if len(self.app.worker.rawData11) > 0:
             # There's raw data, so we can get corrected data
@@ -566,6 +1235,54 @@ class CalibrationWindow(QtWidgets.QWidget):
             )
             self.app.worker.signals.updated.emit()
 
+    def fillIdealStandards(self, cal_element) -> None:
+        """Describe all four standards as ideal."""
+
+        cal_element.short_state = "IDEAL"
+        cal_element.open_state = "IDEAL"
+        cal_element.load_state = "IDEAL"
+        cal_element.through_is_ideal = True
+
+    def fillCoefficientStandards(self, cal_element) -> None:
+        """Read the coefficient entry fields into ``cal_element``.
+
+        The divisors are the ones the fields are labelled with (e-12 H,
+        e-15 F, ps) and are the only place where the displayed unit is
+        applied.
+        """
+
+        cal_element.short_state = "COEFF"
+        cal_element.open_state = "COEFF"
+        cal_element.load_state = "COEFF"
+        cal_element.through_is_ideal = False
+        for standard, key, legacy_key, divisor, _default in COEFFICIENT_FIELDS:
+            setattr(
+                cal_element,
+                f"{standard}_{key}",
+                getFloatValue(self.coefficientFields[legacy_key].text())
+                / divisor,
+            )
+
+    def fillFileStandards(self, cal_element) -> None:
+        """Use the selected Touchstone files for the measured standards."""
+
+        cal_element.short_state = "IDEAL"
+        cal_element.open_state = "IDEAL"
+        cal_element.load_state = "IDEAL"
+        if self.short_touchstone is not None:
+            cal_element.short_state = "FILE"
+            cal_element.short_touchstone = self.short_touchstone
+        if self.open_touchstone is not None:
+            cal_element.open_state = "FILE"
+            cal_element.open_touchstone = self.open_touchstone
+        if self.load_touchstone is not None:
+            cal_element.load_state = "FILE"
+            cal_element.load_touchstone = self.load_touchstone
+        cal_element.through_is_ideal = False
+        cal_element.through_length = (
+            getFloatValue(self.through_length.text()) / 1.0e12
+        )
+
     def calculate(self):
         cal_element = self.app.calibration.cal_element
         if self.app.sweep_control.btn_stop.isEnabled():
@@ -582,81 +1299,21 @@ class CalibrationWindow(QtWidgets.QWidget):
             )
             return
 
-        cal_element.short_state = "IDEAL"
-        cal_element.open_state = "IDEAL"
-        cal_element.load_state = "IDEAL"
-        cal_element.through_is_ideal = True
-
-        # TODO: all ideal or not?
-        if self.radio_group.checkedButton() == self.use_coefficients:
-            cal_element.short_state = "COEFF"
-            cal_element.open_state = "COEFF"
-            cal_element.load_state = "COEFF"
-            cal_element.through_is_ideal = False
-
-            # We are using custom calibration standards
-
-            cal_element.short_l0 = (
-                getFloatValue(self.short_l0_input.text()) / 1.0e12
-            )
-            cal_element.short_l1 = (
-                getFloatValue(self.short_l1_input.text()) / 1.0e24
-            )
-            cal_element.short_l2 = (
-                getFloatValue(self.short_l2_input.text()) / 1.0e33
-            )
-            cal_element.short_l3 = (
-                getFloatValue(self.short_l3_input.text()) / 1.0e42
-            )
-            cal_element.short_length = (
-                getFloatValue(self.short_length.text()) / 1.0e12
-            )
-
-            cal_element.open_c0 = (
-                getFloatValue(self.open_c0_input.text()) / 1.0e15
-            )
-            cal_element.open_c1 = (
-                getFloatValue(self.open_c1_input.text()) / 1.0e27
-            )
-            cal_element.open_c2 = (
-                getFloatValue(self.open_c2_input.text()) / 1.0e36
-            )
-            cal_element.open_c3 = (
-                getFloatValue(self.open_c3_input.text()) / 1.0e45
-            )
-            cal_element.open_length = (
-                getFloatValue(self.open_length.text()) / 1.0e12
-            )
-
-            cal_element.load_r = getFloatValue(self.load_resistance.text())
-            cal_element.load_l = (
-                getFloatValue(self.load_inductance.text()) / 1.0e12
-            )
-            cal_element.load_c = (
-                getFloatValue(self.load_capacitance.text()) / 1.0e15
-            )
-            cal_element.load_length = (
-                getFloatValue(self.load_length.text()) / 1.0e12
-            )
-
-            cal_element.through_length = (
-                getFloatValue(self.through_length.text()) / 1.0e12
-            )
+        pending = self.pendingCalElement()
+        if pending is not None:
+            # An applied kit already describes the standards exactly; keep
+            # its element rather than re-deriving the coefficients from the
+            # text fields, which cannot represent every stored value.
+            cal_element = pending
+            self.app.calibration.cal_element = cal_element
+        elif self.radio_group.checkedButton() == self.use_coefficients:
+            self.fillCoefficientStandards(cal_element)
         elif self.radio_group.checkedButton() == self.use_s1p_files:
-            if self.short_touchstone is not None:
-                cal_element.short_state = "FILE"
-                cal_element.short_touchstone = self.short_touchstone
-            if self.open_touchstone is not None:
-                cal_element.open_state = "FILE"
-                cal_element.open_touchstone = self.open_touchstone
-            if self.load_touchstone is not None:
-                cal_element.load_state = "FILE"
-                cal_element.load_touchstone = self.load_touchstone
-            cal_element.through_is_ideal = False
-            cal_element.through_length = (
-                getFloatValue(self.through_length.text()) / 1.0e12
-            )
+            self.fillFileStandards(cal_element)
+        else:
+            self.fillIdealStandards(cal_element)
 
+        self.recordMetadata()
         logger.debug("Attempting calibration calculation.")
         try:
             self.app.calibration.calc_corrections()
@@ -703,6 +1360,7 @@ class CalibrationWindow(QtWidgets.QWidget):
             )
             self.reset()
             return
+        self.refreshHealth()
         self.app.sweep_control.update_text()
 
     def loadCalibration(self):

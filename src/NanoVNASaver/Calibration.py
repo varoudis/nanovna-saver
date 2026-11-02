@@ -23,12 +23,18 @@ import math
 import os
 import re
 from collections import UserDict, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence
 
 import numpy as np
 from scipy.interpolate import interp1d
 
+from .CalibrationHealth import (
+    CalibrationMetadata,
+    StandardVerification,
+    split_metadata,
+    utc_now,
+)
 from .RFTools import Datapoint
 from .Touchstone import Touchstone
 
@@ -482,6 +488,26 @@ class Calibration:
         self.cal_element = CalElement()
         self.interp = {}
         self.isCalculated = False
+        #: Where the calibration data came from, as shown by the window.
+        self.source = ""
+        #: Name and content digest of the calibration kit whose standards
+        #: were applied (CAL-01).  A name alone is not evidence of accuracy,
+        #: so the digest of the actual coefficients/span is recorded too.
+        #: Both stay ``""`` for device and legacy calibrations.
+        self.kit_name = ""
+        self.kit_identity = ""
+        #: When and with what the standards were measured (CAL-02).  Empty
+        #: for a file from an older version, whose age stays unknown.
+        self.metadata = CalibrationMetadata()
+        #: True once a standard was measured here rather than read from a
+        #: file, which is the only case the current device may be recorded.
+        self.measured_here = False
+        #: Latest verification per standard.  Held in memory only: a result
+        #: says what was connected at that moment, not what a file contains.
+        self.verifications: dict[str, StandardVerification] = {}
+        #: Counts changes to the corrections, so a result computed from one
+        #: state cannot be attached after the calibration has moved on.
+        self.revision = 0
 
     def frozen_copy(self) -> "Calibration":
         """Return an independent copy of this calibration's current state.
@@ -499,11 +525,15 @@ class Calibration:
         frozen.cal_element = copy.deepcopy(self.cal_element)
         frozen.interp = dict(self.interp)
         frozen.notes = list(self.notes)
+        frozen.verifications = dict(self.verifications)
         return frozen
 
     def insert(self, name: str, data: list[Datapoint]):
         for dp in data:
             self.dataset.insert(name, dp)
+        self.metadata = replace(self.metadata, created=utc_now())
+        self.measured_here = True
+        self.verifications = {}
 
     def size(self) -> int:
         return len(self.dataset.frequencies())
@@ -591,6 +621,10 @@ class Calibration:
 
         self.gen_interpolation()
         self.isCalculated = True
+        # New corrections, possibly from new standard definitions on the same
+        # measured data, so nothing verified before applies to them.
+        self.verifications = {}
+        self.revision += 1
         logger.debug("Calibration correctly calculated.")
 
     def gamma_short(self, freq: int) -> complex:
@@ -873,15 +907,29 @@ class Calibration:
                     f"got {len(value)}"
                 )
 
+    def to_text(self) -> str:
+        """The calibration file's content, with its metadata as a comment."""
+        note = self.metadata.to_note()
+        self.dataset.notes = "\n".join(
+            [*self.notes, note] if note else self.notes
+        )
+        return str(self.dataset)
+
+    def from_text(self, text: str) -> None:
+        self.dataset = CalDataSet().from_str(text)
+        self.metadata, self.notes = split_metadata(
+            self.dataset.notes.splitlines()
+        )
+        self.measured_here = False
+        self.verifications = {}
+
     def save(self, filename: str):
-        self.dataset.notes = "\n".join(self.notes)
         if not self.isValid1Port():
             raise ValueError("Not a valid calibration")
         with open(filename, mode="w", encoding="utf-8") as calfile:
-            calfile.write(str(self.dataset))
+            calfile.write(self.to_text())
 
     def load(self, filename):
         self.source = os.path.basename(filename)
         with open(filename, encoding="utf-8") as calfile:
-            self.dataset = CalDataSet().from_str(calfile.read())
-            self.notes = self.dataset.notes.splitlines()
+            self.from_text(calfile.read())

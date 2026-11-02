@@ -300,19 +300,31 @@ class SweepControl(Control):
             )
         self.label_progress.setText(" · ".join(parts))
 
-    def show_calibration_status(self, coverage, source: str = "unknown"):
+    def show_calibration_status(
+        self, coverage, source: str = "unknown", age=None
+    ):
         """Concise calibration status for the main window (CAL-02.1/02.4)."""
         if coverage is None:
             self.label_calibration.setText("Calibration: unknown")
             self.label_calibration.setToolTip("")
             return
         text = f"Calibration: {coverage.describe()} · correction on {source}"
-        self.label_calibration.setText(text)
-        self.label_calibration.setToolTip(
+        tooltip = (
             "Coverage shows where calibration corrections are interpolated"
             " or held at a span edge. It is not an uncertainty estimate and"
             " says nothing about calibration age or connector condition."
         )
+        if age is not None:
+            # Beside coverage, never merged into it: a reminder is a prompt
+            # the operator set up, not a measurement of anything.
+            text += f" · {age.describe()}"
+            tooltip += (
+                " Age is the time since the standards were measured, and any"
+                " reminder is the interval you chose in the Calibration"
+                " window. Neither is an accuracy statement."
+            )
+        self.label_calibration.setText(text)
+        self.label_calibration.setToolTip(tooltip)
 
     def show_idle(self, message: str = "") -> None:
         """Reset the progress display after a run ends."""

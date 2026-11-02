@@ -31,6 +31,11 @@ from .About import VERSION
 from .Analysis.Results import AnalysisKind
 from .Calibration import Calibration
 from .CalibrationCoverage import coverage_from_calibration
+from .CalibrationHealth import (
+    DEFAULT_REMINDER_HOURS,
+    CalibrationAge,
+    calibration_age,
+)
 from .ChartLimits import apply_chart_limits
 from .Charts import (
     CapacitanceChart,
@@ -1143,9 +1148,26 @@ class NanoVNASaver(QWidget):
         for chart in self.subscribing_charts:
             chart.setCoverage(coverage)
         self.sweep_control.show_calibration_status(
-            coverage, self._correction_source_label()
+            coverage,
+            self._correction_source_label(),
+            self.calibration_age_now(),
         )
         self.refresh_marker_coverage()
+
+    def calibration_age_now(self) -> CalibrationAge | None:
+        """Age of the calibration in use, or ``None`` when there is none."""
+        if not self.calibration.isCalculated:
+            return None
+        return calibration_age(
+            self.calibration.metadata.created,
+            reminder_hours=float(
+                self.settings.value(
+                    "CalibrationAgeReminderHours",
+                    DEFAULT_REMINDER_HOURS,
+                    type=float,
+                )
+            ),
+        )
 
     def refresh_marker_coverage(self) -> None:
         """State coverage at the active marker (CAL-02.3).
@@ -1684,11 +1706,8 @@ class NanoVNASaver(QWidget):
         calibration = self.calibration
         if not getattr(calibration, "isValid1Port", lambda: False)():
             return {}
-        dataset = getattr(calibration, "dataset", None)
-        if dataset is None:
-            return {}
         try:
-            return {"loaded.cal": str(dataset)}
+            return {"loaded.cal": calibration.to_text()}
         except Exception:  # unrepresentable calibration stays out of the file
             logger.warning("Unable to serialize the calibration", exc_info=True)
             return {}
@@ -2087,8 +2106,7 @@ class NanoVNASaver(QWidget):
             return
         calibration = Calibration()
         try:
-            calibration.dataset = calibration.dataset.from_str(text)
-            calibration.notes = calibration.dataset.notes.splitlines()
+            calibration.from_text(text)
             calibration.calc_corrections()
         except (ValueError, KeyError, IndexError):
             logger.warning(

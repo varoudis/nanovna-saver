@@ -42,6 +42,7 @@ from typing import Iterable, Sequence
 
 from .Analysis.Results import AnalysisResult
 from .CalibrationCoverage import CoverageResult, CoverageState
+from .CalibrationHealth import calibration_age
 from .Limits import LimitEvaluation, LimitSet, Metric, Verdict
 from .Measurement import (
     S11,
@@ -876,6 +877,17 @@ def render_html(model: ReportModel, *, include_plots: bool = True) -> str:
                 f"{html.escape(trace.coverage.describe())}"
                 f" (calibrated {trace.coverage.calibrated_start} Hz to"
                 f" {trace.coverage.calibrated_end} Hz)</p>"
+            )
+        calibration = trace.snapshot.provenance.calibration
+        if calibration is not None and calibration.available:
+            # Measured against this run's own time, so reopening an old
+            # session reports the age the data had, not the age it has now.
+            age = calibration_age(
+                calibration.created, now=trace.snapshot.provenance.created
+            )
+            parts.append(
+                '<p class="meta">Calibration when swept: '
+                f"{html.escape(age.describe())}</p>"
             )
         parts.append(_trace_table(trace))
         limit_table = _limit_table(trace)
