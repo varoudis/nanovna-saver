@@ -29,6 +29,13 @@ from scipy.constants import speed_of_light  # type: ignore
 from scipy.signal import convolve  # type: ignore
 
 from ..RFTools import Datapoint
+from ..TDRGating import (
+    GateKind,
+    TDRGatingError,
+    apply_gate,
+    to_frequency_domain,
+    to_time_domain,
+)
 from .Defaults import make_scrollable
 from .ui import get_window_icon
 
@@ -129,6 +136,18 @@ class TDRWindow(QtWidgets.QWidget):
         super().__init__()
         self.app = app
 
+        #: Why the gate could not be applied, or "" when it could.  Set
+        #: before any control can fire, so the status line never reads it
+        #: unset.
+        self.gate_error = ""
+        self.gate_result = None
+        #: What the legacy transform drew, kept so a gate can be compared
+        #: against the measured record instead of quietly replacing it.
+        self.ungated_td: npt.NDArray[np.complex128] | None = None
+        self.ungated_distance_axis: npt.NDArray[np.float64] | None = None
+        self.ungated_step_response_Z: npt.NDArray[np.float64] | None = None
+        #: Metadata of every trace currently drawn as an overlay.
+        self.overlay_metadata: list[dict[str, object]] = []
         self.td: npt.NDArray[np.complex128]
         self.windowed_s11: npt.NDArray[np.complex128]
         self.distance_axis: npt.NDArray[np.float64]
@@ -206,7 +225,176 @@ class TDRWindow(QtWidgets.QWidget):
 
         self.tdr_result_label = QtWidgets.QLabel()
         layout.addRow("Estimated cable length:", self.tdr_result_label)
+        layout.addRow(self._gating_group())
         layout.addRow(self.app.tdr_chart)
+
+    def _gating_group(self) -> QtWidgets.QGroupBox:
+        """Optional time gating, off by default.
+
+        Gating is a *derived* view: the measured samples are never replaced,
+        and the gated trace is labelled with the gate that produced it.  The
+        controls live here rather than in the chart so the gate can be
+        described in text alongside the plot.
+        """
+        group = QtWidgets.QGroupBox("Time gating (derived)")
+        form = QtWidgets.QFormLayout(group)
+
+        self.gate_enabled = QtWidgets.QCheckBox("Apply gate to the overlay")
+        self.gate_enabled.setToolTip(
+            "Adds a gated trace. The measured trace is always shown too."
+        )
+        self.gate_enabled.toggled.connect(self._refresh_gated_trace)
+        form.addRow(self.gate_enabled)
+
+        self.gate_kind = QtWidgets.QComboBox()
+        self.gate_kind.addItem("Keep band", GateKind.KEEP)
+        self.gate_kind.addItem("Bandstop", GateKind.BANDSTOP)
+        self.gate_kind.currentIndexChanged.connect(self._refresh_gated_trace)
+        form.addRow("Gate", self.gate_kind)
+
+        self.gate_window = QtWidgets.QComboBox()
+        for name in ("rectangular", "hann", "hamming", "blackman"):
+            self.gate_window.addItem(name, name)
+        self.gate_window.currentIndexChanged.connect(self._refresh_gated_trace)
+        form.addRow("Taper", self.gate_window)
+
+        row = QtWidgets.QHBoxLayout()
+        self.gate_start = QtWidgets.QDoubleSpinBox()
+        self.gate_start.setDecimals(3)
+        self.gate_start.setRange(0.0, 10000.0)
+        self.gate_start.setSuffix(" m")
+        self.gate_start.valueChanged.connect(self._refresh_gated_trace)
+        self.gate_stop = QtWidgets.QDoubleSpinBox()
+        self.gate_stop.setDecimals(3)
+        self.gate_stop.setRange(0.0, 10000.0)
+        self.gate_stop.setSuffix(" m")
+        self.gate_stop.valueChanged.connect(self._refresh_gated_trace)
+        row.addWidget(QtWidgets.QLabel("from"))
+        row.addWidget(self.gate_start, 1)
+        row.addWidget(QtWidgets.QLabel("to"))
+        row.addWidget(self.gate_stop, 1)
+        form.addRow("Band", row)
+
+        self.gate_edge = QtWidgets.QDoubleSpinBox()
+        self.gate_edge.setDecimals(3)
+        self.gate_edge.setRange(0.0, 1000.0)
+        self.gate_edge.setSuffix(" m")
+        self.gate_edge.setToolTip(
+            "Total raised-cosine transition width; 0 gives a rectangular"
+            " gate and the ringing that comes with it."
+        )
+        self.gate_edge.valueChanged.connect(self._refresh_gated_trace)
+        form.addRow("Transition", self.gate_edge)
+
+        self.gate_status = QtWidgets.QLabel("Gate off")
+        self.gate_status.setWordWrap(True)
+        form.addRow(self.gate_status)
+        return group
+
+    def gated_trace(self) -> tuple[Datapoint, ...]:
+        """The gated S11 trace, or empty when gating is off or impossible."""
+        if not self.gate_enabled.isChecked():
+            # Nothing is derived, and nothing may linger from a previous
+            # gate: a stale overlay would be drawn as if it were current.
+            self.gate_result = None
+            self.gate_error = ""
+            return ()
+        if len(self.app.data.s11) < MIN_DATA_LENGTH:
+            self.gate_result = None
+            return ()
+        self.gate_error = ""
+        try:
+            time_result = to_time_domain(
+                self.app.data.s11,
+                window=self.gate_window.currentData(),
+                velocity_factor=self._velocity_factor(),
+            )
+            start = self.gate_start.value()
+            # A stop past the end of the record cannot gate data the
+            # transform does not hold, so it is clamped to the record rather
+            # than silently producing a shorter trace.
+            stop = min(self.gate_stop.value(), time_result.max_distance)
+            edge = min(self.gate_edge.value(), max(stop - start, 0.0))
+            gated = apply_gate(
+                time_result,
+                kind=self.gate_kind.currentData(),
+                start_distance=start,
+                stop_distance=stop,
+                edge=edge,
+            )
+            trace = to_frequency_domain(gated)
+        except (TDRGatingError, ValueError) as exc:
+            # A gate the data cannot support is reported in full, not drawn.
+            # The commonest case is a sweep that does not start at DC: the
+            # lowpass impulse response needs a DC sample, and silently gating
+            # such a grid gives a trace that is not an identity even for a
+            # full-record gate (measured: 3e-4 residual against the 6e-18 of
+            # a DC grid).
+            self.gate_error = str(exc)
+            self.gate_result = None
+            return ()
+        self.gate_result = gated
+        return trace
+
+    def _velocity_factor(self) -> float:
+        try:
+            return float(self.tdr_velocity_input.text())
+        except ValueError:
+            return 1.0
+
+    def overlay_points(self) -> list[tuple[float, float]]:
+        """The gate weight profile as ``(chart index, weight)``.
+
+        The gate and the chart sit on different grids: the gate has one bin
+        per sample of its own record, while the chart's FFT is much longer.
+        So each bin is placed by its distance, on the chart's axis, and a
+        chart index may fall between two of the chart's samples.
+
+        The *weights* are plotted, not the gated amplitude, deliberately.
+        ``TDRGating`` normalises so an on-grid echo reads its true
+        coefficient, while the window's legacy transform uses a different
+        normalisation (measured on one sweep: peak 0.497 against 0.006).
+        Drawing those two on one axis would invent a comparison that is not
+        in the data.  A weight is dimensionless, so it means the same thing
+        in either normalisation and shows exactly which distances were kept.
+        """
+        gated = getattr(self, "gate_result", None)
+        axis = getattr(self, "distance_axis", None)
+        if gated is None or axis is None or len(axis) < 2:
+            return []
+        # ``distance_axis`` is round-trip and the gate's step is one-way.
+        chart_step = float(axis[1] - axis[0]) / 2
+        source = gated.source
+        last_index = float(len(axis) - 1)
+        points = []
+        for index, weight in enumerate(gated.gate):
+            distance = index * source.distance_step
+            position = distance / chart_step
+            # The record is circular: later bins are negative distances.
+            if distance > source.max_distance or position > last_index:
+                break
+            points.append((position, float(weight)))
+        return points
+
+    def _refresh_gated_trace(self) -> None:
+        trace = self.gated_trace()
+        self.app.tdr_chart.overlay = self.overlay_points()
+        if self.gate_error:
+            self.gate_status.setText(f"Gate not applied: {self.gate_error}")
+        elif not self.gate_enabled.isChecked():
+            self.gate_status.setText("Gate off")
+        elif trace:
+            self.gate_status.setText(
+                f"{len(trace)} samples,"
+                f" {self.gate_kind.currentText().lower()}"
+                f" {self.gate_start.value():g}-{self.gate_stop.value():g} m,"
+                f" {self.gate_window.currentData()} taper"
+            )
+        else:
+            self.gate_status.setText(
+                "The gate could not be applied to this sweep."
+            )
+        self.updated.emit()
 
     def updateFormat(self):
         self.app.tdr_chart.resetDisplayLimits()
@@ -316,6 +504,9 @@ class TDRWindow(QtWidgets.QWidget):
             Datapoint(0, 0.0, 0.0)
         ]  # A bit of cheating otherwise the super().wheelEvent() exits
         # without doing anything.
+        # The gate belongs to *this* sweep.  Re-evaluate it here rather than
+        # leaving a stale overlay describing the previous measurement.
+        self._refresh_gated_trace()
         self.updated.emit()
 
     def _tdr_lowpass(self, tdr_format, s11, tdr_window) -> np.ndarray:

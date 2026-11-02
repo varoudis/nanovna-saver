@@ -18,6 +18,8 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
 import math
+from itertools import pairwise
+from typing import ClassVar
 
 import numpy as np
 from PySide6.QtCore import QPoint, QRect, Qt
@@ -65,9 +67,16 @@ class TDRChart(Chart):
     fixed_values: bool = False
     marker_location: int = -1
 
+    #: A gated trace drawn over the measured one, as ``(index, value)``
+    #: pairs into ``tdrWindow.distance_axis``.  Empty when gating is off.
+    #: Kept separate from ``data``/``td`` so the measured record is never
+    #: replaced by a derived one.
+    overlay: ClassVar[list[tuple[int, float]]] = []
+
     def __init__(self, name) -> None:
         super().__init__(name)
         self.tdrWindow: QDialog = QDialog()
+        self.overlay = []
 
         self.bottomMargin = 25
         self.topMargin = 20
@@ -572,6 +581,7 @@ class TDRChart(Chart):
                 if self.isPlotable(p):
                     qp.drawPoint(p)
 
+        self._draw_overlay(height, width, min_index, x_step, qp)
         self._draw_max_point(height, x_step, y_step, min_index, qp)
 
         if self.marker_location != -1:
@@ -607,6 +617,47 @@ class TDRChart(Chart):
             self.drawDragbog(qp)
 
         qp.end()
+
+    def _draw_overlay(
+        self, height: int, width: int, min_index: int, x_step: float, qp
+    ) -> None:
+        """Draw the gate weight profile over the measured trace.
+
+        The profile is dimensionless (1 = kept, 0 = rejected), so it gets its
+        own fixed vertical mapping: weight 0 on the baseline, weight 1 at the
+        top of the plot.  It deliberately shares no scale with the
+        impulse-response curve, because the two normalisations differ.
+        """
+        if not self.overlay or not hasattr(self.tdrWindow, "td"):
+            return
+        max_index = min(
+            int(max(index for index, _ in self.overlay)) + 1,
+            len(self.tdrWindow.td),
+        )
+        if max_index <= min_index or height <= 0:
+            return
+
+        pen = QPen(Chart.color.sweep_secondary)
+        pen.setWidth(self.dim.line if self.flag.draw_lines else self.dim.point)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        qp.setPen(pen)
+        baseline = self.topMargin + height
+        points = [
+            QPoint(
+                self.leftMargin + int((index - min_index) / x_step),
+                baseline - int(min(max(weight, 0.0), 1.0) * height),
+            )
+            for index, weight in self.overlay
+            if min_index <= index < max_index
+        ]
+        if self.flag.draw_lines:
+            for first, second in pairwise(points):
+                if self.isLinePlotable(first, second):
+                    qp.drawLine(first, second)
+        else:
+            for point in points:
+                if self.isPlotable(point):
+                    qp.drawPoint(point)
 
     def valueAtPosition(self, y: int) -> float:
         if hasattr(self.tdrWindow, "td"):
