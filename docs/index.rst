@@ -31,6 +31,7 @@ Contents
 
    Overview <readme>
    Contributions & Help <contributing>
+   Workflow guides <guides>
    License <license>
    Authors <authors>
    Module Reference <api/modules>

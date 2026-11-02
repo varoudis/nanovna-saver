@@ -5,6 +5,10 @@ covers sessions, traces, comparison, calibration coverage, presets, reports,
 and the export placeholders, and it is the manual counterpart of the automated
 checks in `tests/`.
 
+New to the project? [FEATURES.md](FEATURES.md) lists each workflow with the
+button that opens it and the document that describes it; this page is the
+single end-to-end run through them.
+
 Everything here uses the built-in simulator. Data produced that way is always
 labelled: the window title gains `[SIMULATED: <scenario>]`, Touchstone exports
 carry a `! NanoVNASaver export: SIMULATED DATA ...` comment that survives a
@@ -14,22 +18,31 @@ simulated sweep as a device measurement.
 ## 1. Start the simulator
 
 1. Open the connection panel.
-2. Tick **Simulated device** and choose a scenario:
-   * `antenna` — a 14.15 MHz resonance, no S21;
-   * `filter` — a 5th-order Butterworth low-pass, fc = 100 MHz;
-   * `cable` — a 10 m line, velocity factor 0.66;
-   * `attenuator` — a flat −3 dB pad.
-3. Connect. No serial port is opened and no hardware is touched.
+2. Tick **Simulated device (demo)** and choose a scenario in the **Scenario**
+   combo:
+   * **Antenna resonance** — a 14.15 MHz resonance, 50 Ω radiation
+     resistance, Q = 20; reflection-only, its S21 channel is identically
+     zero rather than a transmission measurement;
+   * **Butterworth low-pass filter** — 5th order, fc = 100 MHz;
+   * **Coaxial cable** — a 10 m line, velocity factor 0.66, 10 dB/100 m at
+     100 MHz;
+   * **Fixed attenuator** — a flat 3 dB pad with 30 dB return loss;
+   * **Touchstone replay (file)** — see [REPLAY.md](REPLAY.md); press
+     **Choose replay file ...** first.
+3. Press **Connect to device**. No serial port is opened and no hardware is
+   touched.
 
 ## 2. Sweep
 
-Set the sweep span, then start a sweep.
+Set the sweep span in the **Start** / **Stop** / **Center** / **Span** fields
+(or pick a preset), then press **Sweep** (Ctrl+W).
 
-* The state indicator moves through preparing, measuring, averaging,
-  retrying, and finally complete, cancelled, or failed.
+* The state label moves through `Idle`, `Preparing`, `Measuring`,
+  `Averaging`, `Retrying`, and finally `Completed`, `Cancelled` or `Failed`.
 * Progress shows the completed segment and average, plus an estimate once
   enough of the sweep has run.
-* **Cancel** stops the run. A cancelled sweep is never shown as a
+* **Stop** (Esc) requests cancellation and returns immediately; the label
+  passes through `Cancelling`. A cancelled sweep is never shown as a
   measurement: the display either returns to the last complete sweep and says
   so, or is emptied and labelled.
 * A failed sweep reports the device's own error rather than leaving stale
@@ -49,22 +62,28 @@ Coverage is a span statement. It says nothing about calibration age,
 connector wear, or measurement uncertainty, and must not be read as an error
 bar. See `DEVELOPMENT.md` for the full list of what it cannot establish.
 
+The correction itself is applied in bulk per segment; see
+[CALIBRATION_BULK.md](CALIBRATION_BULK.md) for what changed and what did not.
+
 ## 4. Captured traces
 
-Use **Trace control**:
+Use the trace panel below the charts:
 
 * **Capture current sweep** freezes the displayed measurement as a new trace.
-* **Import file** adds a Touchstone file (`s1p`/`s2p`) as an imported trace.
-* Rename, hide (the checkbox), reorder, and delete any trace.
-* **Use as reference** marks one trace as the comparison reference.
+* **Import file ...** adds a Touchstone file (`s1p`/`s2p`) as an imported
+  trace.
+* **Rename ...**, **Delete**, **Move up**, **Move down**, and the visibility
+  checkbox next to each trace.
+* **Use as reference** marks the selected trace as the comparison reference.
 
-Four or more traces can be shown together on the frequency plots, each with
-its own color in the chart legend. TDR currently displays a single trace; the
+Several traces can be shown together on the frequency plots, each with its
+own color in the chart legend. TDR currently displays a single trace; the
 trace panel states this limitation rather than silently ignoring the extras.
 
 ## 5. Comparison
 
-Pick a trace and a reference, then choose how to compare:
+Pick a trace and a reference, then choose how to compare in the **Compare**
+combo:
 
 * magnitude in dB,
 * phase in degrees,
@@ -81,7 +100,9 @@ frequency, so a delta is never attributed to the wrong curve.
 
 ## 6. Sessions
 
-* **New / Open / Save / Save As** live in the session window.
+* **New session**, **Open session ...**, **Save session** and
+  **Save session as ...** live in the session window, with the recent-session
+  list and the recovery state below them.
 * A session is a ZIP of JSON files (see `SESSION_FORMAT.md`); there is no
   pickle and members are read by name, so a corrupted archive fails cleanly.
 * Saving captures every trace with its own name, color, and provenance,
@@ -95,7 +116,8 @@ frequency, so a delta is never attributed to the wrong curve.
 ## 7. Presets
 
 Presets capture a sweep configuration plus the charts and analyses that suit
-it. Three built-ins ship: Antenna, Filter, and Cable.
+it. Three built-ins ship: **Antenna tuning**, **Filter testing** and
+**Cable testing**.
 
 * Applying a preset only changes settings; it never connects or sweeps.
 * A preset whose span or point count the connected device cannot support is
@@ -105,8 +127,9 @@ it. Three built-ins ship: Antenna, Filter, and Cable.
 
 ## 8. Antenna tuning
 
-**Antenna tuning ...** is a guided overview -> minimum -> zoom -> repeat ->
-export workflow. See `ANTENNA_TUNING.md` for the full description.
+**Antenna tuning ...** in the main window's button grid is a guided overview
+-> minimum -> zoom -> repeat -> export workflow. See
+[ANTENNA_TUNING.md](ANTENNA_TUNING.md) for the full description.
 
 * The overview sweep runs inside the device range with a supported point
   count, then reports the lowest **measured** VSWR sample and places a marker
@@ -135,6 +158,9 @@ Each trace carries its provenance labels in the report: simulated status,
 completeness, calibration state, one-port data, and whether correction was
 applied and by what. Read those before comparing two traces.
 
+**Manage limits ...** opens the same limits window described above, so a
+report can be built with its verdicts already frozen into it.
+
 ### Reading an incomplete two-port report
 
 A forward-only measurement has S11 and S21 but no S12/S22. The report says so
@@ -161,6 +187,9 @@ self-contained and prints correctly from a browser.
   export never leaves a truncated file behind.
 * The simulation marker is re-read when the file is loaded again.
 
+Provenance is written into every export; [FEATURES.md](FEATURES.md) lists
+every surface on which simulated data is labelled.
+
 ## 11. What this walkthrough does not verify
 
 * Any physical device: accuracy, calibration validity, protocol quirks, or
@@ -171,3 +200,6 @@ self-contained and prints correctly from a browser.
 
 Those remain hardware and platform acceptance items and are recorded as
 unverified rather than assumed.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the command-by-command matrix of
+what has been verified on which platform.

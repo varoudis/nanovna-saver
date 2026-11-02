@@ -52,7 +52,8 @@ Current features
 * Reading data from a TinySA
 * Splitting a frequency range into multiple segments to increase resolution
   (tried up to >10k points)
-* Averaging data for better results particularly at higher frequencies
+* Averaging repeated sweeps and segmenting a frequency span; averaged and
+  smoothed traces are separate, labelled results, not "more accurate" data
 * Displaying data on multiple chart types, such as Smith, LogMag, Phase and
   VSWR-charts, for both S11 and S21
 * Displaying markers, and the impedance, VSWR, Q, equivalent
@@ -69,6 +70,17 @@ Current features
   standards
 * Customizable display options, including "dark mode"
 * Exporting images of plotted values
+* Explicit measurement limits: versioned JSON limit sets with PASS, FAIL and
+  UNAVAILABLE verdicts that can be frozen into a report
+* Antenna tuning workflow: overview sweep, marker on the measured minimum,
+  zoom, repeat and one-port export
+* Sessions (``.nvsession``): a portable, versioned record of traces, markers,
+  charts, sweep settings and provenance, restorable without a device
+* Touchstone replay as a simulator scenario, for reproducing a known dataset
+  without hardware
+* Provenance on every capture (source, simulated status, device, version,
+  calibration and processing identity) that follows data into sessions,
+  reports and Touchstone comments
 
 Screenshot
 ^^^^^^^^^^
@@ -82,7 +94,24 @@ Screenshot
 Running the application
 -----------------------
 
-Main development is currently done on Linux (Debian 11)
+The application is a Python 3.10+ program and needs no VNA hardware to start:
+tick ``Simulated device (demo)`` in the connection panel to explore it. Qt is
+not installed separately - PySide6 comes from the project's locked
+dependencies.
+
+From a source checkout:
+
+.. code-block:: sh
+
+   git clone https://github.com/NanoVNA-Saver/nanovna-saver
+   cd nanovna-saver
+   uv sync --locked
+   uv run task ui-compile
+   uv run NanoVNASaver
+
+``uv run task ui-compile`` is the only working resource-compilation command.
+A package install with ``pipx install
+git+https://github.com/NanoVNA-Saver/nanovna-saver`` also works.
 
 Installation
 ------------
@@ -90,10 +119,18 @@ Installation
 Binary releases
 ^^^^^^^^^^^^^^^
 
-You can find current binary releases for Windows, Linux under
-https://github.com/NanoVNA-Saver/nanovna-saver/releases/latest
+Current binary releases for Windows and Linux are published as GitHub release
+assets. macOS builds are produced locally with ``./build-macos-app.sh``.
 
 `Detailed installation instructions <docs/INSTALLATION.md>`_
+
+.. Note::
+
+   Release binaries are built by the ``release_win.yml`` and
+   ``release_linux.yml`` workflows; there is no macOS release workflow, so a
+   macOS bundle is built from source. Binaries are unsigned and are not a
+   substitute for reproducing a problem from a source checkout.
+
 
 Using the software
 ------------------
@@ -103,9 +140,10 @@ port box.  If the NanoVNA is connected before the application starts, it should
 be automatically detected. Otherwise, click "Rescan". Click "Connect to device"
 to connect.
 
-The app can collect multiple segments to get more accurate measurements. Enter
-the number of segments to be done in the "Segments" box. Each segment is 101
-data points, and takes about 1.5 seconds to complete.
+The app can split a span into several segments to collect more frequency
+samples. Enter the number of segments to be done in the "Segments" box. Each
+device segment is 101 data points and takes roughly 1.5 seconds. More segments
+mean a finer grid, not a more accurate measurement.
 
 Frequencies are entered in Hz, or suffixed with k or M.  Scientific notation
 (6.5e6 for 6.5MHz) also works.
@@ -180,25 +218,49 @@ The "Limits" window loads versioned JSON limit sets and checks captured
 traces against them.  A limit set describes frequency bands and the bounds a
 measurement has to satisfy inside them, for example a maximum S11 VSWR, a
 minimum S11 return loss in dB, or a maximum S21 insertion loss in dB.  Bounds
-are inclusive and are only evaluated at measured samples.  Coverage is checked
-against the acquisition settings recorded in the snapshot: the capture must
-hold exactly the grid those settings declare, so a missing, clustered-missing
-or duplicated sample makes the check UNAVAILABLE.  Without recorded settings
-the check falls back to the captured spacing itself, so logarithmic and
-multi-segment sweeps are handled normally while a genuinely missing sample or
-chunk still makes the check UNAVAILABLE.
+are inclusive and are only evaluated at measured samples.
 
 Each check reports PASS, FAIL or UNAVAILABLE; the last means the question
 could not be decided (missing S-parameter channel, band not covered by the
 sweep, incomplete acquisition or an invalid sample) and is never treated as a
 pass.  Report previews and HTML/CSV exports freeze the selected limit set
 together with its results, so a later measurement or a different selection
-cannot change an already built report.  An infinite VSWR from a total
-reflection is a real measurement: it is exported as ``inf`` rather than as an
-empty value.
+cannot change an already built report.
 
 The file format is documented in `docs/LIMIT_SETS.md <docs/LIMIT_SETS.md>`_,
-with a working example in ``tests/data/example.nvlimits``.
+with working examples in ``tests/data/example.nvlimits`` (schema version 1)
+and ``tests/data/example_v2.nvlimits``.
+
+More features
+^^^^^^^^^^^^^
+
+`docs/FEATURES.md <docs/FEATURES.md>`_ is the index of the newer workflows,
+each with its own document:
+
+* `Touchstone replay <docs/REPLAY.md>`_ - run against a recorded ``s1p`` or
+  ``s2p`` instead of a device, with no extrapolation.
+* `Antenna tuning <docs/ANTENNA_TUNING.md>`_ - guided overview, minimum,
+  zoom, repeat and one-port export.
+* `Sessions <docs/SESSION_FORMAT.md>`_ - a versioned ``.nvsession`` archive of
+  traces, markers, charts, sweep settings and provenance.
+* `Processing pipeline <docs/PROCESSING.md>`_ - opt-in, ordered corrections
+  recorded in provenance; smoothing and averaging change a measurement rather
+  than improving it.
+* `Bulk calibration correction <docs/CALIBRATION_BULK.md>`_ - the per-segment
+  correction path used by the sweep worker.
+* `Offline walkthrough <docs/OFFLINE_WALKTHROUGH.md>`_ - the whole application
+  exercised with the built-in simulator.
+
+Current restrictions, stated so no feature description overstates them: only
+S11 and S21 are acquired (S12 and S22 are never measured, which is different
+from measuring zero); replaying an ``s1p`` file provides S11 only, with no
+fabricated S21; an S2P export writes a channel the measurement never had as an
+explicit zero placeholder named in the file comments; PDF reports are not
+implemented (HTML and CSV are); TDR shows a single trace.
+Provenance: every capture records source, simulated status, device,
+application version, calibration and processing identity, and simulated data
+is labelled ``[SIMULATED: <scenario>]`` in the window title and with
+``SIMULATED DATA`` in exported Touchstone comments.
 
 Latest Changes
 ^^^^^^^^^^^^^^
@@ -216,8 +278,11 @@ make the open-source community such an amazing place to learn, inspire, and
 create. Any contributions you make will benefit everybody else and are
 **greatly appreciated**.
 
-Please read `our contribution guidelines <docs/CONTRIBUTING.md>`_\ , and thank
-you for being involved!
+Please read `our contribution guidelines <docs/CONTRIBUTING.md>`_. They
+contain the environment setup, the test and lint commands, the documentation
+build, the packaging steps and an explicit list of what has and has not been
+verified on which platform. A short reStructuredText summary is also part of
+the Sphinx documentation.
 
 License
 -------
