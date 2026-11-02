@@ -19,6 +19,7 @@
 """SIM-01: deterministic simulated device, verified against known physics."""
 
 import math
+import time
 
 import pytest
 
@@ -194,6 +195,26 @@ class TestSimulatedDevice:
     @staticmethod
     def test_reference_impedance_is_documented():
         assert SimulatedDevice("antenna").reference_impedance == 50.0
+
+    @staticmethod
+    def test_nominal_latency_is_charged_once_per_read():
+        """NEXT-02: ``latency`` costs one wait per ``read_channel`` call."""
+        device = SimulatedDevice("filter", latency=0.01)
+        device.set_sweep(1_000_000, 2_000_000, 5)
+        start = time.monotonic()
+        device.read_channel("data 0")
+        device.read_channel("data 1")
+        elapsed = time.monotonic() - start
+        # Lower bound only: two reads pay two latencies, and a generous
+        # upper bound keeps a loaded machine from failing the test.
+        assert elapsed >= 0.018
+        assert elapsed < 2 * 0.01 + 1.0
+
+    @staticmethod
+    @pytest.mark.parametrize("bad", [-0.1, math.nan, math.inf])
+    def test_impossible_latency_is_rejected(bad):
+        with pytest.raises(ValueError, match="latency"):
+            SimulatedDevice("antenna", latency=bad)
 
 
 class TestFaults:

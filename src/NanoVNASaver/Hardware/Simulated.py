@@ -29,6 +29,22 @@ language (``sweep``, ``frequencies``, ``data 0``, ``data 1``, ``version``,
 the ASCII protocol devices, without any bytes crossing a pipe.  That keeps
 command parsing exercised and makes fault injection possible at the same
 seam (SIM-03).
+
+Timing contract (NEXT-02)
+-------------------------
+``latency`` is the nominal cost of **one data read**: a whole
+``data <n>`` command, i.e. one :meth:`SimulatedDevice.read_channel` call.
+It is *not* charged per sample and *not* per sweep, and it is validated to
+be a finite number ``>= 0`` (``ValueError`` otherwise).  The delay never
+draws from the seeded random stream, so the same seed yields exactly the
+same samples for any latency.
+
+Fault modes that already own the timing of a read replace the nominal
+latency instead of being stacked on top of it: ``FaultMode.SLOW`` sleeps
+its per-sample ``slow_delay`` and ``FaultMode.TIMEOUT`` sleeps the
+transport ``timeout`` before raising, so in both cases the configured
+latency adds nothing.  A pending nominal delay is delivered in short
+slices so :meth:`SimulatedDevice.close` can interrupt it.
 """
 
 from __future__ import annotations
@@ -39,7 +55,7 @@ import random
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from time import sleep
+from time import monotonic, sleep
 from typing import Sequence
 
 from ..utils import Version
@@ -57,6 +73,25 @@ from .SimulatedScenarios import (
 logger = logging.getLogger(__name__)
 
 SIMULATED_COMMENT = "SIMULATED"
+
+#: Longest uninterrupted nominal-latency sleep; a longer delay is delivered
+#: in further slices so ``SimulatedDevice.close()`` can interrupt it.
+DELAY_SLICE = 0.01
+
+
+def _validated_latency(value: float) -> float:
+    """Return ``value`` as a finite, non-negative latency, or raise."""
+    try:
+        latency = float(value)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            f"latency must be a finite number >= 0, got {value!r}"
+        ) from err
+    if not math.isfinite(latency):
+        raise ValueError(f"latency must be a finite number >= 0, got {value!r}")
+    if latency < 0:
+        raise ValueError(f"latency must be >= 0, got {value!r}")
+    return latency
 
 
 class FaultMode(Enum):
@@ -85,12 +120,27 @@ class FaultMode(Enum):
     """Succeeds for N data reads, then behaves as ``EMPTY_SAMPLES``."""
 
     SLOW = "slow"
-    """Adds ``slow_delay`` seconds to every data read."""
+    """Sleeps ``slow_delay`` seconds per sample (a read waits per point).
+
+    A slow read already owns its timing, so the nominal device ``latency``
+    is not added on top of ``slow_delay``.
+    """
+
+
+#: Fault modes that already own the timing of a read.  The nominal device
+#: ``latency`` is never stacked on top of them (NEXT-02).
+TIMED_FAULTS = frozenset({FaultMode.SLOW, FaultMode.TIMEOUT})
 
 
 @dataclass
 class FaultConfig:
-    """Fault injection configuration; kept separate from demo settings."""
+    """Fault injection configuration; kept separate from demo settings.
+
+    ``slow_delay`` is charged once per sample (per frequency point) by
+    ``FaultMode.SLOW``; it is independent of the device-wide nominal
+    ``latency``, which is charged once per read.  When ``SLOW`` is active
+    the two are not stacked.
+    """
 
     mode: FaultMode = FaultMode.NONE
     fail_after_samples: int = 1
@@ -135,6 +185,9 @@ class SimulatedTransport:
     # ------------------------------------------------------------------
     # Transport API
     # ------------------------------------------------------------------
+    def __post_init__(self) -> None:
+        self.latency = _validated_latency(self.latency)
+
     def open(self) -> None:
         self.is_open = True
 
@@ -167,7 +220,25 @@ def _scenario_source_span(scenario: Scenario) -> SourceSpan | None:
 
 
 class SimulatedDevice:
-    """Command-level simulation of an ASCII-protocol NanoVNA."""
+    """Command-level simulation of an ASCII-protocol NanoVNA.
+
+    ``latency`` is the nominal cost of **one data read**: each
+    :meth:`read_channel` call pays it once, whatever the point count, so it
+    never multiplies with the sweep size.  The value must be finite and
+    ``>= 0`` (``ValueError`` otherwise, on construction and on assignment),
+    and it never consumes from the seeded random stream, so samples stay
+    byte-identical across latencies.  Fault modes listed in
+    :data:`TIMED_FAULTS` own the timing of a read and are never charged the
+    nominal latency on top of their own delay.
+
+    ``error_model`` optionally puts a 12-term error box between the ideal
+    scenario and the instrument, and ``reverse`` measures a two-port DUT
+    with its ports exchanged.  Both default to "off", and an identity box is
+    skipped entirely rather than evaluated, so the plain ideal path stays
+    bit-identical to what it was before either option existed.  Whatever is
+    switched on is named in :attr:`provenance_note` and
+    :meth:`simulation_state`, so simulated data never loses its label.
+    """
 
     name = "Simulated VNA"
     SANE_VERSION = "sim-1.0.0"
@@ -195,7 +266,7 @@ class SimulatedDevice:
         self.fault = fault or FaultConfig()
         self.seed = seed
         self.noise_floor = noise_floor
-        self.latency = latency
+        self._latency = _validated_latency(latency)
         self.sweep_max_freq_hz = sweep_max_freq_hz
         self._random = random.Random(seed)
         self._reads_served = 0
@@ -209,6 +280,15 @@ class SimulatedDevice:
     # ------------------------------------------------------------------
     # Identity
     # ------------------------------------------------------------------
+    @property
+    def latency(self) -> float:
+        """Nominal seconds charged once per data read (never per sample)."""
+        return self._latency
+
+    @latency.setter
+    def latency(self, value: float) -> None:
+        self._latency = _validated_latency(value)
+
     @property
     def scenario_key(self) -> str:
         """Canonical scenario name as offered by the demonstration mode."""
@@ -272,6 +352,25 @@ class SimulatedDevice:
     def features(self) -> set[str]:
         return {"Customizable data points", "Bandwidth"}
 
+    def _delay(self) -> None:
+        """Deliver the nominal latency this read owes, at most once."""
+        if self.fault.mode in TIMED_FAULTS:
+            # SLOW and TIMEOUT already own the timing of the read; adding
+            # the nominal latency would double-charge the caller.
+            return
+        self._sleep(self.latency)
+
+    def _sleep(self, seconds: float) -> None:
+        """Sleep ``seconds`` in slices, abandoned once the device closes."""
+        if seconds <= 0.0:
+            return
+        deadline = monotonic() + seconds
+        while not self._closed:
+            remaining = deadline - monotonic()
+            if remaining <= 0.0:
+                return
+            sleep(min(remaining, DELAY_SLICE))
+
     # ------------------------------------------------------------------
     # Acquisition
     # ------------------------------------------------------------------
@@ -333,6 +432,11 @@ class SimulatedDevice:
         ):
             raise IOError("simulated failure during averaging")
         self._reads_served += 1
+        # One data read costs one nominal latency, whatever the point count
+        # (NEXT-02); the seeded samples are untouched by the wait.
+        self._delay()
+        if self._closed:
+            raise IOError("simulated transport disconnected")
 
         grid = self.frequency_grid()
         samples = [self.sample(freq) for freq in grid]
@@ -414,7 +518,9 @@ class SimulatedVNA:
     """Drop-in replacement for ``VNA`` that wraps ``SimulatedDevice``.
 
     Deliberately a thin adapter: it exposes the exact members that the rest
-    of the application uses, and delegates all physics to the device.
+    of the application uses, and delegates all physics and timing to the
+    device.  ``latency`` therefore reaches the device unchanged and is
+    charged once per ``readValues`` call, exactly like ``read_channel``.
     """
 
     def __init__(  # noqa: PLR0913
