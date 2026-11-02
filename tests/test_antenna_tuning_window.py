@@ -200,10 +200,16 @@ class TestOverviewWorkflow:
     def test_marker_placement_can_be_switched_off(app, tuning, monkeypatch):
         run_synchronously(app, monkeypatch)
         tuning.chk_marker.setChecked(False)
-        app.markers[0].freq = 0
         enter_overview(tuning)
+        # A marker's indexed position is what the workflow would move; its
+        # reported frequency is derived from that position on every redraw,
+        # so the position is what must stay put.
+        marker = app.markers[0]
+        marker.location = 0
+        before = marker.location
         assert tuning.start_overview()
-        assert app.markers[0].freq == 0
+        assert marker.location == before
+        assert marker.location != tuning.measured_minimum().index
 
     @staticmethod
     def test_the_completed_sweep_is_exportable_and_complete(

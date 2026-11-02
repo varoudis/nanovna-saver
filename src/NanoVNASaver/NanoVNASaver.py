@@ -121,9 +121,16 @@ from .Windows.ui import get_window_icon
 logger = logging.getLogger(__name__)
 
 WORKING_KILL_TIME_MS = 10 * 1000
-#: Minimum gap between live chart repaints (TRACE-04.3).  Roughly one frame
-#: on a 60 Hz display; samples arriving faster are merged into the next paint.
-LIVE_REDRAW_INTERVAL_MS = 16
+#: Minimum gap between live chart repaints (TRACE-04.3/PERF-03).
+#:
+#: Measured on a 4001-point sweep with all 27 charts visible: one
+#: ``dataUpdated`` costs ~10 ms of model work, but repainting the charts it
+#: invalidates costs ~259 ms -- so a 16 ms timer would queue paints faster
+#: than they can be drawn and starve the GUI thread.  ~~~~50 ms keeps a live
+#: sweep visibly continuous (20 updates/s) while letting a repaint finish
+#: before the next one is scheduled.  It only ever merges repaints: samples
+#: and analysis are adopted immediately.
+LIVE_REDRAW_INTERVAL_MS = 50
 
 #: Trace id used for the measurement currently displayed, when it is not one
 #: of the captured traces.
@@ -275,6 +282,8 @@ class NanoVNASaver(QWidget):
         #: from displayed samples when this is available.
         self._live_snapshot = None
         self._redraw_timer: QtCore.QTimer | None = None
+        #: True while a coalesced repaint is owed but not yet drawn.
+        self._redraw_pending = False
         #: Session workflow state (SESSION-03.1).
         self.session = SessionState(title="Untitled")
         self._restoring = False
@@ -968,11 +977,13 @@ class NanoVNASaver(QWidget):
         self._schedule_redraw()
 
     def _schedule_redraw(self) -> None:
-        """Coalesce live redraws into one repaint (TRACE-04.3).
+        """Coalesce live redraws into one repaint (TRACE-04.3/PERF-03).
 
         Full-resolution data is kept for analysis and export; only the
-        repaints are merged, never the samples.
+        repaints are merged, never the samples.  A redraw that is already
+        pending absorbs this request, so a burst of samples costs one paint.
         """
+        self._redraw_pending = True
         if self._redraw_timer is None:
             self._redraw_timer = QtCore.QTimer(self)
             self._redraw_timer.setSingleShot(True)
@@ -982,7 +993,22 @@ class NanoVNASaver(QWidget):
             self._redraw_timer.start()
 
     def _flush_redraw(self) -> None:
+        self._redraw_pending = False
         self.dataUpdated()
+
+    def flush_pending_redraw(self) -> bool:
+        """Draw any coalesced repaint now, and report whether one was due.
+
+        A terminal state must never be left undrawn because it arrived
+        inside the coalescing window, so completion, cancellation and
+        failure all call this instead of waiting for the timer.
+        """
+        if not self._redraw_pending:
+            return False
+        if self._redraw_timer is not None:
+            self._redraw_timer.stop()
+        self._flush_redraw()
+        return True
 
     def sweepProgress(self, progress) -> None:
         """Render structured progress for the active sweep (SWEEP-04.1)."""
@@ -1019,6 +1045,10 @@ class NanoVNASaver(QWidget):
             self.sweep_control.show_idle("Failed")
             self._after_sweep = None  # a failure ends the chain
         self._sweep_had_data = False
+        # A terminal state inside the coalescing window must still be drawn:
+        # the timer alone would leave the last frame of a cancelled or
+        # failed sweep on screen until something else asked for a repaint.
+        self.flush_pending_redraw()
 
     def run_after_sweep(self, callback) -> None:
         """Run ``callback`` once after the next successful sweep.
