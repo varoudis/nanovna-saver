@@ -22,7 +22,14 @@ import serial
 from PySide6.QtGui import QPixmap
 
 from ..utils import Version
+from .CombinedScan import (
+    PATH_TRUSTED,
+    CombinedSweep,
+    one_shot_read,
+    parse_combined_reply,
+)
 from .Convert import get_argb32_pixmap
+from .ScanCapability import ScanPreferences
 from .Serial import Interface, drain_serial
 from .VNA import VNA
 
@@ -42,6 +49,13 @@ class NanoVNA(VNA):
         self.start, self.stop = self._get_running_frequencies()
         self.sweep_max_freq_hz = 300e6
         self._sweepdata: list[tuple[complex, complex]] = []
+        #: Channels produced by an accepted optimised read (PERF-02).
+        self._optimised_cache: dict[str, tuple[complex, ...]] = {}
+        self._optimised_path = PATH_TRUSTED
+        #: ``(start, stop, points)`` the cache was filled for.  Subclasses
+        #: (SV4401A, SV6301A) override ``setSweep``, so the cache cannot rely
+        #: on that call alone to notice a changed grid.
+        self._optimised_sweep: tuple[int, int, int] | None = None
 
     def _get_running_frequencies(self):
         logger.debug("Reading values: frequencies")
@@ -88,6 +102,8 @@ class NanoVNA(VNA):
     def setSweep(self, start, stop):
         self.start = start
         self.stop = stop
+        # A new sweep invalidates any samples cached by an optimised read.
+        self._optimised_cache = {}
         if self.sweep_method == "sweep":
             list(self.exec_command(f"sweep {start} {stop} {self.datapoints}"))
         elif self.sweep_method == "scan":
@@ -130,7 +146,85 @@ class NanoVNA(VNA):
                 self._sweepdata.append(
                     (complex(d[0], d[1]), complex(d[2], d[3]))
                 )
+        # A ``scan_mask`` read is this device's trusted path, not an
+        # optimisation: it has always returned both channels per sweep.
+        self.last_read_path = PATH_TRUSTED
         if value == "data 1":
             return [x[1] for x in self._sweepdata]
         # default to data 0
         return [x[0] for x in self._sweepdata]
+
+    # -- optimised reads (PERF-02) -------------------------------------
+    def read_values_optimised(
+        self, value: str, preferences: ScanPreferences | None = None
+    ) -> list[complex]:
+        """Read a channel, trying one masked text scan when opted in.
+
+        Only a driver whose firmware was *not* proven to answer
+        ``scan ... 0b110`` ever needs this: a ``scan_mask`` device already
+        reads one command for both channels in :meth:`readValues`, and is
+        left exactly as it is.  The masked attempt is validated whole by
+        :func:`parse_combined_reply`; on any doubt the sweep is re-read
+        channel by channel and the optimised reply is discarded.
+        """
+        self.last_read_path = PATH_TRUSTED
+        requested = self.scan_capability.requested(
+            preferences if preferences is not None else ScanPreferences()
+        )
+        if requested != "combined-text":
+            # Nothing was opted in for this driver: the trusted read runs
+            # untouched, exactly as it did before PERF-02.
+            self._optimised_path = PATH_TRUSTED
+            self._optimised_cache = {}
+            return self.readValues(value)
+        # A subclass may override ``setSweep`` without calling this class,
+        # so the cache is keyed on the sweep it was read for rather than
+        # cleared by a call that might never happen.
+        identity = (self.start, self.stop, self.datapoints)
+        if identity != self._optimised_sweep:
+            self._optimised_sweep = identity
+            self._optimised_cache = {}
+            self._optimised_path = PATH_TRUSTED
+        if value != "data 0":
+            cached = self._optimised_cache.get(value)
+            if cached is not None:
+                # A combined read already produced this channel; it is
+                # never re-read, and never replaced by zeros.
+                self.last_read_path = self._optimised_path
+                return list(cached)
+            return self.readValues(value)
+        command = f"scan {self.start} {self.stop} {self.datapoints} 0b110"
+        channels = ("data 0", "data 1")
+
+        def attempt() -> CombinedSweep:
+            return parse_combined_reply(
+                self.exec_command(command),
+                points=self.datapoints,
+                channels=channels,
+                frequencies=self.read_frequencies(),
+                start=self.start,
+                stop=self.stop,
+            )
+
+        outcome = one_shot_read(attempt, self._trusted_sweep)
+        self.last_read_path = outcome.path
+        self._optimised_path = outcome.path
+        self._optimised_cache = {}
+        if outcome.sweep is not None:
+            # Either the validated optimised sweep, or the trusted re-read
+            # that replaced it; both are complete, so the second channel
+            # never triggers another transaction.
+            for name in outcome.sweep.channels:
+                self._optimised_cache[name] = outcome.sweep.channel(name)
+            if value in self._optimised_cache:
+                return list(self._optimised_cache[value])
+        return self.readValues(value)
+
+    def _trusted_sweep(self) -> CombinedSweep:
+        """Re-read both channels the ordinary way, for ``one_shot_read``."""
+        grid = tuple(int(value) for value in VNA.read_frequencies(self))
+        return CombinedSweep(
+            frequencies=grid,
+            s11=tuple(VNA.readValues(self, "data 0")),
+            s21=tuple(VNA.readValues(self, "data 1")),
+        )

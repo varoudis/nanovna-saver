@@ -24,6 +24,12 @@ from PySide6 import QtGui
 
 from ..utils import Version
 from .Capability import SweepCapability
+from .CombinedScan import PATH_TRUSTED
+from .ScanCapability import (
+    ScanCapability,
+    ScanPreferences,
+    scan_capability_for,
+)
 from .Serial import Interface, drain_serial
 
 logger = logging.getLogger(__name__)
@@ -63,6 +69,10 @@ class VNA:
 
     # Must be initilized in child classes
     sweep_max_freq_hz = 0.0
+
+    #: Path the last read actually used: the trusted per-channel read
+    #: unless a driver opted into an optimisation (PERF-02).
+    last_read_path: str = PATH_TRUSTED
 
     def __init__(self, iface: Interface):
         self.serial = iface
@@ -209,7 +219,26 @@ class VNA:
             complex(*map(float, s.split())) for s in self.exec_command(value)
         ]
         logger.debug("VNA done reading %s (%d values)", value, len(result))
+        self.last_read_path = PATH_TRUSTED
         return result
+
+    # -- optimised reads (PERF-02) -------------------------------------
+    @property
+    def scan_capability(self) -> ScanCapability:
+        """How this device is read, per the audited driver matrix."""
+        return scan_capability_for(self)
+
+    def read_values_optimised(
+        self, value: str, preferences: ScanPreferences | None = None
+    ) -> list[complex]:
+        """Read ``value``, using an optimised path only when opted in.
+
+        The base implementation is the trusted per-channel read every
+        driver already implements, so a device that opts in for nothing
+        behaves exactly as it did before PERF-02.
+        """
+        self.last_read_path = PATH_TRUSTED
+        return self.readValues(value)
 
     def read_fw_version(self) -> Version:
         result = list(self.exec_command("version"))

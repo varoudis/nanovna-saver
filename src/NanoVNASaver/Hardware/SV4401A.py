@@ -46,7 +46,10 @@ class SV4401A(NanoVNA):
 
     def init_features(self) -> None:
         super().init_features()
-        self.features.remove("Scan mask command")
+        # The base class only adds the mask feature on firmware >= 0.7.1,
+        # but this device drives the plain ``scan`` command regardless of
+        # what the firmware reports, so the mask must go when it is there.
+        self.features.discard("Scan mask command")
         self.features.add("Scan command")
         self.sweep_method = "scan"
 

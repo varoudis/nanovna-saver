@@ -22,6 +22,14 @@ from struct import pack, unpack_from
 from time import sleep
 
 from ..utils import Version
+from .CombinedScan import (
+    PATH_TRUSTED,
+    CombinedSweep,
+    ShortDataError,
+    decode_scan_bin,
+    one_shot_read,
+)
+from .ScanCapability import ScanPreferences
 from .Serial import Interface
 from .VNA import VNA
 
@@ -111,6 +119,9 @@ class NanoVNA_V2(VNA):
         self.sweepStepHz = 1e6
 
         self._sweepdata: list[tuple[complex, complex]] = []
+        #: Channels produced by an accepted optimised read (PERF-02).
+        self._binary_cache: dict[str, tuple[complex, ...]] = {}
+        self._binary_path = PATH_TRUSTED
         self._updateSweep()
 
     def getCalibration(self) -> str:
@@ -174,71 +185,131 @@ class NanoVNA_V2(VNA):
 
         logger.debug("Freq index to: %i", freq_index)
 
+    def _read_fifo_payload(self, pointstodo: int) -> bytes | None:
+        """Read ``pointstodo`` raw 32-byte records from the FIFO.
+
+        ``None`` means the stream ran short: the transport is then out of
+        step, and nothing after it can be trusted.
+        """
+        timeout = self.serial.timeout
+        payload = b""
+        with self.serial.lock:
+            self.serial.write(pack("<Q", 0))
+            sleep(WRITE_SLEEP)
+            # cmd: write register 0x30 to clear FIFO
+            self.serial.write(pack("<BBB", _CMD_WRITE, _ADDR_VALUES_FIFO, 0))
+            sleep(WRITE_SLEEP)
+            # we read at most 255 values at a time and the time required
+            # empirically is just over 3 seconds for 101 points or
+            # 7 seconds for 255 points
+            self.serial.timeout = min(pointstodo, 255) * 0.035 + 0.1
+            remaining = pointstodo
+            while remaining > 0:
+                logger.info("reading values")
+                pointstoread = min(255, remaining)
+                # cmd: read FIFO, addr 0x30
+                self.serial.write(
+                    pack(
+                        "<BBB",
+                        _CMD_READFIFO,
+                        _ADDR_VALUES_FIFO,
+                        pointstoread,
+                    )
+                )
+                sleep(WRITE_SLEEP)
+                # each value is 32 bytes
+                nBytes = pointstoread * 32
+
+                # serial .read() will try to read nBytes bytes in
+                # timeout secs
+                arr = self.serial.read(nBytes)
+                if nBytes != len(arr):
+                    logger.warning(
+                        "expected %d bytes, got %d", nBytes, len(arr)
+                    )
+                    # the way to retry on timeout is keep the data
+                    # already read then try to read the rest of
+                    # the data into the array
+                    if nBytes > len(arr):
+                        arr = arr + self.serial.read(nBytes - len(arr))
+                if nBytes != len(arr):
+                    self.serial.timeout = timeout
+                    return None
+                payload += arr
+                remaining -= pointstoread
+        self.serial.timeout = timeout
+        return payload
+
     def readValues(self, value) -> list[complex]:
         # Actually grab the data only when requesting channel 0.
         # The hardware will return all channels which we will store.
         if value == "data 0":
             s21hack = 1 if "S21 hack" in self.features else 0
-            # reset protocol to known state
-            timeout = self.serial.timeout
-            with self.serial.lock:
-                self.serial.write(pack("<Q", 0))
-                sleep(WRITE_SLEEP)
-                # cmd: write register 0x30 to clear FIFO
-                self.serial.write(
-                    pack("<BBB", _CMD_WRITE, _ADDR_VALUES_FIFO, 0)
-                )
-                sleep(WRITE_SLEEP)
-                # clear sweepdata
-                self._sweepdata = [(complex(), complex())] * (
-                    self.datapoints + s21hack
-                )
-                pointstodo = self.datapoints + s21hack
-                # we read at most 255 values at a time and the time required
-                # empirically is just over 3 seconds for 101 points or
-                # 7 seconds for 255 points
-                self.serial.timeout = min(pointstodo, 255) * 0.035 + 0.1
-                while pointstodo > 0:
-                    logger.info("reading values")
-                    pointstoread = min(255, pointstodo)
-                    # cmd: read FIFO, addr 0x30
-                    self.serial.write(
-                        pack(
-                            "<BBB",
-                            _CMD_READFIFO,
-                            _ADDR_VALUES_FIFO,
-                            pointstoread,
-                        )
-                    )
-                    sleep(WRITE_SLEEP)
-                    # each value is 32 bytes
-                    nBytes = pointstoread * 32
-
-                    # serial .read() will try to read nBytes bytes in
-                    # timeout secs
-                    arr = self.serial.read(nBytes)
-                    if nBytes != len(arr):
-                        logger.warning(
-                            "expected %d bytes, got %d", nBytes, len(arr)
-                        )
-                        # the way to retry on timeout is keep the data
-                        # already read then try to read the rest of
-                        # the data into the array
-                        if nBytes > len(arr):
-                            arr = arr + self.serial.read(nBytes - len(arr))
-                    if nBytes != len(arr):
-                        return []
-
-                    self._read_pointstoread(pointstoread, arr)
-
-                    pointstodo = pointstodo - pointstoread
-            self.serial.timeout = timeout
-
+            pointstodo = self.datapoints + s21hack
+            # clear sweepdata
+            self._sweepdata = [(complex(), complex())] * pointstodo
+            payload = self._read_fifo_payload(pointstodo)
+            if payload is None:
+                self.last_read_path = PATH_TRUSTED
+                return []
+            self._read_pointstoread(pointstodo, payload)
             if s21hack:
                 self._sweepdata = self._sweepdata[1:]
 
+        self.last_read_path = PATH_TRUSTED
         idx = 1 if value == "data 1" else 0
         return [x[idx] for x in self._sweepdata]
+
+    # -- optimised reads (PERF-02) -------------------------------------
+    def read_values_optimised(
+        self, value: str, preferences: ScanPreferences | None = None
+    ) -> list[complex]:
+        """Read a channel, validating the FIFO frame when opted in.
+
+        The trusted read already parses the same bytes; the opt-in version
+        additionally rejects a frame whose records are misaligned, repeated
+        or of impossible magnitude, and re-reads the sweep instead of
+        publishing it.  The ``S21 hack`` firmware shifts the grid by one
+        point, so it is always read the trusted way.
+        """
+        self.last_read_path = PATH_TRUSTED
+        requested = self.scan_capability.requested(
+            preferences if preferences is not None else ScanPreferences()
+        )
+        if requested != "scan_bin" or "S21 hack" in self.features:
+            return self.readValues(value)
+        if value != "data 0":
+            cached = self._binary_cache.get(value)
+            if cached is not None:
+                self.last_read_path = self._binary_path
+                return list(cached)
+            return self.readValues(value)
+
+        def attempt() -> CombinedSweep:
+            payload = self._read_fifo_payload(self.datapoints)
+            if payload is None:
+                raise ShortDataError(
+                    f"{self.datapoints} FIFO records were not delivered"
+                )
+            return decode_scan_bin(payload, points=self.datapoints)
+
+        outcome = one_shot_read(attempt, self._trusted_sweep)
+        self.last_read_path = outcome.path
+        self._binary_path = outcome.path
+        self._binary_cache = {}
+        if outcome.sweep is not None:
+            for name in outcome.sweep.channels:
+                self._binary_cache[name] = outcome.sweep.channel(name)
+            if value in self._binary_cache:
+                return list(self._binary_cache[value])
+        return self.readValues(value)
+
+    def _trusted_sweep(self) -> CombinedSweep:
+        """Re-read both channels the ordinary way, for ``one_shot_read``."""
+        grid = tuple(int(value) for value in self.read_frequencies())
+        s11 = tuple(self.readValues("data 0"))
+        s21 = tuple(self.readValues("data 1"))
+        return CombinedSweep(frequencies=grid, s11=s11, s21=s21)
 
     def resetSweep(self, start: int, stop: int):
         self.setSweep(start, stop)
