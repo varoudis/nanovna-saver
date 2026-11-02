@@ -19,7 +19,7 @@
 import logging
 import platform
 from collections import namedtuple
-from time import sleep
+from time import monotonic, sleep
 
 import serial
 from serial.tools import list_ports
@@ -53,6 +53,24 @@ USBDEVICETYPES = (
 RETRIES = 3
 TIMEOUT = 0.2
 WAIT = 0.05
+
+#: Total budget (seconds) for enumerating and probing candidate interfaces.
+#: Probing an unresponsive port costs a drain/retry/read cycle per attempt
+#: (see :func:`detect_version`), so the scan is bounded instead of letting a
+#: wedged port block the caller for minutes.
+SCAN_BUDGET = 8.0
+
+
+def probe_deadline(budget: float | None) -> float | None:
+    """Turn a relative budget in seconds into an absolute deadline."""
+    if budget is None or budget <= 0:
+        return None
+    return monotonic() + float(budget)
+
+
+def deadline_expired(deadline: float | None) -> bool:
+    return deadline is not None and monotonic() >= deadline
+
 
 NAME2DEVICE = {
     "S-A-A-2": NanoVNA_V2,
@@ -100,10 +118,33 @@ def usb_typename(device: ListPortInfo) -> str:
 # Get list of interfaces with VNAs connected
 
 
-def get_interfaces() -> list[Interface]:
+def get_interfaces(
+    budget: float | None = SCAN_BUDGET, *, needs_comment: bool = True
+) -> list[Interface]:
+    """Enumerate NanoVNA-like serial ports, optionally identifying each one.
+
+    With ``needs_comment=True`` every candidate port is probed, i.e. opened
+    and asked what firmware it runs.  That is a blocking, hardware-bound
+    conversation, so the call belongs off the GUI thread; ``budget``
+    (seconds) bounds the whole scan and the interfaces found so far are
+    returned when it runs out, each already closed again, so a wedged port
+    cannot hang the caller.  ``None`` or ``0`` disables the bound.
+
+    With ``needs_comment=False`` only the port metadata reported by the OS
+    is collected: no port is opened, no device is touched, and the returned
+    :class:`Interface` objects carry only type, port and (empty) comment.
+    """
     interfaces = []
+    deadline = probe_deadline(budget) if needs_comment else None
     # serial like usb interfaces
     for d in list_ports.comports():
+        if needs_comment and deadline_expired(deadline):
+            logger.warning(
+                "Stopped scanning serial ports after %.1f s; %d found",
+                budget,
+                len(interfaces),
+            )
+            break
         if platform.system() == "Windows" and d.vid is None:
             d = _fix_v2_hwinfo(d)  # noqa: PLW2901
         if not (typename := usb_typename(d)):
@@ -117,13 +158,56 @@ def get_interfaces() -> list[Interface]:
         )
         iface = Interface("serial", typename)
         iface.port = d.device
-        iface.open()
-        iface.comment = get_comment(iface)
-        iface.close()
+        #: True only once a probe confirmed the firmware variant.
+        iface.probed = False
+        if needs_comment:
+            if not _probe_interface(iface, deadline):
+                continue
+            iface.probed = True
         interfaces.append(iface)
 
     logger.debug("Interfaces: %s", interfaces)
     return interfaces
+
+
+def list_serial_ports() -> list[Interface]:
+    """Enumerate candidate ports without opening or probing any of them.
+
+    This is the cheap, side effect free half of :func:`get_interfaces`: it
+    only asks the OS which ports exist, so it may be called on the GUI
+    thread.  The returned interfaces are marked ``probed = False``; a
+    consumer that needs the firmware variant either scans properly
+    (:func:`get_interfaces`, off the GUI thread) or probes the port it is
+    about to use.
+    """
+    return get_interfaces(needs_comment=False)
+
+
+def _probe_interface(iface: Interface, deadline: float | None) -> bool:
+    """Open ``iface``, read its comment and close it again.
+
+    Returns ``True`` when the port answered.  The port is closed on every
+    path, including a failed open and a failing detection, so a scan never
+    leaks a handle.
+    """
+    opened = False
+    try:
+        iface.open()
+        opened = True
+        if deadline_expired(deadline):
+            logger.debug("Scan budget exhausted; not probing %s", iface.port)
+            return False
+        iface.comment = get_comment(iface)
+        return True
+    except Exception:
+        logger.debug("Unable to probe %s", iface.port, exc_info=True)
+        return False
+    finally:
+        if opened:
+            try:
+                iface.close()
+            except Exception:
+                logger.debug("Unable to close %s", iface.port, exc_info=True)
 
 
 def get_portinfos() -> list[str]:

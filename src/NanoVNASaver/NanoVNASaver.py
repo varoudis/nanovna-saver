@@ -281,6 +281,10 @@ class NanoVNASaver(QWidget):
         #: One-shot continuation run when the next sweep completes
         #: successfully (SWEEP-04.3).
         self._after_sweep = None
+        #: How the last connection attempt ended (``connected``/``failed``/
+        #: ``cancelled``/``timed out``); a background attempt has no return
+        #: value, so the outcome is recorded when its signal arrives.
+        self.last_connection_status = ""
         #: Analysis kinds requested by the last applied preset.
         self._preset_analyses: tuple = ()
         #: Workflow parameters requested by the last applied preset.
@@ -326,6 +330,12 @@ class NanoVNASaver(QWidget):
             self.sweep_control.update_sweep_btn
         )
         self.serial_control.connected.connect(self._on_connection_changed)
+        # ``connected`` only fires on a published success, so a failed or
+        # timed-out attempt would otherwise be visible only through the error
+        # dialog.  This records the outcome for the status area and logs it.
+        self.serial_control.connection_finished.connect(
+            self._on_connection_finished
+        )
 
         self.bands: BandsModel = BandsModel()
 
@@ -1120,6 +1130,20 @@ class NanoVNASaver(QWidget):
             f"Calibration @ {marker.freq / 1e6:.6g} MHz:"
             f" {state.value.replace('_', ' ')}"
         )
+
+    def _on_connection_finished(self, status: str) -> None:
+        """Record how a connection attempt ended (PERF-01).
+
+        The attempt runs off the GUI thread, so its outcome arrives as a
+        signal rather than a return value.  A failure already raised its own
+        dialog; this keeps the last outcome available so the UI never shows a
+        stale "connected" impression after a cancelled or timed-out attempt.
+        """
+        self.last_connection_status = status
+        logger.info("Connection attempt finished: %s", status)
+        connected = status == "connected"
+        self.sweep_control.update_sweep_btn(connected)
+        self._on_connection_changed(connected)
 
     def _on_connection_changed(self, _connected: bool) -> None:
         """Refresh device facts once per connection change, not per redraw."""
@@ -2021,6 +2045,9 @@ class NanoVNASaver(QWidget):
             return
         self.worker.quit()
         self.worker.wait(WORKING_KILL_TIME_MS)
+        # A connection attempt runs off the GUI thread (PERF-01); cancel it
+        # and wait, so no worker outlives the window it would report to.
+        self.serial_control.shutdown(WORKING_KILL_TIME_MS)
         for marker in self.markers:
             marker.update_settings()
         self.settings.sync()

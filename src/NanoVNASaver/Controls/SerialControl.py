@@ -17,15 +17,36 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
+from functools import partial
 from threading import RLock
-from time import sleep
 from typing import TYPE_CHECKING
 
-import serial
 from PySide6 import QtWidgets
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Slot
 
-from ..Hardware.Hardware import Interface, get_comment, get_interfaces, get_VNA
+from ..Connection import (
+    CANCELLED,
+    CONNECTED,
+    ConnectionBusyError,
+    ConnectionOutcome,
+    ConnectionRequest,
+    ConnectionService,
+    DeviceConnectionError,
+    PortScanService,
+    ScanOutcome,
+    close_quietly,
+    identify_device,
+    open_serial_interface,
+    open_tcp_interface,
+)
+from ..Connection import validate_frequencies as _validate_frequencies
+from ..Hardware.Hardware import (
+    Interface,
+    get_comment,
+    get_interfaces,
+    get_VNA,
+    list_serial_ports,
+)
 from ..Hardware.ReplayScenario import (
     ReplayData,
     ReplayError,
@@ -60,83 +81,14 @@ SCENARIO_LABELS = {
     REPLAY_SCENARIO: "Touchstone replay (file)",
 }
 
-
-class DeviceConnectionError(Exception):
-    """A connection attempt failed; the message is meant for the user."""
-
-
-def _close_quietly(interface) -> None:
-    if interface is None:
-        return
-    try:
-        interface.close()
-    except Exception:
-        logger.debug("Unable to close %s", interface, exc_info=True)
+#: Button caption while an attempt owns the device conversation.
+CONNECTING_LABEL = "Connecting ..."
 
 
-def open_tcp_interface(address: str) -> Interface:
-    """Open a TCP interface for address, closing it again on any failure."""
-    url = f"socket://{address}"
-    logger.info("Connection TCP %s", url)
-    interface = None
-    try:
-        interface = serial.serial_for_url(url, do_not_open=True)
-        interface.type = "network"
-        interface.lock = RLock()
-        interface.timeout = 0.05
-        interface.open()
-        interface.comment = get_comment(interface)
-        interface.close()
-        interface.open()
-    except Exception as exc:
-        _close_quietly(interface)
-        raise DeviceConnectionError(
-            f"Unable to connect to {address}: {exc}"
-        ) from exc
-    return interface
-
-
-def open_serial_interface(interface) -> Interface:
-    """Open the selected serial interface, closing it on any failure."""
-    logger.info("Connection %s", interface)
-    try:
-        interface.open()
-        is_open = interface.is_open
-    except Exception as exc:
-        _close_quietly(interface)
-        raise DeviceConnectionError(
-            f"Unable to open {interface}: {exc}"
-        ) from exc
-    if not is_open:
-        _close_quietly(interface)
-        raise DeviceConnectionError(f"Unable to open port {interface}")
-    interface.timeout = 0.05
-    return interface
-
-
-def validate_frequencies(frequencies) -> list[int]:
-    """Return the frequencies as integers, rejecting unusable responses."""
-    if not frequencies:
-        raise DeviceConnectionError(
-            "The device reported no sweep frequencies. Check that the "
-            "correct port and connection type are selected, then try again."
-        )
-    normalized = []
-    for frequency in frequencies:
-        if isinstance(frequency, bool) or not isinstance(
-            frequency, (int, float)
-        ):
-            raise DeviceConnectionError(
-                "The device reported an invalid sweep frequency "
-                f"({frequency!r}). Check the device firmware and connection."
-            )
-        if frequency < 0:
-            raise DeviceConnectionError(
-                "The device reported a negative sweep frequency "
-                f"({frequency!r}). Check the device firmware and connection."
-            )
-        normalized.append(int(frequency))
-    return normalized
+# Kept importable from here: the helpers now live next to the worker that
+# uses them, but the control (and its tests) refer to them by this name.
+_close_quietly = close_quietly
+validate_frequencies = _validate_frequencies
 
 
 def initialize_vna(app: "vna_app", interface) -> tuple[object, list[int]]:
@@ -147,21 +99,41 @@ def initialize_vna(app: "vna_app", interface) -> tuple[object, list[int]]:
     again and a DeviceConnectionError carrying a user facing message is
     raised; the caller is responsible for publishing the connected state.
     """
-    stage = "identify the connected device"
     try:
-        vna = get_VNA(interface)
-        vna.validateInput = app.settings.value(
-            "SerialInputValidation", False, bool
+        return identify_device(
+            interface,
+            get_VNA,
+            validate_input=app.settings.value(
+                "SerialInputValidation", False, bool
+            ),
+            comment_probe=get_comment,
         )
-        stage = "read the sweep frequencies from the connected device"
-        frequencies = validate_frequencies(list(vna.read_frequencies()))
     except DeviceConnectionError:
         _close_quietly(interface)
         raise
     except Exception as exc:
         _close_quietly(interface)
-        raise DeviceConnectionError(f"Unable to {stage}: {exc}") from exc
-    return vna, frequencies
+        raise DeviceConnectionError(
+            f"Unable to identify the connected device: {exc}"
+        ) from exc
+
+
+def open_selected_interface(tcp: bool, address: str, selected) -> object:
+    """Open the transport the user selected, described by plain values.
+
+    Runs in the worker thread and deliberately takes only plain values, so
+    it never touches a widget; the caller captured them on the GUI thread.
+    ``get_comment`` is looked up at call time to stay patchable.
+    """
+    if tcp:
+        if not address:
+            raise DeviceConnectionError(
+                "Enter a host and port to connect to over TCP/IP."
+            )
+        return open_tcp_interface(address, comment_probe=get_comment)
+    if selected is None:
+        raise DeviceConnectionError("Select a serial port to connect to.")
+    return open_serial_interface(selected)
 
 
 def apply_frequency_range(app: "vna_app", vna, frequencies: list[int]) -> None:
@@ -184,11 +156,37 @@ def apply_frequency_range(app: "vna_app", vna, frequencies: list[int]) -> None:
 class SerialControl(Control):
     # true when serial port was connected and false when it was disconnected
     connected = Signal(bool)
+    #: Emitted once per hardware connection attempt with a status string
+    #: (``"connected"``, ``"failed"``, ``"cancelled"`` or ``"timed out"``).
+    connection_finished = Signal(str)
 
     def __init__(self, app: "vna_app"):
         super().__init__(app, "Serial port control")
 
         self.interface = Interface("serial", "none")
+        #: Single owner of the (blocking) device conversation.
+        self._service = ConnectionService(self)
+        self._service.signals.attempt_finished.connect(
+            self._on_attempt_finished
+        )
+        #: Owns the (blocking) port enumeration when it runs in a thread.
+        self._scanner = PortScanService(self)
+        self._scanner.signals.results.connect(self._on_scan_finished)
+        # The result is emitted from inside the scan; the thread may still be
+        # leaving its run loop when it arrives, so the button state is
+        # restored once more when the worker is really gone.
+        self._scanner.signals.finished.connect(self.update_scan_state)
+        #: Token of the attempt the control is waiting for (``None`` when
+        #: no hardware attempt is pending).
+        self._pending_token: object = None
+        #: Token of the scan whose result will repopulate the port list.
+        self._scan_token: object = None
+        #: The interface a live device was connected on.
+        self._live_interface = None
+        #: True between starting the worker and applying its result.
+        self._connecting = False
+        #: Serialises port-list replacement against the scan result.
+        self._port_lock = RLock()
 
         self.cb_tcp = QtWidgets.QCheckBox("TCP/IP")
         self.cb_tcp.stateChanged.connect(self.update_connect_btn_state)
@@ -269,7 +267,10 @@ class SerialControl(Control):
 
         self.inp_port = QtWidgets.QComboBox()
         self.inp_port.setMinimumHeight(20)
-        self.rescanSerialPort()
+        # Startup must not touch a port: only the OS metadata is read here
+        # (microseconds), and the firmware variant is filled in by a
+        # background rescan or by the connection attempt itself.
+        self._fill_ports(list_serial_ports())
         self.inp_port.setEditable(True)
         self.inp_port.currentIndexChanged.connect(self.update_connect_btn_state)
         self.inp_port.editTextChanged.connect(self.update_connect_btn_state)
@@ -307,20 +308,120 @@ class SerialControl(Control):
 
         self.connected.connect(self.update_settings_state)
 
-    def rescanSerialPort(self):
-        self.inp_port.clear()
-        for iface in get_interfaces():
-            self.inp_port.insertItem(1, f"{iface}", iface)
+    # -- port enumeration ----------------------------------------------
+    def is_scanning(self) -> bool:
+        """True while a port scan owns the enumeration conversation."""
+        return self._scanner.busy
+
+    def rescanSerialPort(self) -> bool:
+        """Refresh the port list without blocking the GUI thread.
+
+        Enumeration asks every candidate port what firmware it runs, which
+        is a blocking serial conversation; it therefore runs in a
+        :class:`ScanWorker` and its result is applied by
+        :meth:`_on_scan_finished`.  Re-entering while a scan is running is a
+        no-op, so a double click cannot start two scans over the same ports.
+        """
+        if self.is_connecting():
+            logger.info("Not scanning ports while a connection is pending")
+            return False
+        if self._scanner.busy:
+            logger.info("Ignoring a rescan: a port scan is already running")
+            return False
+        try:
+            token = self._scanner.begin(self._scan_ports)
+        except ConnectionBusyError:
+            logger.info("Ignoring a rescan: a port scan is already running")
+            return False
+        self._scan_token = token
+        self.update_scan_state()
+        return True
+
+    def _scan_ports(self):
+        """Enumerate and probe the ports; runs in the scan worker thread.
+
+        ``get_interfaces`` is looked up here so it stays patchable on the
+        module; the call already bounds itself with ``SCAN_BUDGET``.
+        """
+        return get_interfaces()
+
+    def cancel_scan(self) -> None:
+        """Discard a running scan's result; the thread finishes on its own."""
+        if not self._scanner.busy:
+            return
+        logger.info("Cancelling the pending port scan")
+        self._scan_token = None
+        self._scanner.cancel()
+        self.update_scan_state()
+
+    @Slot(object)
+    def _on_scan_finished(self, outcome: ScanOutcome) -> None:
+        """Apply a scan result on the GUI thread - only if it is current."""
+        if outcome.token is not self._scan_token:
+            logger.info("Discarding a stale serial port scan result")
+            return
+        self._scan_token = None
+        if not outcome.ok:
+            logger.info("Port scan did not complete: %s", outcome.message)
+            self.update_scan_state()
+            return
+        self._fill_ports(outcome.interfaces)
+        self.update_scan_state()
+
+    def _fill_ports(self, interfaces) -> None:
+        """Replace the port list, keeping the user's selection when possible.
+
+        A port that disappears is not silently swapped for another one: the
+        previous text stays selected so the user sees what they chose.
+        """
+        with self._port_lock:
+            previous = self.inp_port.currentData()
+            previous_text = self.inp_port.currentText()
+            self.inp_port.clear()
+            for iface in interfaces:
+                self.inp_port.insertItem(1, f"{iface}", iface)
+            if previous is not None:
+                index = self.inp_port.findData(previous)
+                if index >= 0:
+                    self.inp_port.setCurrentIndex(index)
+            elif previous_text and self.inp_port.isEditable():
+                self.inp_port.setEditText(previous_text)
         self.inp_port.repaint()
 
+    def update_scan_state(self) -> None:
+        """Show the scan in progress and disable conflicting controls."""
+        scanning = self._scanner.busy
+        self.btn_rescan.setEnabled(
+            not scanning
+            and not self.is_connecting()
+            and not self.is_vna_connected()
+            and not self.cb_simulated.isChecked()
+        )
+        self.btn_rescan.setText("Scanning" if scanning else "Rescan")
+
     def serialButtonClick(self):
+        if self.is_connecting():
+            # A second click must not start a second attempt.
+            return
         if not self.app.vna.connected():
             self.connect_device()
         else:
             self.disconnect_device()
 
+    # -- connection lifecycle -----------------------------------------
+    def is_connecting(self) -> bool:
+        """True while a hardware attempt owns the device conversation."""
+        return self._connecting
+
     def connect_device(self):
-        """Connect, publishing the connected state only on full success."""
+        """Start connecting without blocking the GUI thread.
+
+        A simulated or replay source is local and fast, so it is published
+        synchronously.  A hardware device needs a whole serial conversation
+        (port open, firmware identification, frequency read); that runs in a
+        :class:`ConnectionWorker` and its result is applied by
+        :meth:`_on_attempt_finished` on the GUI thread.
+        """
         if self.sweep_active():
             # Replacing the device mid-sweep would change what the running
             # worker reads between segments.
@@ -329,57 +430,215 @@ class SerialControl(Control):
                 " the replay source."
             )
             return
+        if self.is_connecting():
+            logger.info("Ignoring a second connect request while connecting")
+            return
         previous_vna = self.app.vna
-        interface = None
         try:
             if self.cb_simulated.isChecked():
                 return self._connect_simulated()
-            interface = self._open_interface()
-            sleep(0.1)
-            vna, frequencies = initialize_vna(self.app, interface)
-            self.app.vna = vna
-            apply_frequency_range(self.app, vna, frequencies)
         except DeviceConnectionError as exc:
             self.app.vna = previous_vna
             self._connection_failed(exc)
             return
         except Exception as exc:
             self.app.vna = previous_vna
-            _close_quietly(interface)
             self._connection_failed(
                 DeviceConnectionError(f"Unable to prepare the sweep: {exc}")
             )
             return
+        self._begin_hardware_attempt()
 
-        self.interface = interface
+    def _begin_hardware_attempt(self) -> None:
+        """Resolve the request on the GUI thread and start the worker.
+
+        Everything the worker needs is captured here, as a plain value or a
+        callable closing over plain values: reading a widget from the worker
+        thread would be a cross-thread access to a Qt object.
+        """
+        tcp = self.cb_tcp.isChecked()
+        address = self.inp_port.currentText()
+        selected = self.inp_port.currentData()
+        if tcp and not address:
+            self._connection_failed(
+                DeviceConnectionError(
+                    "Enter a host and port to connect to over TCP/IP."
+                )
+            )
+            return
+        if not tcp and selected is None:
+            self._connection_failed(
+                DeviceConnectionError("Select a serial port to connect to.")
+            )
+            return
+        request = ConnectionRequest(
+            open=partial(
+                open_selected_interface,
+                tcp=tcp,
+                address=address,
+                selected=selected,
+            ),
+            identify=partial(self._identify, self._input_validation()),
+            note=str(address if tcp else selected or ""),
+        )
+        try:
+            token = self._service.begin(request)
+        except ConnectionBusyError:
+            logger.info("A connection attempt is already running")
+            return
+        self._pending_token = token
+        self._previous_vna_snapshot = self.app.vna
+        self._connecting = True
+        self._entering_connecting_state()
+
+    def _identify(self, validate_input: bool, interface):
+        """Identify the device on ``interface``; runs in the worker thread.
+
+        ``get_VNA``/``get_comment`` are looked up here rather than captured
+        so they stay patchable on the module; ``validate_input`` was read
+        from the settings on the GUI thread.
+        """
+        return identify_device(
+            interface,
+            get_VNA,
+            validate_input=validate_input,
+            comment_probe=get_comment,
+        )
+
+    def _input_validation(self) -> bool:
+        try:
+            return bool(
+                self.app.settings.value("SerialInputValidation", False, bool)
+            )
+        except Exception:  # a stub app may not have settings at all
+            logger.debug("No settings available for input validation")
+            return False
+
+    def _entering_connecting_state(self) -> None:
+        """Keep the button busy and the conflicting controls disabled."""
+        self.btn_toggle.setText(CONNECTING_LABEL)
+        self.btn_toggle.setEnabled(False)
+        self.inp_port.setEnabled(False)
+        self.cb_tcp.setEnabled(False)
+        self.btn_rescan.setEnabled(False)
+        self.btn_settings.setEnabled(False)
+        self.cb_simulated.setEnabled(False)
+        self.cb_scenario.setEnabled(False)
+        self.btn_replay_file.setEnabled(False)
+        self.btn_toggle.repaint()
+
+    def _leaving_connecting_state(self) -> None:
+        self._connecting = False
+        self._pending_token = None
+        self.btn_toggle.setText("Connect to device")
+        self.cb_simulated.setEnabled(True)
+        self.update_simulation_state()
+        self.update_settings_state(self.is_vna_connected())
+        self.btn_toggle.repaint()
+
+    def cancel_connection(self) -> None:
+        """Cancel a pending hardware attempt and discard its result."""
+        if not self.is_connecting():
+            return
+        logger.info("Cancelling the pending connection attempt")
+        self._pending_token = None
+        self._service.cancel()
+        self._leaving_connecting_state()
+
+    def shutdown(self, timeout_ms: int | None = None) -> bool:
+        """Stop any pending work and release the device (window close).
+
+        Returns ``True`` when no worker is left running.  Called from
+        ``closeEvent``; an attempt or scan that is still in flight is
+        cancelled and waited for here, so the process never exits with a
+        live thread reading a port that is being torn down.
+        """
+        self._pending_token = None
+        self._scan_token = None
+        self._connecting = False
+        if timeout_ms is None:
+            stopped = self._service.shutdown()
+            scanned = self._scanner.shutdown()
+        else:
+            stopped = self._service.shutdown(timeout_ms)
+            scanned = self._scanner.shutdown(timeout_ms)
+        self.disconnect_device()
+        return stopped and scanned
+
+    def owns_attempt(self, outcome: ConnectionOutcome) -> bool:
+        """True when ``outcome`` belongs to the attempt being waited for."""
+        token = self._pending_token
+        return token is not None and outcome.token is token
+
+    @Slot(object)
+    def _on_attempt_finished(self, outcome: ConnectionOutcome) -> None:
+        """Apply a worker result on the GUI thread - only if it is current."""
+        if not self.is_connecting():
+            logger.info("Discarding a connection result: no attempt is pending")
+            close_quietly(outcome.interface)
+            return
+        if not self.owns_attempt(outcome):
+            # A cancelled or superseded attempt: never publish its device.
+            logger.info("Discarding a stale connection result")
+            close_quietly(outcome.interface)
+            return
+        self._pending_token = None
+        if outcome.status != CONNECTED:
+            previous = self._previous_vna_snapshot
+            self._leaving_connecting_state()
+            self._previous_vna_snapshot = None
+            self.app.vna = previous
+            if outcome.status == CANCELLED:
+                logger.info("Connection attempt cancelled")
+                self.connection_finished.emit(outcome.status)
+                return
+            self._connection_failed(
+                DeviceConnectionError(outcome.message), status=outcome.status
+            )
+            return
+        previous = self._previous_vna_snapshot
+        try:
+            self._publish_connected(outcome)
+        except Exception as exc:
+            logger.exception("Unable to prepare the sweep after connecting")
+            close_quietly(outcome.interface)
+            self.app.vna = previous
+            self._leaving_connecting_state()
+            self._connection_failed(
+                DeviceConnectionError(f"Unable to prepare the sweep: {exc}")
+            )
+        finally:
+            self._previous_vna_snapshot = None
+
+    #: The device that was live when the current attempt started, so a
+    #: failed attempt can restore it instead of leaving a half-applied one.
+    _previous_vna_snapshot = None
+
+    def _publish_connected(self, outcome: ConnectionOutcome) -> None:
+        """Adopt a successfully identified device and start the first sweep."""
+        vna = outcome.vna
+        frequencies = list(outcome.frequencies)
+        if not frequencies:
+            raise DeviceConnectionError("The device reported no frequencies.")
+        self.app.vna = vna
+
+        self.interface = outcome.interface
+        self._live_interface = outcome.interface
+        # Seed the sweep control before publishing the connected state: a
+        # range that cannot be applied keeps the control disconnected.
+        apply_frequency_range(self.app, vna, frequencies)
+        self._leaving_connecting_state()
 
         # connected
         self.btn_toggle.setText("Disconnect")
         self.btn_toggle.repaint()
         self.connected.emit(True)
+        self.connection_finished.emit(CONNECTED)
 
         self.app.windows["sweep_settings"].vna_connected()
 
         logger.debug("Starting initial sweep")
         self.app.sweep_start()
-
-    def _open_interface(self):
-        """Open the serial or TCP interface selected in the UI."""
-        if self.cb_simulated.isChecked():
-            # A simulated device needs no transport at all.
-            return None
-        if self.cb_tcp.isChecked():
-            address = self.inp_port.currentText()
-            if not address:
-                raise DeviceConnectionError(
-                    "Enter a host and port to connect to over TCP/IP."
-                )
-            return open_tcp_interface(address)
-
-        selected = self.inp_port.currentData()
-        if not selected:
-            raise DeviceConnectionError("Select a serial port to connect to.")
-        return open_serial_interface(selected)
 
     def selected_scenario(self) -> str:
         return self.cb_scenario.currentData() or SCENARIO_NAMES[0]
@@ -407,6 +666,12 @@ class SerialControl(Control):
             # source would change the meaning of samples mid-acquisition.
             self.app.showError(
                 "A sweep is running. Stop it before changing the replay source."
+            )
+            return False
+        if self.is_connecting():
+            self.app.showError(
+                "A connection attempt is in progress. Wait for it to finish"
+                " before changing the replay source."
             )
             return False
         connected_vna = getattr(self.app, "vna", None)
@@ -474,7 +739,9 @@ class SerialControl(Control):
         placeholder it started with.  For replay the sweep default is
         planned *before* the device is published, so a file whose span
         cannot support the configured points leaves the previous device
-        and sweep untouched.
+        and sweep untouched.  This path is local and fast, so it stays
+        synchronous: a pending hardware attempt never blocks it (the port
+        selection is disabled while connecting, but the demo path is not).
         """
         scenario = self.selected_scenario()
         replay = scenario == REPLAY_SCENARIO
@@ -567,44 +834,59 @@ class SerialControl(Control):
 
     def update_simulation_state(self, *_args) -> None:
         """Keep the transport controls consistent with the mode selector."""
+        connecting = self.is_connecting()
         simulated = self.cb_simulated.isChecked()
         replay_selected = simulated and (
             self.selected_scenario() == REPLAY_SCENARIO
         )
         self.row_scenario.setVisible(simulated)
-        self.cb_scenario.setEnabled(simulated)
+        self.cb_scenario.setEnabled(simulated and not connecting)
         # The replay file picker is only meaningful for the replay scenario,
         # but a loaded source stays visible when switching scenarios so it
         # is never lost silently.
         self.row_replay_file.setVisible(simulated)
-        self.btn_replay_file.setEnabled(replay_selected)
-        self.inp_port.setEnabled(not simulated)
-        self.btn_rescan.setEnabled(
-            not simulated and not self.is_vna_connected()
+        self.btn_replay_file.setEnabled(replay_selected and not connecting)
+        self.inp_port.setEnabled(
+            not simulated and not connecting and not self.is_scanning()
         )
-        self.cb_tcp.setEnabled(not simulated)
+        self.update_scan_state()
+        self.cb_tcp.setEnabled(not simulated and not connecting)
         self.update_connect_btn_state()
 
-    def _connection_failed(self, failure: DeviceConnectionError) -> None:
+    def _connection_failed(
+        self, failure: DeviceConnectionError, status: str = "failed"
+    ) -> None:
         """Keep the control and the application in a disconnected state."""
         logger.error("Connection attempt failed: %s", failure)
         self.btn_toggle.setText("Connect to device")
         self.btn_toggle.repaint()
         self.update_settings_state(False)
         self.app.showError(str(failure))
+        self.connection_finished.emit(status)
 
     def disconnect_device(self):
+        if self.is_connecting():
+            # A pending attempt owns the port; cancel it first so the device
+            # it may have opened is closed instead of leaked.
+            self.cancel_connection()
+        if not self.is_vna_connected() and self._live_interface is None:
+            # Nothing to release: a spurious ``connected(False)`` would look
+            # like a dropped session to every listener.
+            logger.debug("Ignoring a disconnect: no device is connected")
+            return
         if getattr(self.app.vna, "simulated", False):
             self._disconnect_simulated()
             return
-        with self.interface.lock:
-            logger.info("Closing connection to %s", self.interface)
+        interface = self._live_interface or self.interface
+        with interface.lock:
+            logger.info("Closing connection to %s", interface)
             try:
                 self.app.vna.disconnect()
             except IOError as exc:
                 logger.error("Unable to disconnect from VNA: %s", exc)
 
-            self.interface.close()
+            close_quietly(interface)
+            self._live_interface = None
             self.btn_toggle.setText("Connect to device")
             self.btn_toggle.repaint()
 
@@ -622,10 +904,16 @@ class SerialControl(Control):
         self.connected.emit(False)
 
     def update_connect_btn_state(self) -> None:
-        # Eanble Connect/Dicsonnect button only if:
+        # Enable Connect/Disconnect button only if:
         # a) serial was already connected
         # b) serial is disconnected AND inp_port was selected
         # c) TCP is checked and text is present
+        # d) a simulated device is selected
+        # A pending attempt keeps the button disabled: a second click must
+        # not start a second conversation with the device.
+        if self.is_connecting():
+            self.btn_toggle.setEnabled(False)
+            return
         port_selected = self.inp_port.currentData() is not None
         tcp_selected = self.cb_tcp.isChecked() and bool(
             self.inp_port.currentText()
@@ -638,9 +926,10 @@ class SerialControl(Control):
         )
 
     def is_vna_connected(self) -> bool:
-        return self.app.vna and self.app.vna.connected()
+        return bool(self.app.vna and self.app.vna.connected())
 
     def update_settings_state(self, was_connected: bool) -> None:
-        self.btn_rescan.setEnabled(not was_connected)
-        self.btn_settings.setEnabled(was_connected)
+        connecting = self.is_connecting()
+        self.update_scan_state()
+        self.btn_settings.setEnabled(was_connected and not connecting)
         self.update_connect_btn_state()
