@@ -25,10 +25,24 @@ Tests are free to create any number of windows or QObject wrappers; nothing
 here depends on test names, order or counts.
 """
 
+import atexit
 import gc
 import os
+import shutil
+import tempfile
 
 import pytest
+
+# Application settings, calibration kits and presets all live under the home
+# directory, and ``Defaults`` opens its settings file on import.  So the whole
+# run gets its own home before anything from the application is imported:
+# tests must never read or rewrite the operator's real configuration.
+_SANDBOX_HOME = tempfile.mkdtemp(prefix="nanovna-tests-")
+atexit.register(shutil.rmtree, _SANDBOX_HOME, ignore_errors=True)
+for _variable in ("HOME", "USERPROFILE", "CFFIXED_USER_HOME"):
+    os.environ[_variable] = _SANDBOX_HOME
+os.environ["XDG_CONFIG_HOME"] = os.path.join(_SANDBOX_HOME, ".config")
+os.environ["XDG_DATA_HOME"] = os.path.join(_SANDBOX_HOME, ".local", "share")
 
 #: Python wrappers of every top-level widget created during this session.
 #:
