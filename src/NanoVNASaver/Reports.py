@@ -23,10 +23,10 @@ their structured analysis results.  Nothing is read from live widgets or a
 running sweep, so a report can never mix two different measurements.
 
 Output is a self-contained HTML document (inline CSS, inline SVG plots) plus
-an optional CSV summary.  PDF generation is deliberately not implemented:
-the existing Qt stack would need `QWebEngine` or `QPrinter` and neither is a
-declared dependency, so that remains a documented limitation rather than a
-half-working feature.
+an optional CSV summary.  A PDF is drawn from the same frozen model by
+``PdfReport`` using ``QTextDocument`` and ``QPdfWriter`` (both part of the
+already-declared Qt dependency, so no new dependency and no web engine), so
+the PDF cannot disagree with the HTML about a value or a verdict.
 """
 
 from __future__ import annotations

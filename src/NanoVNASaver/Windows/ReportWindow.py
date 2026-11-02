@@ -182,8 +182,14 @@ class ReportWindow(QtWidgets.QWidget):
         self.btn_save_html.clicked.connect(self.save_html)
         self.btn_save_csv = QtWidgets.QPushButton("Save CSV ...")
         self.btn_save_csv.clicked.connect(self.save_csv)
+        self.btn_save_pdf = QtWidgets.QPushButton("Save PDF ...")
+        self.btn_save_pdf.clicked.connect(self.save_pdf)
+        self.btn_save_pdf.setToolTip(
+            "Draw the same frozen model as a printable A4 document."
+        )
         buttons.addWidget(self.btn_save_html)
         buttons.addWidget(self.btn_save_csv)
+        buttons.addWidget(self.btn_save_pdf)
         layout.addLayout(buttons)
 
         self.label_status = QtWidgets.QLabel("")
@@ -530,6 +536,26 @@ class ReportWindow(QtWidgets.QWidget):
             self.label_status.setText(f"Unable to write the report: {exc}")
             return False
         self.label_status.setText(f"Report saved to {filename}")
+        return True
+
+    def save_pdf(self) -> bool:
+        """Ask for a path and write the frozen model as a PDF (REPORT-01)."""
+        filename = self._ask_filename(".pdf", "PDF report (*.pdf)")
+        if not filename:
+            return False
+        return self.save_pdf_at(filename)
+
+    def save_pdf_at(self, filename: str) -> bool:
+        """Draw the frozen model to ``filename``; never rebuilds it."""
+        from ..PdfReport import write_pdf
+
+        try:
+            write_pdf(self.frozen_model(), filename)
+        except (OSError, ValueError) as exc:
+            logger.warning("Unable to write the PDF report: %s", exc)
+            self.label_status.setText(f"Unable to write the PDF: {exc}")
+            return False
+        self.label_status.setText(f"PDF report saved to {filename}")
         return True
 
     def save_csv(self) -> bool:
