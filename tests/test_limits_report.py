@@ -426,6 +426,10 @@ def app(qt_app):
 
     window = NanoVNASaver()
     yield window
+    # A test may legitimately make the session dirty (deactivating a limit
+    # set does).  Closing a dirty window opens a modal "discard changes?"
+    # dialog that blocks the whole run, so the discard is answered here.
+    window.session.dirty = False
     window.close()
 
 

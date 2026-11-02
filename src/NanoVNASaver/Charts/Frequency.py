@@ -598,6 +598,9 @@ class FrequencyChart(Chart):
         )
         self.drawFrequencyTicks(qp)
 
+        # Limit bounds are drawn first so the measurement stays legible on
+        # top of them; a bound is a reference, never a measurement.
+        self.drawLimits(qp)
         self.drawData(qp, self.data, Chart.color.sweep)
         for _name, color, points in self.traces:
             self.drawData(qp, points, QtGui.QColor(color))

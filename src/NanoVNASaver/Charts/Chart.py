@@ -16,6 +16,7 @@
 #
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+import itertools as it
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, NamedTuple, Optional
@@ -174,6 +175,9 @@ class Chart(QtWidgets.QWidget):
         #: Additional named traces drawn on top of the primary data
         #: (TRACE-02.2).  Each entry is ``(name, color, points)``.
         self.traces: list[tuple[str, str, list[Datapoint]]] = []
+        #: Evaluated limit bounds in chart units (NEXT-04).  Each entry is
+        #: ``(label, color, [(frequency_hz, value), ...])``.
+        self.limit_series: list[tuple[str, str, list[tuple[float, float]]]] = []
 
         self.markers: list[Marker] = []
         self.swrMarkers: set[float] = set()
@@ -239,6 +243,49 @@ class Chart(QtWidgets.QWidget):
         """Attach the active calibration coverage (CAL-02.2)."""
         self.coverage = coverage
         self.update()
+
+    def setLimits(self, series) -> None:
+        """Draw evaluated limit bounds (NEXT-04).
+
+        ``series`` is an iterable of ``(label, color, points)`` where
+        ``points`` are ``(frequency_hz, value_in_chart_units)`` pairs.  The
+        values are already expressed in the units the chart plots, so a
+        bound and the trace it checks are drawn against one scale.
+        """
+        self.limit_series = [
+            (str(label), str(color), list(points))
+            for label, color, points in series
+            if points
+        ]
+        self.update()
+
+    def clearLimits(self) -> None:
+        self.limit_series = []
+        self.update()
+
+    def drawLimits(self, qp: QtGui.QPainter) -> None:
+        """Draw limit bounds as dashed lines behind the measurement."""
+        if not self.limit_series:
+            return
+        pen = QtGui.QPen(Chart.color.reference)
+        pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+        pen.setWidth(1)
+        for _label, color, points in self.limit_series:
+            pen.setColor(QtGui.QColor(color))
+            qp.setPen(pen)
+            plotted = [
+                Datapoint(int(freq), float(value), 0.0)
+                for freq, value in points
+            ]
+            for first, second in it.pairwise(plotted):
+                qp.drawLine(
+                    QtCore.QPoint(
+                        self.getXPosition(first), self.getYPosition(first)
+                    ),
+                    QtCore.QPoint(
+                        self.getXPosition(second), self.getYPosition(second)
+                    ),
+                )
 
     def setMarkers(self, markers) -> None:
         self.markers = markers
@@ -385,6 +432,7 @@ class Chart(QtWidgets.QWidget):
         new_chart.reference = self.reference
         new_chart.coverage = self.coverage
         new_chart.traces = list(self.traces)
+        new_chart.limit_series = list(self.limit_series)
         new_chart.dim = replace(self.dim)
         new_chart.flag = replace(self.flag)
         new_chart.markers = self.markers

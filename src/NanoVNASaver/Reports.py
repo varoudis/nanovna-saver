@@ -427,6 +427,9 @@ def _delay(points: Sequence[Datapoint]) -> list[tuple[float, float]]:
 
 
 LIMIT_COLOR = "#777777"
+#: The same grey is used for chart bound overlays, so a bound looks the same
+#: in the live chart and in a frozen report.
+LIMIT_BOUND_COLOR = LIMIT_COLOR
 
 
 def _metric_points(
@@ -442,7 +445,13 @@ def _metric_points(
 
 
 def _bound_points(limit_set: LimitSet, metric: Metric) -> list[tuple]:
-    """(label, colour, points) step lines for every bound of ``metric``."""
+    """(label, colour, points) step lines for every bound of ``metric``.
+
+    A sloped bound is drawn as its two endpoint values, which is exactly the
+    line the evaluator compares samples against (``value + slope * (f -
+    start)``).  A flat bound keeps a two-point step line, so the stored
+    document, the drawn bound and the checked verdict describe one shape.
+    """
     series: list[tuple] = []
     for rule in limit_set.rules:
         if rule.metric is not metric:
@@ -454,13 +463,21 @@ def _bound_points(limit_set: LimitSet, metric: Metric) -> list[tuple]:
             ):
                 if bound is None:
                     continue
+                getter = (
+                    segment.maximum_at
+                    if kind == "maximum"
+                    else segment.minimum_at
+                )
                 series.append(
                     (
                         f"{rule.id} {kind}",
                         LIMIT_COLOR,
                         [
-                            (float(segment.start), float(bound)),
-                            (float(segment.stop), float(bound)),
+                            (
+                                float(segment.start),
+                                float(getter(segment.start)),
+                            ),
+                            (float(segment.stop), float(getter(segment.stop))),
                         ],
                     )
                 )

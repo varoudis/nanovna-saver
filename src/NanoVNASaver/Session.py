@@ -59,7 +59,10 @@ from .Measurement import (
 from .RFTools import Datapoint
 
 SESSION_FORMAT = "nanovna-saver-session"
-SESSION_VERSION = 1
+#: Bumped to 2 when embedded limit sets were added (NEXT-03).  Version 1
+#: documents have no embedded limits and restore with an empty catalogue,
+#: which is exactly what they meant.
+SESSION_VERSION = 2
 SESSION_SUFFIX = ".nvsession"
 
 MANIFEST_NAME = "manifest.json"
@@ -181,6 +184,12 @@ class SessionDocument:
         default_factory=lambda: datetime.now(timezone.utc)
     )
     app_version: str = ""
+    #: Format version this document was read from (or will be written as).
+    #:
+    #: Version 1 sessions predate embedded limit sets, so restoring one must
+    #: leave the operator's current catalogue alone instead of silently
+    #: emptying it.
+    format_version: int = SESSION_VERSION
     traces: list[dict[str, Any]] = field(default_factory=list)
     selected_trace: str = ""
     markers: list[dict[str, Any]] = field(default_factory=list)
@@ -190,6 +199,12 @@ class SessionDocument:
     preset: dict[str, Any] = field(default_factory=dict)
     calibration: dict[str, Any] = field(default_factory=dict)
     calibration_files: dict[str, str] = field(default_factory=dict)
+    #: Embedded limit set documents, keyed by name (NEXT-03).  The content,
+    #: not a file path, is stored: a session that referenced an external
+    #: ``.nvlimits`` file would break as soon as the file moved or changed.
+    limit_sets: list[dict[str, Any]] = field(default_factory=list)
+    #: Name of the limit set that was active when the session was saved.
+    active_limit_set: str = ""
     ui: dict[str, Any] = field(default_factory=dict)
 
     def to_manifest(self) -> dict[str, Any]:
@@ -212,6 +227,8 @@ class SessionDocument:
             "preset": self.preset,
             "calibration": self.calibration,
             "calibration_files": sorted(self.calibration_files),
+            "limit_sets": self.limit_sets,
+            "active_limit_set": self.active_limit_set,
             "ui": self.ui,
         }
 
@@ -224,6 +241,7 @@ class SessionDocument:
             if manifest.get("created")
             else datetime.now(timezone.utc),
             app_version=str(manifest.get("app_version", "")),
+            format_version=int(manifest.get("version", 1)),
             selected_trace=str(manifest.get("selected_trace", "")),
             markers=list(manifest.get("markers") or []),
             charts=dict(manifest.get("charts") or {}),
@@ -234,6 +252,8 @@ class SessionDocument:
             calibration_files={
                 name: "" for name in manifest.get("calibration_files") or []
             },
+            limit_sets=list(manifest.get("limit_sets") or []),
+            active_limit_set=str(manifest.get("active_limit_set", "")),
             ui=dict(manifest.get("ui") or {}),
         )
 
@@ -367,6 +387,10 @@ def parse_session(payload: bytes) -> SessionDocument:
         )
 
     document = SessionDocument.from_manifest(manifest)
+    if document.format_version >= 2:
+        # Refused here, while nothing has been touched: restoring applies the
+        # data, traces and calibration first, so this cannot wait until then.
+        limit_sets_from_document(document)
     trace_files = list(manifest.get("trace_files") or [])
     if len(trace_files) > MAX_TRACES:
         raise SessionFormatError("session declares too many traces")
@@ -427,6 +451,8 @@ def make_document(  # noqa: PLR0913
     preset: dict | None = None,
     calibration: dict | None = None,
     calibration_files: dict[str, str] | None = None,
+    limit_sets: list[dict] | None = None,
+    active_limit_set: str = "",
     ui: dict | None = None,
 ) -> SessionDocument:
     """Assemble a document from snapshots (SESSION-01.2)."""
@@ -453,6 +479,8 @@ def make_document(  # noqa: PLR0913
         preset=dict(preset or {}),
         calibration=dict(calibration or {}),
         calibration_files=dict(calibration_files or {}),
+        limit_sets=list(limit_sets or []),
+        active_limit_set=active_limit_set,
         ui=dict(ui or {}),
     )
     return document
@@ -474,6 +502,42 @@ def completion_of(trace: Mapping[str, Any]) -> CompletionState:
     return CompletionState.parse(
         provenance.get("completion", CompletionState.COMPLETE.value)
     )
+
+
+def limit_sets_from_document(document: SessionDocument) -> list:
+    """Validate and rebuild the limit sets embedded in ``document``.
+
+    Validation happens without touching any catalogue, so a session whose
+    limits are corrupt is rejected as a whole instead of replacing part of
+    the operator's working state.
+    """
+    from .Limits import (
+        LimitFormatError,
+        LimitSet,
+        LimitValidationError,
+    )
+
+    parsed = []
+    names: set[str] = set()
+    for index, payload in enumerate(document.limit_sets):
+        try:
+            limit_set = LimitSet.from_dict(payload)
+        except (LimitFormatError, LimitValidationError) as exc:
+            raise SessionFormatError(
+                f"invalid limit set in session (entry {index}): {exc}"
+            ) from exc
+        if limit_set.name in names:
+            raise SessionFormatError(
+                f"session embeds two limit sets named {limit_set.name!r}"
+            )
+        names.add(limit_set.name)
+        parsed.append(limit_set)
+    if document.active_limit_set and document.active_limit_set not in names:
+        raise SessionFormatError(
+            f"active limit set {document.active_limit_set!r} is not embedded"
+            " in this session"
+        )
+    return parsed
 
 
 def is_finite(value: float) -> bool:

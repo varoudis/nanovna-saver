@@ -62,9 +62,12 @@ documented rather than hidden.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import itertools as it
 import json
 import math
+import os
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
@@ -79,8 +82,14 @@ from .Measurement import (
 from .RFTools import Datapoint
 
 LIMIT_SET_FORMAT = "nanovna-saver-limits"
-LIMIT_SET_VERSION = 1
+#: Version 2 added optional sloped bounds and the S11 phase metric.
+#: Version 1 documents keep loading unchanged (no slopes, three metrics).
+LIMIT_SET_VERSION = 2
 LIMIT_SUFFIX = ".nvlimits"
+
+#: Colour of a drawn bound in charts and reports, shared so the live chart and
+#: the frozen report draw the same specification the same way.
+LIMIT_BOUND_COLOR = "#777777"
 
 #: A hole wider than this many times the *locally* observed sample spacing
 #: means the band is not measured there, so the check is ``UNAVAILABLE``.
@@ -91,7 +100,14 @@ GAP_FACTOR = 1.5
 
 #: Keys accepted in one segment object.  There is deliberately no unit key:
 #: the unit is a property of the metric.
-SEGMENT_KEYS = ("start_hz", "stop_hz", "minimum", "maximum")
+SEGMENT_KEYS = (
+    "start_hz",
+    "stop_hz",
+    "minimum",
+    "maximum",
+    "minimum_slope",
+    "maximum_slope",
+)
 RULE_KEYS = ("id", "label", "metric", "segments")
 DOCUMENT_KEYS = ("format", "version", "name", "description", "rules")
 
@@ -114,6 +130,7 @@ class Metric(Enum):
     S11_VSWR = "s11_vswr"
     S11_RETURN_LOSS_DB = "s11_return_loss_db"
     S21_INSERTION_LOSS_DB = "s21_insertion_loss_db"
+    S11_PHASE_DEG = "s11_phase_deg"
 
     @property
     def parameter(self) -> str:
@@ -124,7 +141,11 @@ class Metric(Enum):
 
     @property
     def unit(self) -> str:
-        return "" if self is Metric.S11_VSWR else "dB"
+        if self is Metric.S11_VSWR:
+            return ""
+        if self is Metric.S11_PHASE_DEG:
+            return "deg"
+        return "dB"
 
     @property
     def description(self) -> str:
@@ -132,6 +153,8 @@ class Metric(Enum):
             return "S11 VSWR (ratio)"
         if self is Metric.S11_RETURN_LOSS_DB:
             return "S11 return loss (dB, positive for a match)"
+        if self is Metric.S11_PHASE_DEG:
+            return "S11 phase (deg, -180 to +180, wrapped)"
         return "S21 insertion loss (dB, positive for loss)"
 
     def measure(self, point: Datapoint) -> float:
@@ -140,10 +163,17 @@ class Metric(Enum):
         ``datapoint.vswr`` is infinite for a total reflection, which is a
         valid measurement: it violates every finite maximum rather than
         being treated as missing data.
+
+        Phase is reported wrapped into ``(-180, +180]`` degrees.  A limit on
+        wrapped phase is only meaningful where the measurement does not
+        cross the +/-180 degree branch; the evaluator cannot detect that
+        intent, so :meth:`S11_PHASE_DEG` documents it rather than guessing.
         """
         magnitude = abs(point.z)
         if self is Metric.S11_VSWR:
             return point.vswr
+        if self is Metric.S11_PHASE_DEG:
+            return math.degrees(point.phase)
         if magnitude == 0.0:
             return math.inf
         return -20.0 * math.log10(magnitude)
@@ -237,12 +267,21 @@ class LimitSegment:
 
     ``start`` is inclusive; ``stop`` is excluded unless the segment is the
     last one of its rule, where it is inclusive.
+
+    A bound is either flat or sloped.  ``minimum``/``maximum`` give the value
+    at ``start``; the optional ``*_slope`` fields give the change per hertz,
+    so the interpolated bound at frequency ``f`` inside the segment is
+    ``value + slope * (f - start)``.  Slope is expressed in the metric's own
+    unit per hertz, which keeps a stored document independent of how the UI
+    chooses to display it (the editor shows dB/GHz and converts).
     """
 
     start: int
     stop: int
     minimum: float | None = None
     maximum: float | None = None
+    minimum_slope: float = 0.0
+    maximum_slope: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.start, int) or not isinstance(self.stop, int):
@@ -266,19 +305,75 @@ class LimitSegment:
                 raise LimitValidationError(
                     f"segment {name} must be finite, got {value!r}"
                 )
+        for name in ("minimum_slope", "maximum_slope"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise LimitValidationError(f"segment {name} must be a number")
+            if not math.isfinite(float(value)):
+                raise LimitValidationError(
+                    f"segment {name} must be finite, got {value!r}"
+                )
         if self.minimum is None and self.maximum is None:
             raise LimitValidationError(
                 "segment must declare a minimum, a maximum, or both"
             )
+        if self.minimum is None and self.minimum_slope:
+            raise LimitValidationError(
+                "segment declares a minimum_slope without a minimum"
+            )
+        if self.maximum is None and self.maximum_slope:
+            raise LimitValidationError(
+                "segment declares a maximum_slope without a maximum"
+            )
         if (
             self.minimum is not None
             and self.maximum is not None
+            and not (self.minimum_slope or self.maximum_slope)
             and float(self.minimum) > float(self.maximum)
         ):
             raise LimitValidationError(
                 f"conflicting bounds: minimum ({self.minimum:g}) is greater"
                 f" than maximum ({self.maximum:g})"
             )
+        # A sloped pair can still cross, which would make the band impossible
+        # over part of its range; that is a specification error, not
+        # measurement noise, so it is rejected at construction.
+        if (
+            self.minimum is not None
+            and self.maximum is not None
+            and (self.minimum_slope or self.maximum_slope)
+            and self.lowest_gap() < 0
+        ):
+            raise LimitValidationError(
+                "the sloped minimum is above the sloped maximum somewhere"
+                f" in {self.start} Hz to {self.stop} Hz"
+            )
+
+    # -- bounds --------------------------------------------------------
+    def minimum_at(self, freq: int) -> float | None:
+        if self.minimum is None:
+            return None
+        return float(self.minimum) + float(self.minimum_slope) * (
+            freq - self.start
+        )
+
+    def maximum_at(self, freq: int) -> float | None:
+        if self.maximum is None:
+            return None
+        return float(self.maximum) + float(self.maximum_slope) * (
+            freq - self.start
+        )
+
+    def lowest_gap(self) -> float:
+        """Smallest ``maximum - minimum`` over the segment (infinite when one
+        side is unbounded)."""
+        if self.minimum is None or self.maximum is None:
+            return math.inf
+        gaps = [
+            self.maximum_at(freq) - self.minimum_at(freq)
+            for freq in (self.start, self.stop)
+        ]
+        return min(gaps)
 
     def contains(self, freq: int, *, last: bool) -> bool:
         if freq < self.start:
@@ -294,6 +389,10 @@ class LimitSegment:
             data["minimum"] = self.minimum
         if self.maximum is not None:
             data["maximum"] = self.maximum
+        if self.minimum_slope:
+            data["minimum_slope"] = self.minimum_slope
+        if self.maximum_slope:
+            data["maximum_slope"] = self.maximum_slope
         return data
 
     @classmethod
@@ -316,6 +415,16 @@ class LimitSegment:
                     None
                     if self_.get("maximum") is None
                     else _number(self_["maximum"], where, "maximum")
+                ),
+                minimum_slope=(
+                    0.0
+                    if self_.get("minimum_slope") is None
+                    else _number(self_["minimum_slope"], where, "minimum_slope")
+                ),
+                maximum_slope=(
+                    0.0
+                    if self_.get("maximum_slope") is None
+                    else _number(self_["maximum_slope"], where, "maximum_slope")
                 ),
             )
         except LimitValidationError as exc:
@@ -511,6 +620,40 @@ def loads(text: str) -> LimitSet:
             f"invalid JSON at line {exc.lineno} column {exc.colno}: {exc.msg}"
         ) from exc
     return LimitSet.from_dict(document)
+
+
+def dumps(limit_set: LimitSet) -> str:
+    """Serialize ``limit_set`` as a stable, human editable document.
+
+    Key order and indentation are fixed so a saved file diffs cleanly and can
+    still be edited by hand; floats are written exactly as stored, because a
+    bound is a specification and must not drift when it is re-read.
+    """
+    return json.dumps(limit_set.to_dict(), indent=2, sort_keys=False) + "\n"
+
+
+def save(limit_set: LimitSet, filename: str) -> None:
+    """Write ``limit_set`` to ``filename`` atomically.
+
+    The document is validated by construction, and the temporary file is
+    replaced only once it has been written and flushed, so a failure part way
+    through cannot leave a truncated limit set where a valid one was.
+    """
+    text = dumps(limit_set)
+    directory = os.path.dirname(os.path.abspath(filename)) or "."
+    handle, temporary = tempfile.mkstemp(
+        dir=directory, prefix=".nvlimits-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as target:
+            target.write(text)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, filename)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
 
 
 def load(filename: str) -> LimitSet:
@@ -919,31 +1062,65 @@ def _worst_of(
     ``violation`` is positive when the value is outside the bound and zero or
     negative when it is inside; the largest violation wins, so an infinite
     VSWR from a total reflection correctly beats any finite excess.
+
+    A sloped bound is evaluated at each sample's own frequency.  Comparing a
+    sample against the bound at the segment start would let a sloped limit
+    pass data it was written to reject, so the per-sample bound is used
+    whenever a slope is present.
     """
     values = [(metric.measure(point), point.freq) for point in points]
-    highest = max(values, key=lambda item: item[0])
-    lowest = min(values, key=lambda item: item[0])
+    sloped = bool(segment.minimum_slope or segment.maximum_slope)
     candidates: list[tuple[float, float, int, float, str]] = []
     if segment.maximum is not None:
-        candidates.append(
-            (
-                highest[0] - float(segment.maximum),
-                highest[0],
-                highest[1],
+        if sloped:
+            best = max(
+                (
+                    (
+                        value - segment.maximum_at(freq),
+                        value,
+                        freq,
+                        segment.maximum_at(freq),
+                        "maximum",
+                    )
+                    for value, freq in values
+                ),
+                key=lambda item: item[0],
+            )
+        else:
+            value, freq = max(values, key=lambda item: item[0])
+            best = (
+                value - float(segment.maximum),
+                value,
+                freq,
                 float(segment.maximum),
                 "maximum",
             )
-        )
+        candidates.append(best)
     if segment.minimum is not None:
-        candidates.append(
-            (
-                float(segment.minimum) - lowest[0],
-                lowest[0],
-                lowest[1],
+        if sloped:
+            best = max(
+                (
+                    (
+                        segment.minimum_at(freq) - value,
+                        value,
+                        freq,
+                        segment.minimum_at(freq),
+                        "minimum",
+                    )
+                    for value, freq in values
+                ),
+                key=lambda item: item[0],
+            )
+        else:
+            value, freq = min(values, key=lambda item: item[0])
+            best = (
+                float(segment.minimum) - value,
+                value,
+                freq,
                 float(segment.minimum),
                 "minimum",
             )
-        )
+        candidates.append(best)
     best = candidates[0]
     for candidate in candidates[1:]:
         if candidate[0] > best[0]:

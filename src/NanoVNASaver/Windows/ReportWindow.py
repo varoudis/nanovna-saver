@@ -229,6 +229,18 @@ class ReportWindow(QtWidgets.QWidget):
         self.combo_limits.setCurrentIndex(max(index, 0))
         self.combo_limits.blockSignals(False)
 
+    def limits_changed(self) -> None:
+        """The limit catalogue changed in the limits window (NEXT-04).
+
+        The selector is rebuilt so a newly loaded set becomes choosable, but
+        an explicit "No limits" choice is preserved: this is a notification,
+        not a selection.  An already frozen report is flagged stale rather
+        than rebuilt, because a frozen report is evidence of what was shown
+        at freeze time and must not change underneath the operator.
+        """
+        self._rebuild_limit_list()
+        self._mark_stale()
+
     def selected_limit_name(self) -> str:
         return str(self.combo_limits.currentData() or "")
 

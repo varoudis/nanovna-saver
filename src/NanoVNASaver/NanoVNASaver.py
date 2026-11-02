@@ -31,6 +31,7 @@ from .About import VERSION
 from .Analysis.Results import AnalysisKind
 from .Calibration import Calibration
 from .CalibrationCoverage import coverage_from_calibration
+from .ChartLimits import apply_chart_limits
 from .Charts import (
     CapacitanceChart,
     CombinedLogMagChart,
@@ -79,6 +80,7 @@ from .RFTools import corr_att_data
 from .Session import (
     SessionError,
     document_snapshots,
+    limit_sets_from_document,
     load_session,
     make_document,
     save_session,
@@ -496,6 +498,10 @@ class NanoVNASaver(QWidget):
             "setup": DisplaySettingsWindow(self),
             "tdr": TDRWindow(self),
         }
+
+        # A limit edit changes what a report will say, so it is a session
+        # change like any other; the window itself never talks to the session.
+        self.windows["limits"].catalogue_changed.connect(self._limits_changed)
 
         ###############################################################
         #  Sweep control
@@ -1556,6 +1562,20 @@ class NanoVNASaver(QWidget):
         for chart in self.subscribing_charts:
             chart.update()
 
+    def _limits_changed(self) -> None:
+        """React to a limit set edit made in the limits window (NEXT-04).
+
+        Three things follow one edit: the session becomes dirty, the charts
+        redraw the bounds now in force, and an open report window is told its
+        frozen evaluation no longer matches the catalogue (the report keeps
+        what it already froze).
+        """
+        self.mark_session_changed("limits")
+        self.refresh_chart_limits()
+        window = self.windows.get("report")
+        if window is not None and hasattr(window, "limits_changed"):
+            window.limits_changed()
+
     def refresh_trace_charts(self) -> None:
         """Push the visible traces into every multi-trace chart."""
         for parameter, charts in (
@@ -1566,6 +1586,17 @@ class NanoVNASaver(QWidget):
             for chart in charts:
                 if hasattr(chart, "setTraces"):
                     chart.setTraces(series)
+
+    def refresh_chart_limits(self) -> dict[tuple[str, str], int]:
+        """Draw the active limit set's bounds on the charts that plot it.
+
+        A bound is only drawn on a chart that plots the metric itself, so the
+        drawn line and the reported verdict always describe the same
+        quantity.  Charts without an applicable bound are cleared, because a
+        leftover line would advertise a specification that is no longer in
+        force.
+        """
+        return apply_chart_limits(self.charts, self.limits.active())
 
     def current_session_document(self, title: str = ""):
         """Freeze the current experiment into a session document."""
@@ -1595,6 +1626,8 @@ class NanoVNASaver(QWidget):
             },
             calibration=self.calibration_state(),
             calibration_files=self.calibration_file_state(),
+            limit_sets=self.limit_state(),
+            active_limit_set=self.limits.active_name,
             ui=self.ui_state(trace_ids),
         )
 
@@ -1659,6 +1692,46 @@ class NanoVNASaver(QWidget):
         except Exception:  # unrepresentable calibration stays out of the file
             logger.warning("Unable to serialize the calibration", exc_info=True)
             return {}
+
+    # -- limit set persistence (NEXT-03) -------------------------------
+    def limit_state(self) -> list[dict]:
+        """Embedded limit set documents for the session.
+
+        The *content* is stored, not a reference to the ``.nvlimits`` file
+        the set was loaded from: a session must reopen with the same limits
+        even when the file was moved, edited or deleted.  Frozen reports
+        continue to hold their own copy of the set, so saving a session
+        never mutates an existing report.
+        """
+        return [limit_set.to_dict() for limit_set in self.limits.all()]
+
+    def restore_limits(self, document) -> int:
+        """Replace the catalogue with the session's embedded limit sets.
+
+        Limiting this to a session restore keeps the user's own library
+        (``.nvlimits`` files on disk) untouched: opening a session is not an
+        import of a global limits library.  A malformed session is rejected
+        before this is called, so nothing is ever half-applied.
+
+        A session written before limit sets were embedded carries no limit
+        data at all; restoring it must leave the operator's own catalogue
+        alone rather than silently replacing it with an empty one.
+        """
+        if getattr(document, "format_version", 1) < 2:
+            return 0
+        limit_sets = limit_sets_from_document(document)
+        catalogue = LimitCatalogue()
+        for limit_set in limit_sets:
+            catalogue.add(limit_set)
+        if document.active_limit_set:
+            catalogue.activate(document.active_limit_set)
+        self.limits = catalogue
+        window = self.windows.get("limits")
+        if window is not None:
+            window.catalogue = catalogue
+            window.refresh(select=document.active_limit_set)
+        self.refresh_chart_limits()
+        return len(limit_sets)
 
     def _displayed_snapshot(self):
         """Snapshot of what is currently on screen, or ``None``.
@@ -1948,6 +2021,7 @@ class NanoVNASaver(QWidget):
             self._restore_markers(document)
             self._restore_sweep(document)
             self._restore_calibration(document)
+            self.restore_limits(document)
             self.apply_chart_state(document.charts)
             self._preset_analyses = _analysis_kinds(
                 document.analysis.get("kinds")

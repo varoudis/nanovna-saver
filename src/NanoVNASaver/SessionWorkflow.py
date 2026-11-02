@@ -69,6 +69,7 @@ EXPERIMENT_CHANGES = frozenset(
         "calibration",
         "analysis",
         "chart_selection",
+        "limits",
     }
 )
 

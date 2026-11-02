@@ -25,6 +25,7 @@ measurement and never starts a sweep.
 """
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -34,8 +35,12 @@ from ..Limits import (
     LimitCatalogue,
     LimitError,
     LimitEvaluation,
+    LimitRule,
+    LimitSegment,
     LimitSet,
+    Metric,
     Verdict,
+    save,
 )
 from .Defaults import make_scrollable
 from .ui import get_window_icon
@@ -53,6 +58,26 @@ LIMIT_FILE_FILTER = (
 ACTIVE_SUFFIX = " (active)"
 
 
+#: Display span used when a slope is shown per gigahertz.  The document stores
+#: a slope per hertz so it does not depend on how a UI chooses to display it.
+HZ_PER_GHZ = 1e9
+
+
+def _describe_bound(segment, kind: str) -> str:
+    """One bound as text, naming its slope when it has one.
+
+    A flat bound reads as before (``max 3``); a sloped bound is shown at both
+    ends plus the rate in dB per GHz, which is how an operator writes one.
+    """
+    flat = getattr(segment, kind)
+    slope = getattr(segment, f"{kind}_slope", 0.0)
+    if not slope:
+        return f"{kind} {flat:g}"
+    start = getattr(segment, f"{kind}_at")(segment.start)
+    stop = getattr(segment, f"{kind}_at")(segment.stop)
+    return f"{kind} {start:g} to {stop:g} ({slope * HZ_PER_GHZ:+g}/GHz)"
+
+
 def describe_limit_set(limit_set: LimitSet) -> str:
     """Read-only summary of every rule in a limit set."""
     lines = [limit_set.name, ""]
@@ -66,9 +91,9 @@ def describe_limit_set(limit_set: LimitSet) -> str:
         for segment in rule.segments:
             bounds = []
             if segment.minimum is not None:
-                bounds.append(f"min {segment.minimum:g}")
+                bounds.append(_describe_bound(segment, "minimum"))
             if segment.maximum is not None:
-                bounds.append(f"max {segment.maximum:g}")
+                bounds.append(_describe_bound(segment, "maximum"))
             unit = f" {rule.metric.unit}" if rule.metric.unit else ""
             lines.append(
                 f"  {segment.start} Hz to {segment.stop} Hz:"
@@ -83,6 +108,11 @@ def describe_result(result: LimitEvaluation) -> str:
 
 class LimitsWindow(QtWidgets.QWidget):
     """Load limit sets, elect one, and inspect the pass/fail results."""
+
+    #: Emitted after any change that alters the stored catalogue or which set
+    #: is active.  The main window turns this into a session change, so a
+    #: limit edit is recorded the same way any other experiment change is.
+    catalogue_changed = QtCore.Signal()
 
     def __init__(
         self,
@@ -128,6 +158,26 @@ class LimitsWindow(QtWidgets.QWidget):
         transfer.addWidget(self.btn_load)
         transfer.addWidget(self.btn_remove)
         layout.addLayout(transfer)
+
+        editing = QtWidgets.QHBoxLayout()
+        self.btn_new = QtWidgets.QPushButton("New ...")
+        self.btn_new.setToolTip("Create a limit set without editing JSON")
+        self.btn_new.clicked.connect(self.create_set)
+        self.btn_edit = QtWidgets.QPushButton("Edit ...")
+        self.btn_edit.clicked.connect(self.edit_selected)
+        self.btn_duplicate = QtWidgets.QPushButton("Duplicate")
+        self.btn_duplicate.clicked.connect(self.duplicate_selected)
+        self.btn_export = QtWidgets.QPushButton("Export ...")
+        self.btn_export.setToolTip("Write the selected set to a .nvlimits file")
+        self.btn_export.clicked.connect(self.export_selected)
+        for widget in (
+            self.btn_new,
+            self.btn_edit,
+            self.btn_duplicate,
+            self.btn_export,
+        ):
+            editing.addWidget(widget)
+        layout.addLayout(editing)
 
         use = QtWidgets.QHBoxLayout()
         self.btn_activate = QtWidgets.QPushButton("Use for reports")
@@ -259,7 +309,108 @@ class LimitsWindow(QtWidgets.QWidget):
             return None
         self.refresh(select=limit_set.name)
         self._set_message(f"Loaded limit set {limit_set.name!r}.")
+        self.catalogue_changed.emit()
         return limit_set
+
+    # ------------------------------------------------------------------
+    # Editing (NEXT-04)
+    # ------------------------------------------------------------------
+    def _edit(self, limit_set: LimitSet) -> LimitSet | None:
+        """Run the editor as a transaction; store only an applied result."""
+        from .LimitEditor import LimitEditor
+
+        dialog = LimitEditor(limit_set, self)
+        try:
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                self._set_message("Limit set edit cancelled; nothing changed.")
+                return None
+            candidate = dialog.result_set
+        finally:
+            dialog.deleteLater()
+        if candidate is None:
+            return None
+        try:
+            stored = self.catalogue.add(candidate)
+        except LimitError as exc:
+            # The editor validates the same way a file is validated, so this
+            # is a guard against a race rather than an expected path.
+            self._set_message(str(exc))
+            return None
+        self.refresh(select=stored.name)
+        self._set_message(f"Stored limit set {stored.name!r}.")
+        self.catalogue_changed.emit()
+        return stored
+
+    def _blank_set(self) -> LimitSet:
+        """A minimal valid set, so a new document needs no repair first."""
+        start = 1_000_000
+        return LimitSet(
+            name="New limit set",
+            rules=(
+                LimitRule(
+                    metric=Metric.S11_VSWR,
+                    segments=(
+                        LimitSegment(
+                            start=start,
+                            stop=start + 10_000_000,
+                            maximum=2.0,
+                        ),
+                    ),
+                    id="rule-1",
+                    label="Match",
+                ),
+            ),
+        )
+
+    def create_set(self) -> LimitSet | None:
+        """Create a new set in the editor."""
+        return self._edit(self._blank_set())
+
+    def edit_selected(self) -> LimitSet | None:
+        limit_set = self.selected_limit_set()
+        if limit_set is None:
+            self._set_message("Select a limit set first.")
+            return None
+        return self._edit(limit_set)
+
+    def duplicate_selected(self) -> LimitSet | None:
+        """Copy the selected set under a name that does not collide."""
+        from .LimitEditor import duplicate_name
+
+        limit_set = self.selected_limit_set()
+        if limit_set is None:
+            self._set_message("Select a limit set first.")
+            return None
+        taken = set(self.catalogue.names())
+        copy = replace(limit_set, name=duplicate_name(limit_set, taken))
+        self.catalogue.add(copy)
+        self.refresh(select=copy.name)
+        self._set_message(f"Copied to {copy.name!r}.")
+        self.catalogue_changed.emit()
+        return copy
+
+    def export_selected(self, filename: str = "") -> str:
+        """Write the selected set to a file; returns the path or ``""``."""
+        limit_set = self.selected_limit_set()
+        if limit_set is None:
+            self._set_message("Select a limit set first.")
+            return ""
+        if not filename:
+            filename, _selected = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Export limit set",
+                f"{limit_set.name}{LIMIT_SUFFIX}",
+                LIMIT_FILE_FILTER,
+            )
+            if not filename:
+                return ""
+        try:
+            save(limit_set, filename)
+        except OSError as exc:
+            self._set_message(f"could not write {filename}: {exc}")
+            return ""
+        self._set_message(f"Exported limit set to {filename}.")
+        return filename
 
     def remove_selected(self) -> bool:
         name = self.selected_name()
@@ -270,6 +421,7 @@ class LimitsWindow(QtWidgets.QWidget):
         if removed:
             self.refresh()
             self._set_message(f"Removed limit set {name!r}.")
+            self.catalogue_changed.emit()
         return removed
 
     def activate_selected(self) -> LimitSet | None:
@@ -280,12 +432,14 @@ class LimitsWindow(QtWidgets.QWidget):
         limit_set = self.catalogue.activate(name)
         self.refresh(select=name)
         self._set_message(f"Reports now use limit set {name!r}.")
+        self.catalogue_changed.emit()
         return limit_set
 
     def deactivate(self) -> None:
         self.catalogue.deactivate()
         self.refresh()
         self._set_message("Reports are built without limit checks.")
+        self.catalogue_changed.emit()
 
     def active_limit_set(self) -> LimitSet | None:
         return self.catalogue.active()

@@ -26,6 +26,7 @@ import pytest
 from NanoVNASaver.Limits import (
     GAP_FACTOR,
     LIMIT_SET_FORMAT,
+    LIMIT_SET_VERSION,
     LimitCatalogue,
     LimitError,
     LimitFormatError,
@@ -149,8 +150,17 @@ class TestMalformedDocuments:
 
     @staticmethod
     def test_newer_version_is_rejected():
+        # The document version is pinned to a genuinely unsupported schema,
+        # not to a number that a later revision happened to adopt.
         with pytest.raises(LimitFormatError) as info:
-            loads(json.dumps({"format": LIMIT_SET_FORMAT, "version": 2}))
+            loads(
+                json.dumps(
+                    {
+                        "format": LIMIT_SET_FORMAT,
+                        "version": LIMIT_SET_VERSION + 1,
+                    }
+                )
+            )
         assert "newer than supported" in str(info.value)
 
     @staticmethod

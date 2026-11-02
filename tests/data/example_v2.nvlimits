@@ -1,0 +1,42 @@
+{
+  "format": "nanovna-saver-limits",
+  "version": 2,
+  "name": "Feedline sweep with a sloped ceiling",
+  "description": "Version 2 example: a flat VSWR bound, a feedline loss ceiling that loosens with frequency, and a wrapped-phase window. Slopes are stored per hertz.",
+  "rules": [
+    {
+      "id": "match",
+      "label": "Antenna match",
+      "metric": "s11_vswr",
+      "segments": [
+        { "start_hz": 144000000, "stop_hz": 146000000, "maximum": 2.0 }
+      ]
+    },
+    {
+      "id": "path",
+      "label": "Feedline loss",
+      "metric": "s21_insertion_loss_db",
+      "segments": [
+        {
+          "start_hz": 144000000,
+          "stop_hz": 146000000,
+          "maximum": 2.0,
+          "maximum_slope": 5e-07
+        }
+      ]
+    },
+    {
+      "id": "phase",
+      "label": "Wrapped phase window",
+      "metric": "s11_phase_deg",
+      "segments": [
+        {
+          "start_hz": 144000000,
+          "stop_hz": 146000000,
+          "minimum": -90.0,
+          "maximum": 90.0
+        }
+      ]
+    }
+  ]
+}
