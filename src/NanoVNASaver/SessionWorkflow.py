@@ -70,6 +70,7 @@ EXPERIMENT_CHANGES = frozenset(
         "analysis",
         "chart_selection",
         "limits",
+        "tuning_history",
     }
 )
 
@@ -216,6 +217,44 @@ def write_recovery(document: SessionDocument, state: SessionState) -> str:
     return target
 
 
+def forget_tuning_history(app) -> int:
+    """Drop the tuning history: a new session starts with no steps."""
+    target = getattr(app, "tuning_history_target", None)
+    if not callable(target):
+        return 0
+    return int(target({}) or 0)
+
+
+def record_tuning_history(app, document: SessionDocument) -> bool:
+    """Attach the antenna tuning history to ``document`` before it is saved.
+
+    The tuning history lives inside the tuning window, which installs
+    ``tuning_history_source`` on the application (a callable returning the
+    history document).  Probing for the attribute instead of importing the
+    window keeps this module widget-free, and an application without a tuning
+    window saves no history rather than an empty stand-in.
+    """
+    source = getattr(app, "tuning_history_source", None)
+    if not callable(source):
+        return False
+    document.tuning_history = dict(source() or {})
+    return True
+
+
+def restore_tuning_history(app, document: SessionDocument) -> int:
+    """Hand a restored document's history to the tuning window.
+
+    An older session has no ``tuning_history`` key at all, which means an
+    empty history - not an error and not a reason to keep the previous
+    session's steps.  The window installs ``tuning_history_target``; without
+    one there is nothing to restore into.
+    """
+    target = getattr(app, "tuning_history_target", None)
+    if not callable(target):
+        return 0
+    return int(target(dict(document.tuning_history or {})) or 0)
+
+
 def discard_recovery(state: SessionState) -> bool:
     """Remove the recovery file after a deliberate save or discard."""
     target = state.recovery_filename or recovery_path_for(state.filename)
@@ -308,5 +347,8 @@ def summary_lines(outcome: RestoreOutcome) -> Iterable[str]:
         created = document.created.astimezone(timezone.utc)
         yield f"Created: {created:%Y-%m-%d %H:%M UTC}"
     yield f"Traces: {len(document.traces)}"
+    steps = len((document.tuning_history or {}).get("steps") or ())
+    if steps:
+        yield f"Tuning steps: {steps}"
     for line in outcome.warnings:
         yield f"Note: {line}"

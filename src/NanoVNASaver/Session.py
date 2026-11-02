@@ -32,6 +32,12 @@ Format rule: numeric arrays are written with ``repr`` precision preserved by
 ``json``'s float serialization, so a saved/reloaded array round-trips exactly
 for finite values.  Non-finite values are stored as the strings ``"nan"``,
 ``"inf"`` and ``"-inf"``.
+
+Compatibility: the antenna tuning history (TUNE-01) is an *optional* object
+in the manifest (``tuning_history``).  Sessions written before it existed
+have no such key and load with an empty history and every other part of
+their state intact, so the session format version was not bumped for it.
+Readers ignore keys they do not know.
 """
 
 from __future__ import annotations
@@ -205,6 +211,10 @@ class SessionDocument:
     limit_sets: list[dict[str, Any]] = field(default_factory=list)
     #: Name of the limit set that was active when the session was saved.
     active_limit_set: str = ""
+    #: Antenna tuning history document (TUNE-01).  Optional: sessions saved
+    #: before it existed carry no key at all and load with an empty history,
+    #: which is why the session version was not bumped for it.
+    tuning_history: dict[str, Any] = field(default_factory=dict)
     ui: dict[str, Any] = field(default_factory=dict)
 
     def to_manifest(self) -> dict[str, Any]:
@@ -229,6 +239,7 @@ class SessionDocument:
             "calibration_files": sorted(self.calibration_files),
             "limit_sets": self.limit_sets,
             "active_limit_set": self.active_limit_set,
+            "tuning_history": self.tuning_history,
             "ui": self.ui,
         }
 
@@ -254,6 +265,7 @@ class SessionDocument:
             },
             limit_sets=list(manifest.get("limit_sets") or []),
             active_limit_set=str(manifest.get("active_limit_set", "")),
+            tuning_history=dict(manifest.get("tuning_history") or {}),
             ui=dict(manifest.get("ui") or {}),
         )
 
@@ -453,6 +465,7 @@ def make_document(  # noqa: PLR0913
     calibration_files: dict[str, str] | None = None,
     limit_sets: list[dict] | None = None,
     active_limit_set: str = "",
+    tuning_history: dict | None = None,
     ui: dict | None = None,
 ) -> SessionDocument:
     """Assemble a document from snapshots (SESSION-01.2)."""
@@ -481,6 +494,7 @@ def make_document(  # noqa: PLR0913
         calibration_files=dict(calibration_files or {}),
         limit_sets=list(limit_sets or []),
         active_limit_set=active_limit_set,
+        tuning_history=dict(tuning_history or {}),
         ui=dict(ui or {}),
     )
     return document

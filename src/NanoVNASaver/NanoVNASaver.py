@@ -102,8 +102,11 @@ from .SessionWorkflow import (
     decide_unsaved_action,
     discard_recovery,
     find_recovery_for,
+    forget_tuning_history,
     plan_restore,
+    record_tuning_history,
     recovery_is_due,
+    restore_tuning_history,
     session_path_for,
     summary_lines,
     write_recovery,
@@ -1711,7 +1714,7 @@ class NanoVNASaver(QWidget):
         """Freeze the current experiment into a session document."""
         snapshots, trace_ids = self._current_snapshots()
         collection = self.trace_control.collection
-        return make_document(
+        document = make_document(
             snapshots,
             trace_ids=trace_ids,
             trace_names={
@@ -1739,6 +1742,11 @@ class NanoVNASaver(QWidget):
             active_limit_set=self.limits.active_name,
             ui=self.ui_state(trace_ids),
         )
+        # The tuning history is owned by its window (TUNE-01); attaching it
+        # here means a deliberate save, a recovery snapshot and save-as all
+        # carry the same record, frozen at this moment.
+        record_tuning_history(self, document)
+        return document
 
     def ui_state(self, trace_ids=None) -> dict:
         """View state that is part of the experiment, not of the settings.
@@ -1979,6 +1987,7 @@ class NanoVNASaver(QWidget):
             return
         discard_recovery(self.session)
         self.session.reset(title="Untitled")
+        forget_tuning_history(self)
         self._restoring = True
         try:
             self.data = Touchstone()
@@ -2128,6 +2137,9 @@ class NanoVNASaver(QWidget):
             self._restore_sweep(document)
             self._restore_calibration(document)
             self.restore_limits(document)
+            # An older session carries no history at all, which restores as
+            # an empty one instead of keeping the previous session's steps.
+            restore_tuning_history(self, document)
             self.apply_chart_state(document.charts)
             self._preset_analyses = _analysis_kinds(
                 document.analysis.get("kinds")

@@ -74,6 +74,12 @@ from ..Formatting import (
 )
 from ..Measurement import CompletionState
 from ..SweepState import SweepState
+from ..TuningHistory import (
+    TuningAppendError,
+    TuningFormatError,
+    TuningHistory,
+    band_for,
+)
 from .Defaults import make_scrollable
 from .ui import get_window_icon
 
@@ -89,6 +95,33 @@ class Phase:
     OVERVIEW = "overview"
     ZOOM = "zoom"
     REPEAT = "repeat"
+
+
+#: Trace id of the measurement currently displayed (see
+#: ``NanoVNASaver.NanoVNASaver.LIVE_TRACE_ID``).  A history step says which
+#: trace it describes without importing the application.
+LIVE_TRACE_ID = "trace-live"
+
+
+def _parse_settings(text: str) -> dict[str, str]:
+    """Parse ``"name=value; name=value"`` into a mapping.
+
+    Free text is the whole point of the field, so a fragment without ``=``
+    is kept under a numeric key rather than dropped.
+    """
+    settings: dict[str, str] = {}
+    for chunk in (text or "").split(";"):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        if "=" in entry:
+            key, _, value = entry.partition("=")
+            key, value = key.strip(), value.strip()
+        else:
+            key, value = f"item{len(settings) + 1}", entry
+        if key:
+            settings[key] = value
+    return settings
 
 
 @dataclass(frozen=True)
@@ -134,12 +167,21 @@ class AntennaTuningWindow(QtWidgets.QWidget):
         #: run may complete before the stop request lands.  Matching the
         #: token keeps somebody else's terminal out of this workflow.
         self._abandoned_token: object = None
+        #: Completed tuning steps of this session (TUNE-01).  Append-only;
+        #: the window owns the record and the session saves it.
+        self.history = TuningHistory()
+        #: The window installs both hooks on the application *instance* so
+        #: session plumbing (which must stay widget-free) can reach the
+        #: record without importing this module.
+        app.tuning_history_source = self.history_document
+        app.tuning_history_target = self.restore_history
 
         layout = QtWidgets.QVBoxLayout()
         make_scrollable(self, layout)
         layout.addWidget(self._build_overview_box())
         layout.addWidget(self._build_zoom_box())
         layout.addWidget(self._build_status_box())
+        layout.addWidget(self._build_history_box())
         layout.addWidget(self._build_export_box())
 
         app.worker.signals.run_finished.connect(self._on_run_finished)
@@ -311,7 +353,7 @@ class AntennaTuningWindow(QtWidgets.QWidget):
         return box
 
     def _build_export_box(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("3. Export the measurement")
+        box = QtWidgets.QGroupBox("4. Export the measurement")
         form = QtWidgets.QFormLayout(box)
         self.label_export = QtWidgets.QLabel("")
         self.label_export.setWordWrap(True)
@@ -330,6 +372,256 @@ class AntennaTuningWindow(QtWidgets.QWidget):
         self.btn_export.clicked.connect(self.choose_and_export)
         form.addRow(self.btn_export)
         return box
+
+    def _build_history_box(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("3. Tuning history")
+        form = QtWidgets.QFormLayout(box)
+        self.label_history = QtWidgets.QLabel("")
+        self.label_history.setWordWrap(True)
+        self.label_history.setObjectName("antenna_tuning_history")
+        form.addRow(self.label_history)
+
+        self.list_history = QtWidgets.QListWidget()
+        self.list_history.setObjectName("antenna_tuning_history_list")
+        self.list_history.setMinimumHeight(110)
+        self.list_history.setToolTip(
+            "Every completed tuning step of this session, oldest first."
+        )
+        self.list_history.currentRowChanged.connect(
+            self._refresh_history_details
+        )
+        form.addRow(self.list_history)
+
+        self.label_trend = QtWidgets.QLabel("")
+        self.label_trend.setWordWrap(True)
+        self.label_trend.setObjectName("antenna_tuning_trend")
+        form.addRow("Comparison", self.label_trend)
+
+        self.history_notes = QtWidgets.QLineEdit()
+        self.history_notes.setPlaceholderText(
+            "Note for the next recorded step, e.g. 'element shortened 5 mm'"
+        )
+        form.addRow("Note", self.history_notes)
+        self.history_settings = QtWidgets.QLineEdit()
+        self.history_settings.setPlaceholderText(
+            "Component/position, e.g. 'coil=3.5 turns; tap=12 mm'"
+        )
+        form.addRow("Settings", self.history_settings)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.btn_recall = QtWidgets.QPushButton("Recall span")
+        self.btn_recall.setToolTip(
+            "Fill the sweep form with a recorded step's span. Nothing is"
+            " measured: press a sweep button when you are ready."
+        )
+        self.btn_recall.clicked.connect(self.recall_selected)
+        self.btn_clear_history = QtWidgets.QPushButton("Clear history")
+        self.btn_clear_history.setToolTip(
+            "Forget every recorded step of this session."
+        )
+        self.btn_clear_history.clicked.connect(self.clear_history)
+        buttons.addWidget(self.btn_recall)
+        buttons.addWidget(self.btn_clear_history)
+        form.addRow(buttons)
+
+        export_row = QtWidgets.QHBoxLayout()
+        self.btn_export_history_json = QtWidgets.QPushButton(
+            "Export history JSON ..."
+        )
+        self.btn_export_history_json.clicked.connect(
+            lambda: self.export_history("json")
+        )
+        self.btn_export_history_csv = QtWidgets.QPushButton(
+            "Export history CSV ..."
+        )
+        self.btn_export_history_csv.clicked.connect(
+            lambda: self.export_history("csv")
+        )
+        export_row.addWidget(self.btn_export_history_json)
+        export_row.addWidget(self.btn_export_history_csv)
+        form.addRow(export_row)
+        self._refresh_history()
+        return box
+
+    # ------------------------------------------------------------------
+    # Tuning history (TUNE-01)
+    # ------------------------------------------------------------------
+    def history_document(self) -> dict:
+        """The session-persistable form of the recorded steps."""
+        return self.history.to_dict()
+
+    def restore_history(self, document) -> int:
+        """Replace the record with a session's history; returns step count.
+
+        An empty or absent document is an empty history, which is what a
+        session written before the history existed means.  A malformed one is
+        reported instead of being silently treated as empty.
+        """
+        try:
+            self.history = TuningHistory.from_dict(document)
+        except TuningFormatError as exc:
+            self.history = TuningHistory()
+            self._set_status(
+                f"The session's tuning history could not be read: {exc}",
+                error=True,
+            )
+            self._refresh_history()
+            return 0
+        self._refresh_history()
+        return len(self.history)
+
+    def forget_history(self) -> int:
+        """Drop every step: a new session starts with no history."""
+        removed = self.history.clear()
+        self._refresh_history()
+        return removed
+
+    def _bands(self) -> list:
+        bands = getattr(self.app, "bands", None)
+        return list(getattr(bands, "bands", ()) or ())
+
+    def record_step(
+        self,
+        *,
+        snapshot,
+        plan: SweepPlan,
+        minimum: MinimumPoint,
+        run_id: str,
+    ) -> bool:
+        """Append one completed step; a refusal is reported, never hidden."""
+        try:
+            result = self.history.append(
+                snapshot=snapshot,
+                plan=plan,
+                minimum=minimum,
+                run_id=run_id,
+                band=band_for(minimum.freq, self._bands()),
+                trace_id=LIVE_TRACE_ID,
+                notes=self.history_notes.text().strip(),
+                settings=_parse_settings(self.history_settings.text()),
+            )
+        except TuningAppendError as exc:
+            self._set_status(
+                f"This measurement was not recorded in the history: {exc}",
+                error=True,
+            )
+            return False
+        if result.duplicate:
+            return False
+        if result.dropped:
+            self._set_status(
+                f"{len(result.dropped)} older tuning step(s) were dropped:"
+                f" the history keeps its most recent {self.history.max_steps}."
+            )
+        self.app.mark_session_changed("tuning_history")
+        self._refresh_history(select=len(self.history) - 1)
+        return True
+
+    def recall_selected(self) -> bool:
+        """Fill the sweep form from a recorded step.  Starts nothing."""
+        row = self.list_history.currentRow()
+        if not 0 <= row < len(self.history):
+            self._set_status(
+                "Select a recorded step to recall its span.", error=True
+            )
+            return False
+        recall = self.history.recall(row)
+        self.overview_start.setText(format_frequency_sweep(recall.start))
+        self.overview_stop.setText(format_frequency_sweep(recall.end))
+        index = self.overview_points.findData(recall.points)
+        if index >= 0:
+            self.overview_points.setCurrentIndex(index)
+        self.overview_segments.setValue(recall.segments)
+        self.overview_log.setChecked(recall.logarithmic)
+        self._refresh_plan_preview()
+        self._set_status(
+            f"Recalled step {row + 1}: {recall.describe()}. Nothing was"
+            " swept; press Overview sweep to measure that span again."
+        )
+        return True
+
+    def clear_history(self) -> int:
+        removed = self.forget_history()
+        if removed:
+            self.app.mark_session_changed("tuning_history")
+        self._set_status(
+            f"Cleared {removed} tuning step(s) from the history."
+            if removed
+            else "The tuning history is already empty."
+        )
+        return removed
+
+    def export_history(self, kind: str) -> Path | None:
+        """Export the whole history as JSON or CSV."""
+        if self.history.empty:
+            self._set_status(
+                "There is no tuning history to export yet.", error=True
+            )
+            return None
+        filters = {
+            "json": "JSON (*.json);;All files (*.*)",
+            "csv": "CSV (*.csv);;All files (*.*)",
+        }
+        suffix = f".{kind}"
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            f"Export tuning history ({kind.upper()})",
+            str(Path.home() / f"tuning-history{suffix}"),
+            filters[kind],
+        )
+        if not filename:
+            return None
+        target = Path(filename)
+        if target.suffix.lower() != suffix:
+            target = target.with_suffix(suffix)
+        try:
+            if kind == "json":
+                written = self.history.export_json(target)
+            else:
+                written = self.history.export_csv(target)
+        except (OSError, TuningFormatError) as exc:
+            self.app.showError(f"Unable to export the tuning history: {exc}")
+            return None
+        self._set_status(
+            f"Exported {len(self.history)} tuning step(s) to {written}"
+        )
+        return Path(written)
+
+    def _refresh_history(self, select: int | None = None) -> None:
+        blocked = self.list_history.blockSignals(True)
+        try:
+            self.list_history.clear()
+            for index, step in enumerate(self.history, start=1):
+                item = QtWidgets.QListWidgetItem(f"{index}. {step.describe()}")
+                item.setToolTip(step.describe())
+                self.list_history.addItem(item)
+        finally:
+            self.list_history.blockSignals(blocked)
+        if select is None:
+            select = len(self.history) - 1
+        if 0 <= select < self.list_history.count():
+            self.list_history.setCurrentRow(select)
+        else:
+            self.list_history.setCurrentRow(-1)
+        self.label_history.setText(self.history.summary())
+        self._refresh_history_details()
+        has_steps = not self.history.empty
+        self.btn_recall.setEnabled(has_steps)
+        self.btn_clear_history.setEnabled(has_steps)
+        self.btn_export_history_json.setEnabled(has_steps)
+        self.btn_export_history_csv.setEnabled(has_steps)
+
+    def _refresh_history_details(self, *_args) -> None:
+        row = self.list_history.currentRow()
+        if not 0 <= row < len(self.history):
+            self.label_trend.setText(
+                "Completed steps appear here with their comparison."
+            )
+            return
+        comparison = self.history.trend(row)
+        self.label_trend.setText(
+            "\n".join(comparison.lines()) if comparison else ""
+        )
 
     # ------------------------------------------------------------------
     # Device facts and defaults
@@ -778,6 +1070,16 @@ class AntennaTuningWindow(QtWidgets.QWidget):
         if self.chk_marker.isChecked():
             self._place_marker(result.minimum)
         self._last_plan = pending.plan
+        # Only a completed sweep whose samples match the plan reaches this
+        # point, so this is the single place a step can be recorded: a
+        # cancelled or failed run never arrives here, and a duplicated
+        # completion is refused by the run's own token upstream.
+        self.record_step(
+            snapshot=snapshot,
+            plan=pending.plan,
+            minimum=result.minimum,
+            run_id=_run_identity(snapshot, pending),
+        )
         self.zoom_span.setText(
             format_frequency_sweep(
                 auto_zoom_span(pending.plan.span, pending.plan.points)
@@ -1045,6 +1347,19 @@ def confirm_overwrite(parent, filename: str) -> bool:
         QtWidgets.QMessageBox.StandardButton.No,
     )
     return answer == QtWidgets.QMessageBox.StandardButton.Yes
+
+
+def _run_identity(snapshot, pending: "PendingStep") -> str:
+    """Identity of the run that produced ``snapshot``.
+
+    The pending step's token is the only thing that can prove ownership, but
+    it must never be serialised.  Its ``id`` is unique for the lifetime of
+    the process and the snapshot id is unique per capture, so together they
+    identify the run for the one purpose the history needs: recognising a
+    duplicated completion inside this session.
+    """
+    token = pending.token
+    return f"{token.__class__.__name__}-{id(token):x}-{snapshot.id}"
 
 
 def _same_value(a: float, b: float) -> bool:
