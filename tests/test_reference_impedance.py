@@ -33,6 +33,7 @@ load may not.
 """
 
 import math
+from pathlib import Path
 
 import pytest
 
@@ -617,6 +618,15 @@ class TestAudit:
         # The charts now carry the reference from the data they draw.
         assert statuses_of("src/NanoVNASaver/Charts/RIZ.py") == {PROPAGATED}
         assert statuses_of("src/NanoVNASaver/Charts/Chart.py") == {PROPAGATED}
+
+    def test_every_location_names_an_existing_file_and_line(self):
+        """The audit cannot rot into pointers at code that moved away."""
+        for entry in AUDIT_TABLE:
+            path, _, line = entry.location.partition(":")
+            source = Path(path)
+            assert source.is_file(), entry.location
+            line_count = len(source.read_text(encoding="utf-8").splitlines())
+            assert 1 <= int(line) <= line_count, entry.location
 
     def test_audit_rows_survive_into_the_public_api(self):
         from NanoVNASaver import ReferenceImpedance as module
