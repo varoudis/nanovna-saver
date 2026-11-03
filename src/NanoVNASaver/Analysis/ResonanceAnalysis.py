@@ -25,7 +25,7 @@ from PySide6 import QtWidgets
 
 from .. import AnalyticTools as At
 from ..Formatting import format_frequency, format_resistance
-from ..RFTools import reflection_coefficient
+from ..RFTools import magnitude, reflection_coefficient
 from .Base import Analysis, QHLine
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ def format_resistence_neg(x):
 
 def vswr_transformed(z, ratio=49) -> float:
     refl = reflection_coefficient(z / ratio)
-    mag = abs(refl)
+    mag = magnitude(refl)
     return 1 if mag == 1 else (1 + mag) / (1 - mag)
 
 

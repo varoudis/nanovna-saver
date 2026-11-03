@@ -90,7 +90,6 @@ from .Measurement import (
 )
 from .Processing import ProcessingConfig, RunningAverageState
 from .ReferenceImpedance import DEFAULT_REFERENCE_IMPEDANCE
-from .RFTools import corr_att_data
 from .Session import (
     SessionError,
     document_snapshots,
@@ -905,11 +904,18 @@ class NanoVNASaver(QWidget):
         # self.threadpool.start(self.worker)
 
     def saveData(self, data, data21, source=None):
+        """Publish one acquisition or loaded file as the live data.
+
+        The inline S21 attenuator is *not* applied here: it is a physical pad
+        in front of the S21 input, so the acquisition undoes it before the
+        calibration (see ``SweepWorker.applyCalibration``).  Scaling the
+        published channel instead left an isolation residue in every
+        corrected sample, and it also scaled files loaded from disk, which
+        were never measured through the pad.
+        """
         with self.dataLock:
             self.data.s11 = data
             self.data.s21 = data21
-            if self.s21att > 0:
-                self.data.s21 = corr_att_data(self.data.s21, self.s21att)
         if source is not None:
             self.sweepSource = source
         else:

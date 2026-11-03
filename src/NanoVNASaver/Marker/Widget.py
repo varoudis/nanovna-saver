@@ -385,14 +385,18 @@ class Marker(QtCore.QObject, Value):
         self.label["s11groupdelay"].setText(
             format_group_delay(RFTools.groupDelay(s11, self.location))
         )
-        self.label["s11mag"].setText(format_magnitude(abs(_s11.z)))
+        self.label["s11mag"].setText(
+            format_magnitude(RFTools.magnitude(_s11.z))
+        )
         self.label["s11phase"].setText(format_phase(_s11.phase))
-        self.label["s11polar"].setText(format_polar(abs(_s11.z), _s11.phase))
+        self.label["s11polar"].setText(
+            format_polar(RFTools.magnitude(_s11.z), _s11.phase)
+        )
 
         self.label["s11q"].setText(
             format_q_factor(_s11.qFactor(self.reference_impedance))
         )
-        self.label["s11z"].setText(format_resistance(abs(imp)))
+        self.label["s11z"].setText(format_resistance(RFTools.magnitude(imp)))
         self.label["serc"].setText(cap_str)
         self.label["serl"].setText(ind_str)
         self.label["serlc"].setText(x_str)
@@ -405,19 +409,25 @@ class Marker(QtCore.QObject, Value):
             self.label["s21groupdelay"].setText(
                 format_group_delay(RFTools.groupDelay(s21, self.location) / 2)
             )
-            self.label["s21mag"].setText(format_magnitude(abs(_s21.z)))
+            self.label["s21mag"].setText(
+                format_magnitude(RFTools.magnitude(_s21.z))
+            )
             self.label["s21phase"].setText(format_phase(_s21.phase))
             self.label["s21polar"].setText(
-                format_polar(abs(_s21.z), _s21.phase)
+                format_polar(RFTools.magnitude(_s21.z), _s21.phase)
             )
             self.label["s21magshunt"].setText(
                 format_magnitude(
-                    abs(_s21.shuntImpedance(self.reference_impedance))
+                    RFTools.magnitude(
+                        _s21.shuntImpedance(self.reference_impedance)
+                    )
                 )
             )
             self.label["s21magseries"].setText(
                 format_magnitude(
-                    abs(_s21.seriesImpedance(self.reference_impedance))
+                    RFTools.magnitude(
+                        _s21.seriesImpedance(self.reference_impedance)
+                    )
                 )
             )
             self.label["s21realimagshunt"].setText(

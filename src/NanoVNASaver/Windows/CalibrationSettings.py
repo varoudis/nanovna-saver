@@ -1001,11 +1001,10 @@ class CalibrationWindow(QtWidgets.QWidget):
 
         One correction does belong in the stored value.  The inline S21
         attenuator is part of the measurement configuration, not of the
-        processing pipeline: ``saveData`` applies it to every published
-        sweep, so a transmission standard is stored with that same factor to
-        keep the error terms on the unattenuated footing the displayed
-        correction is computed on.  Dropping it here makes the recovered
-        DUT wrong by exactly the attenuator ratio.
+        processing pipeline, and the acquisition undoes it before the
+        calibration runs.  A transmission standard is therefore stored with
+        that same factor applied to its raw samples, on the unattenuated
+        footing the correction is computed on.
 
         Data that did not come from an acquisition -- a loaded file, or a
         trace whose published samples no longer match this acquisition --
@@ -1021,13 +1020,12 @@ class CalibrationWindow(QtWidgets.QWidget):
         displayed = snapshot.channel(channel)
         if not raw or not displayed:
             return published
-        # ``saveData`` publishes the acquisition's own samples plus the
-        # inline attenuator, so that is the expected difference; anything
-        # else means the trace is no longer this acquisition.
-        expected = corr_att_data(list(displayed), att)
-        if len(expected) != len(published) or any(
+        # ``saveData`` publishes the acquisition's corrected channel as it
+        # stands; anything else means the trace is no longer this
+        # acquisition.
+        if len(displayed) != len(published) or any(
             now.freq != published_point.freq or now.z != published_point.z
-            for now, published_point in zip(expected, published, strict=True)
+            for now, published_point in zip(displayed, published, strict=True)
         ):
             return published
         return corr_att_data(list(raw), att)
@@ -1250,11 +1248,19 @@ class CalibrationWindow(QtWidgets.QWidget):
         self._pending_element = None
 
         if len(self.app.worker.rawData11) > 0:
-            # There's raw data, so we can get corrected data
-            logger.debug("Saving and displaying raw data.")
+            # Republish what an uncalibrated sweep of the same raw data
+            # would: the attenuator and offset delay are applied by
+            # ``applyCalibration``, not by ``saveData``.
+            logger.debug("Saving and displaying uncalibrated data.")
+            (
+                self.app.worker.data11,
+                self.app.worker.data21,
+            ) = self.app.worker.applyCalibration(
+                self.app.worker.rawData11, self.app.worker.rawData21
+            )
             self.app.saveData(
-                self.app.worker.rawData11,
-                self.app.worker.rawData21,
+                self.app.worker.data11,
+                self.app.worker.data21,
                 self.app.sweepSource,
             )
             self.app.worker.signals.updated.emit()

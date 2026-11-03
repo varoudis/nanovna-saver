@@ -1000,12 +1000,16 @@ class TestDeclaredGridCompleteness:
         assert result.verdict is Verdict.PASS, result.reason
 
     @staticmethod
-    def test_legitimate_join_duplicates_are_accepted():
-        # A logarithmic multi-segment grid repeats the joint frequency: the
-        # declared grid itself contains it twice, so it is not an extra.
+    def test_a_segmented_log_join_is_one_frequency_not_two():
+        """Each segment boundary now appears exactly once.
+
+        A logarithmic multi-segment grid used to repeat the joint frequency,
+        and the completeness check had to accept that repeat.  The repeat is
+        gone, so the declared grid is the captured grid one-for-one.
+        """
         sweep = Sweep(500_000, 30_000_000, 101, 2, Properties(logarithmic=True))
         frequencies = list(sweep.get_frequencies())
-        assert len(frequencies) != len(set(frequencies))
+        assert len(frequencies) == len(set(frequencies))
         snapshot = TestDeclaredGridCompleteness._snapshot(frequencies, sweep)
         result = evaluate_rule(
             TestDeclaredGridCompleteness._rule(1_000_000, 10_000_000),

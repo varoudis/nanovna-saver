@@ -67,7 +67,7 @@ from .Processing import (
     apply_processing,
 )
 from .ReferenceImpedance import DEFAULT_REFERENCE_IMPEDANCE
-from .RFTools import Datapoint
+from .RFTools import Datapoint, corr_att_data
 from .Settings.Sweep import Sweep, SweepMode
 from .SweepState import (
     SweepProgress,
@@ -174,6 +174,12 @@ class SweepCapture:
     #: value so an edit made mid-sweep cannot change what the samples already
     #: published by this run mean (DSP-01/DSP-02).
     processing: object = None
+    #: Inline S21 attenuator in dB, frozen with the rest of the measurement
+    #: configuration.  It is a physical pad in front of the S21 input, so it
+    #: is undone *before* the calibration runs: the isolation standard is
+    #: stored un-padded, and correcting a padded reading would subtract an
+    #: unattenuated leakage term from an attenuated measurement.
+    s21_att: float = 0.0
 
     @property
     def segments(self) -> int:
@@ -482,7 +488,19 @@ class SweepWorker(QThread):
             truncates=sweep.properties.averages[1],
             continuous=sweep.properties.mode == SweepMode.CONTINOUS,
             processing=getattr(self.app, "processing_config", None),
+            s21_att=self._capture_attenuator(),
         )
+
+    def _capture_attenuator(self) -> float:
+        """The inline S21 attenuator this run will un-pad, in dB.
+
+        Only a positive value is a pad: anything else means there is none.
+        Reading it here, beside the calibration and offset delay, is what
+        stops an edit made mid-sweep from changing what the samples already
+        published mean.
+        """
+        att = float(getattr(self.app, "s21att", 0.0) or 0.0)
+        return att if att > 0.0 else 0.0
 
     def _run_loop(self) -> SweepState | None:
         """Acquire segments; return a terminal state when stopping early."""
@@ -958,10 +976,15 @@ class SweepWorker(QThread):
         publishing an invalid measurement: a non-finite offset delay, or a
         correction that is undefined at some frequency.
 
-        Without an explicit ``capture`` the *live* calibration and offset
-        delay are used, which is what re-correcting already acquired raw data
-        from the calibration window needs.  During a sweep the worker always
-        passes its frozen capture, so a run can never mix calibration states.
+        The inline S21 attenuator is undone before the correction runs, so a
+        padded reading is corrected against standards measured the same way
+        and the pad never reaches the published samples.
+
+        Without an explicit ``capture`` the *live* calibration, offset
+        delay and attenuator are used, which is what re-correcting already
+        acquired raw data from the calibration window needs.  During a sweep
+        the worker always passes its frozen capture, so a run can never mix
+        calibration states.
         """
         calibration = (
             capture.calibration if capture is not None else self.app.calibration
@@ -969,15 +992,28 @@ class SweepWorker(QThread):
         offset_delay = validate_delay(
             capture.offset_delay if capture is not None else self.offsetDelay
         )
+        # The inline attenuator is a physical pad in front of the S21 input,
+        # so it belongs to the measurement, not to the published result.  It
+        # is therefore undone *here*, before the calibration, and the padding
+        # never reaches ``saveData``.  Correcting the padded reading instead
+        # subtracted an unattenuated isolation term from an attenuated
+        # measurement, leaving ``|isolation| * (a - 1)`` in every corrected
+        # S21 sample.
+        att = (
+            capture.s21_att
+            if capture is not None
+            else self._capture_attenuator()
+        )
+        padded21 = corr_att_data(raw_data21, att)
 
         if not calibration.isCalculated:
             data11 = raw_data11.copy()
-            data21 = raw_data21.copy()
+            data21 = padded21
         elif not raw_data11 and not raw_data21:
             return [], []
         elif raw_data11 and raw_data21:
             data11, data21 = self._calibrate_bulk(
-                calibration, raw_data11, raw_data21
+                calibration, raw_data11, padded21
             )
         elif raw_data21:
             if calibration.isValid2Port():
@@ -986,7 +1022,7 @@ class SweepWorker(QThread):
                     " samples, but none were supplied."
                 )
             data11 = []
-            data21 = raw_data21.copy()
+            data21 = padded21
         else:
             # Only S11 was measured (one-port device or an unread S21).
             data11 = self._calibrate_channel(calibration, raw_data11)

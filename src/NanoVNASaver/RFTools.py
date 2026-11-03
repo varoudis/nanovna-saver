@@ -27,16 +27,32 @@ FMT_SHORT = Format(max_nr_digits=4)
 FMT_SWEEP = Format(max_nr_digits=9, allow_strip=True)
 
 
-def _magnitude(point: "Datapoint") -> float:
-    """Magnitude of a sample, NaN included.
+def magnitude(value: complex) -> float:
+    """Magnitude of ``value``, answering NaN instead of raising on a NaN one.
 
-    ``abs()`` on a complex is implemented with the C library's ``hypot`` and
-    converts a stale ``errno`` of ``ERANGE`` into ``OverflowError``.  Qt
-    leaves exactly that behind after loading a font, so the builtin raised on
-    an undefined sample instead of answering NaN.  ``math.hypot`` performs
-    the same arithmetic and never raises.
+    ``abs()`` on a complex raises ``OverflowError: absolute value too large``
+    when the C library's ``errno`` is ``ERANGE`` *and* a component is NaN
+    (CPython turns a leftover ``errno`` into an exception).  ``ERANGE``
+    outlives the call that set it: ``cmath.exp`` of a large angle and any
+    other libm range error leave it behind, so whichever code runs next
+    inherits it.
+
+    The guard is a *catch*, not a replacement algorithm: ``math.hypot`` is
+    not bit-identical to ``abs()`` (they disagree in the last place for
+    roughly one finite input in six), so calling the builtin keeps every
+    result exactly what it was.
     """
-    return math.hypot(point.re, point.im)
+    try:
+        return abs(value)
+    except OverflowError:
+        if math.isfinite(value.real) and math.isfinite(value.imag):
+            # Both components are finite, so this is a real overflow of the
+            # magnitude and the raise is the correct answer.  ``ERANGE``
+            # alone does not explain it.
+            raise
+        # An undefined sample: ``hypot`` performs the same arithmetic
+        # without consulting ``errno``, and answers NaN or ``inf``.
+        return math.hypot(value.real, value.imag)
 
 
 class Datapoint(NamedTuple):
@@ -56,7 +72,7 @@ class Datapoint(NamedTuple):
 
     @property
     def gain(self) -> float:
-        mag = _magnitude(self)
+        mag = magnitude(self.z)
         if math.isnan(mag):
             # Nothing was measured; ``log10(nan)`` is NaN but the guard
             # below would turn it into ``-inf``, the value of silence.
@@ -65,7 +81,7 @@ class Datapoint(NamedTuple):
 
     @property
     def vswr(self) -> float:
-        mag = _magnitude(self)
+        mag = magnitude(self.z)
         if not math.isfinite(mag):
             # An undefined reflection coefficient has no ratio.  Falling
             # through the comparison below would report ``inf`` — the value

@@ -49,7 +49,7 @@ from .Measurement import (
     SPARAMETERS,
     MeasurementSnapshot,
 )
-from .RFTools import Datapoint
+from .RFTools import Datapoint, magnitude
 
 DEFAULT_COLORS = (
     "#e6194b",
@@ -597,8 +597,8 @@ def _difference(
         return _to_impedance(left, impedance) - _to_impedance(right, impedance)
     # Magnitude in dB.  Subtraction of dB values is a ratio of magnitudes;
     # a zero magnitude yields -inf and therefore an infinite difference.
-    left_mag = abs(left)
-    right_mag = abs(right)
+    left_mag = magnitude(left)
+    right_mag = magnitude(right)
     if left_mag == 0.0 or right_mag == 0.0:
         if left_mag == right_mag:
             return complex(0.0, 0.0)

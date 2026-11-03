@@ -114,11 +114,16 @@ class DeltaMarker(Marker):
         )
 
         self.label["s11mag"].setText(
-            format_magnitude(abs(s11_b.z) - abs(s11_a.z))
+            format_magnitude(
+                RFTools.magnitude(s11_b.z) - RFTools.magnitude(s11_a.z)
+            )
         )
         self.label["s11phase"].setText(format_phase(s11_b.phase - s11_a.phase))
         self.label["s11polar"].setText(
-            format_polar(abs(s11_b.z) - abs(s11_a.z), s11_b.phase - s11_a.phase)
+            format_polar(
+                RFTools.magnitude(s11_b.z) - RFTools.magnitude(s11_a.z),
+                s11_b.phase - s11_a.phase,
+            )
         )
         self.label["s11q"].setText(
             format_q_factor(
@@ -126,7 +131,7 @@ class DeltaMarker(Marker):
                 True,
             )
         )
-        self.label["s11z"].setText(format_resistance(abs(imp)))
+        self.label["s11z"].setText(format_resistance(RFTools.magnitude(imp)))
         self.label["serc"].setText(cap_str)
         self.label["serl"].setText(ind_str)
         self.label["serlc"].setText(x_str)
@@ -147,13 +152,16 @@ class DeltaMarker(Marker):
                 )
             )
             self.label["s21mag"].setText(
-                format_magnitude(abs(s21_b.z) - abs(s21_a.z))
+                format_magnitude(
+                    RFTools.magnitude(s21_b.z) - RFTools.magnitude(s21_a.z)
+                )
             )
             self.label["s21phase"].setText(
                 format_phase(s21_b.phase - s21_a.phase)
             )
             self.label["s21polar"].setText(
                 format_polar(
-                    abs(s21_b.z) - abs(s21_a.z), s21_b.phase - s21_a.phase
+                    RFTools.magnitude(s21_b.z) - RFTools.magnitude(s21_a.z),
+                    s21_b.phase - s21_a.phase,
                 )
             )

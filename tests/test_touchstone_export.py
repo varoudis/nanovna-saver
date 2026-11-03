@@ -525,7 +525,7 @@ def _data_rows(text: str) -> list[str]:
 
 
 class TestLogarithmicSweepExport:
-    """Bug 5 regression: log-mode sweeps repeat each segment boundary."""
+    """A log-mode sweep exports every sample, each frequency once."""
 
     @staticmethod
     @pytest.mark.parametrize("segments", [2, 3])
@@ -540,20 +540,23 @@ class TestLogarithmicSweepExport:
 
     @staticmethod
     @pytest.mark.parametrize("segments", [2, 3])
-    def test_the_file_contains_each_repeated_boundary(segments):
-        """Open defect: the export writes the repeat instead of dropping it."""
+    def test_no_segment_boundary_is_written_twice(segments):
+        """The grid itself no longer repeats a boundary frequency.
+
+        Each segment used to end on its successor's start, so the file held
+        that frequency twice and only an equal-neighbour allowance let the
+        export through.  ``Sweep.get_index_range`` now leaves a one-hertz gap
+        between segments, so the allowance is no longer exercised.
+        """
         frequencies = _log_sweep_grid(segments)
         touchstone = Touchstone()
         touchstone.s11 = [Datapoint(f, 0.5, 0.1) for f in frequencies]
 
         rows = _data_rows(touchstone.saves(1))
-        repeats = [
-            rows[i]
-            for i in range(1, len(rows))
-            if rows[i].split()[0] == rows[i - 1].split()[0]
-        ]
+        written = [int(row.split()[0]) for row in rows]
 
-        assert len(repeats) == segments - 1
+        assert written == frequencies
+        assert len(set(written)) == len(written)
 
     @staticmethod
     def test_one_log_sweep_round_trips(tmp_path):

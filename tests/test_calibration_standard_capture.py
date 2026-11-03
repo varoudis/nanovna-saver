@@ -95,10 +95,11 @@ def _box(*, isolation: complex = BOX_TERMS["isolation"]) -> ErrorModel:
     return ErrorModel(**{**BOX_TERMS, "isolation": isolation})
 
 
-#: The attenuator correction is applied to the whole S21 reading, leakage
-#: included, so a padded measurement leaves ``|isolation| * (factor - 1)``
-#: behind -- an existing property of that seam, not of the standard capture.
-#: The padded tests use a negligible isolation so they can assert exactly.
+#: A padded measurement used to leave ``|isolation| * (factor - 1)`` behind,
+#: because the attenuator was applied to the whole S21 reading after the
+#: correction.  ``SweepWorker.applyCalibration`` now undoes the pad first, so
+#: that residue is gone; this negligible isolation is kept so the padded
+#: tests below assert the DUT's own S-parameters to a tight tolerance.
 NEGLIGIBLE_ISOLATION = complex(1e-9, 2e-9)
 
 
@@ -284,15 +285,14 @@ def test_a_padded_calibration_still_recovers_the_dut(window, qt_app):
     dut = CableLine()
     _sweep(window, _device(dut, padded=True, error_model=box), qt_app)
 
-    # ``saveData`` divides the pad out again, so the published trace is the
-    # corrected one, and the correction returns the DUT's own S-parameters.
-    # ``S11`` is exact; ``S21`` keeps the leakage-scaling residue named
-    # above (``|isolation| * (factor - 1)``, about 2.5e-9 here).
+    # The pad is undone before the correction, so the published trace holds
+    # the DUT's own S-parameters with no leakage-scaling residue: the tight
+    # tolerance below is satisfied by the correction itself, not excused.
     for index, freq in enumerate(FREQUENCIES):
         ideal = dut(freq)
         assert _close(window.data.s11[index].z, ideal.s11), freq
         assert window.data.s21[index].z == pytest.approx(
-            ideal.s21, rel=1e-6, abs=1e-8
+            ideal.s21, rel=1e-9, abs=1e-12
         ), freq
 
 

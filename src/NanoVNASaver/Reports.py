@@ -50,7 +50,7 @@ from .Measurement import (
     CorrectionSource,
     MeasurementSnapshot,
 )
-from .RFTools import Datapoint, groupDelay
+from .RFTools import Datapoint, groupDelay, magnitude
 from .Traces import Trace
 
 REPORT_FORMAT_VERSION = 1
@@ -405,9 +405,9 @@ def svg_plot(  # noqa: PLR0913
 def _db(points: Sequence[Datapoint]) -> list[tuple[float, float]]:
     out = []
     for dp in points:
-        magnitude = abs(dp.z)
-        if magnitude > 0:
-            out.append((float(dp.freq), 20.0 * math.log10(magnitude)))
+        value = magnitude(dp.z)
+        if value > 0:
+            out.append((float(dp.freq), 20.0 * math.log10(value)))
     return out
 
 

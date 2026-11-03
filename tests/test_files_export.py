@@ -209,9 +209,10 @@ def test_non_ascending_data_is_reported_and_nothing_written(
 def _log_sweep_frequencies():
     """Frequencies of a real two-segment logarithmic sweep.
 
-    ``Sweep.get_index_range`` makes each segment end on the next one's
-    start, so the grid holds its boundary frequency twice -- the shape the
-    export used to refuse.
+    ``Sweep.get_index_range`` used to make each segment end on the next
+    one's start, so the grid held its boundary frequency twice -- the shape
+    the export used to refuse.  It no longer does, and the grid must still
+    export unchanged.
     """
     from NanoVNASaver.Settings.Sweep import Properties, Sweep
 
@@ -219,10 +220,10 @@ def _log_sweep_frequencies():
     return list(sweep.get_frequencies())
 
 
-def test_a_log_sweep_repeat_is_exported_not_refused(
+def test_a_log_sweep_is_exported_not_refused(
     files_window, tmp_path, monkeypatch, _log_sweep_frequencies
 ):
-    """Bug 5 regression: a repeated boundary must not block the export."""
+    """Bug 5 regression: a segmented log sweep must export unchanged."""
     from PySide6 import QtWidgets
 
     app = files_window.app
@@ -248,12 +249,12 @@ def test_a_log_sweep_repeat_is_exported_not_refused(
 
     assert warnings == []
     written = [
-        line
+        int(line.split()[0])
         for line in target.read_text(encoding="utf-8").splitlines()
         if line and line[0].isdigit()
     ]
-    assert len(written) == len(_log_sweep_frequencies)
-    assert written[100].split()[0] == written[101].split()[0]
+    assert written == _log_sweep_frequencies
+    assert len(set(written)) == len(written)
 
 
 def test_s1p_export_keeps_only_s11(files_window, tmp_path, monkeypatch):

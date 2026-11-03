@@ -46,10 +46,14 @@ class TestCases(unittest.TestCase):
         self.assertEqual(data[0], 3600000)
         self.assertEqual(data[-1], 29999934)  # should be close to 30000000
         sweep = Sweep(segments=3, properties=Properties(logarithmic=True))
-        self.assertEqual(sweep.get_index_range(1), (7298642, 14797272))
+        # The log grid keeps its geometric boundaries, but each segment now
+        # stops one of its own steps before the next boundary instead of
+        # sampling that boundary twice.
+        self.assertEqual(sweep.get_index_range(1), (7298642, 14723028))
         data = list(sweep.get_frequencies())
         self.assertEqual(data[0], 3600000)
         self.assertEqual(data[-1], 30000000)
+        self.assertEqual(len(set(data)), len(data))
 
         sweep2 = sweep.copy()
         self.assertEqual(sweep, sweep2)

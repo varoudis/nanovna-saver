@@ -79,7 +79,7 @@ from .Measurement import (
     MeasurementSnapshot,
     SweepInfo,
 )
-from .RFTools import Datapoint
+from .RFTools import Datapoint, magnitude
 
 LIMIT_SET_FORMAT = "nanovna-saver-limits"
 #: Version 2 added optional sloped bounds and the S11 phase metric.
@@ -169,14 +169,14 @@ class Metric(Enum):
         cross the +/-180 degree branch; the evaluator cannot detect that
         intent, so :meth:`S11_PHASE_DEG` documents it rather than guessing.
         """
-        magnitude = abs(point.z)
+        reflection = magnitude(point.z)
         if self is Metric.S11_VSWR:
             return point.vswr
         if self is Metric.S11_PHASE_DEG:
             return math.degrees(point.phase)
-        if magnitude == 0.0:
+        if reflection == 0.0:
             return math.inf
-        return -20.0 * math.log10(magnitude)
+        return -20.0 * math.log10(reflection)
 
     @classmethod
     def parse(cls, text: object) -> "Metric":

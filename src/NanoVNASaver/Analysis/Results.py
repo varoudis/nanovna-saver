@@ -43,7 +43,7 @@ from typing import Iterable, Sequence
 
 from .. import AnalyticTools as At
 from ..Measurement import S11, S21, MeasurementSnapshot
-from ..RFTools import Datapoint
+from ..RFTools import Datapoint, magnitude
 
 logger = logging.getLogger(__name__)
 
@@ -548,7 +548,7 @@ def analyse_cable(
             {"velocity_factor": velocity_factor},
         )
     impedances = [dp.impedance(snapshot.reference_impedance) for dp in points]
-    magnitudes = [abs(z) for z in impedances]
+    magnitudes = [magnitude(z) for z in impedances]
     # An undefined sample has no |Z|.  Leaving it in makes ``sum`` NaN and
     # lets ``min``/``max`` pick it whenever it comes first, so the reported
     # range depends on sweep order.  Search the measured samples instead;

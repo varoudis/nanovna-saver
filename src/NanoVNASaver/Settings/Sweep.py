@@ -172,10 +172,52 @@ class Sweep:
             log((self.start + self.span) / self.start) / self.segments * index
         )
 
+    def _log_boundary(self, index: int) -> int:
+        """The frequency a logarithmic segment boundary falls on.
+
+        The geometric grid is computed for the whole sweep at once: the
+        ``index``-th of ``segments + 1`` boundaries, with the first and last
+        pinned to the configured ends.  The first entry is a real generator
+        so ``round`` and ``exp`` behave exactly as they always have.
+
+        An interior boundary is where the *next* segment starts.  The segment
+        before it stops one of its own steps short, so it never samples the
+        boundary itself.  That is what keeps every frequency unique: the old
+        code used the boundary as both one segment's end and the next one's
+        start, so a segmented logarithmic sweep published it twice.
+        """
+        if index <= 0:
+            return self.start
+        if index >= self.segments:
+            return self.end
+        return round(self.start * self._exp_factor(index))
+
+    def _log_range(self, index: int) -> tuple[int, int]:
+        """``(start, stop)`` of one logarithmic segment, both sampled.
+
+        The next boundary is one segment step away, so the gap between this
+        segment's last sample and the next one's first is the same size as
+        every other interval: not a repeat, and not a hole wide enough to
+        look like a missing sample.
+
+        A span too narrow to give every segment a step of its own keeps the
+        historic overlapping grid; there is no way to fit the requested
+        samples into it, and inventing frequencies outside the sweep would
+        be worse than repeating one.
+        """
+        start = self._log_boundary(index)
+        following = self._log_boundary(index + 1)
+        if index + 1 >= self.segments:
+            return start, following
+        step = max(1, round((following - start) / self.points))
+        stop = following - step
+        if stop <= start:
+            return start, following
+        return start, stop
+
     def get_index_range(self, index: int) -> tuple[int, int]:
         if self.properties.logarithmic:
-            start = round(self.start * self._exp_factor(index))
-            end = round(self.start * self._exp_factor(index + 1))
+            start, end = self._log_range(index)
         else:
             start = self.start + index * self.points * self.stepsize
             end = start + (self.points - 1) * self.stepsize
