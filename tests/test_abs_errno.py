@@ -25,11 +25,15 @@ behind -- so any code that runs next inherits the exception.  ``ERANGE`` is
 also what a genuine magnitude overflow sets, so the fix cannot simply be
 "never raise".
 
-Every test here therefore *forces* ``errno`` immediately before the call it
-is testing.  Setting it once at the top of a test proves nothing: a
+The native tests therefore *force* ``errno`` immediately before the call they
+are testing.  Setting it once at the top of a test proves nothing: a
 successful ``abs()`` clears ``errno``, and ``cmath`` calls clear it too, so a
 preceding expression silently disarms the test.  ``math.hypot`` does not
 clear it, which is what makes it usable in the helper.
+
+Some interpreters, including CPython 3.13 on Linux, do not raise for stale
+errno.  Native checks accept that behaviour, while an injected
+``OverflowError`` exercises the helper's fallback on every interpreter.
 
 The helper's contract, which these tests pin:
 
@@ -88,6 +92,15 @@ def _get_errno() -> int:
 
 ERANGE = errno.ERANGE
 
+
+@pytest.fixture(autouse=True)
+def clean_errno():
+    """Do not let these native-state probes affect other tests."""
+    _set_errno(0)
+    yield
+    _set_errno(0)
+
+
 #: Complex samples whose magnitude is undefined but whose magnitude is *not*
 #: too large, and what ``abs()`` answers for them with a clean ``errno``.
 #:
@@ -140,16 +153,32 @@ def test_an_infinite_component_answers_without_consulting_errno(
 
 
 @pytest.mark.parametrize(("value", "expected"), UNDEFINED)
-def test_the_builtin_really_does_raise_under_the_same_errno(value, expected):
-    """Proof the test above is not vacuous.
-
-    Without this, a future CPython that stops raising would make the helper's
-    test pass for the wrong reason.
-    """
+def test_the_builtin_returns_nan_or_raises_under_stale_errno(value, expected):
+    """Native behaviour depends on the interpreter and C library."""
     _set_errno(ERANGE)
 
-    with pytest.raises(OverflowError):
-        abs(value)
+    try:
+        result = abs(value)
+    except OverflowError:
+        return
+    assert math.isnan(result)
+
+
+@pytest.mark.parametrize(("value", "expected"), UNDEFINED)
+def test_undefined_overflow_uses_the_fallback(value, expected, monkeypatch):
+    """Exercise the guard even where the builtin no longer has the bug."""
+    calls = []
+
+    def overflowing_abs(sample):
+        calls.append(sample)
+        raise OverflowError("absolute value too large")
+
+    monkeypatch.setattr(RFTools, "abs", overflowing_abs, raising=False)
+
+    result = RFTools.magnitude(value)
+
+    assert calls == [value]
+    assert math.isnan(result)
 
 
 def test_a_genuine_overflow_still_raises():
@@ -166,17 +195,18 @@ def test_a_genuine_overflow_still_raises():
 
 
 @pytest.mark.parametrize("value", [0, 1, 2, 22, 33, 35])
-def test_only_erange_produces_the_raise(value):
+def test_other_errno_values_do_not_break_nan_magnitudes(value):
     """The forcing mechanism itself: the code is exact, not "some errno"."""
     _set_errno(value)
     assert math.isnan(abs(complex(math.nan, 0.0)))
     assert math.isnan(RFTools.magnitude(complex(math.nan, 0.0)))
 
 
-def test_erange_itself_produces_the_raise():
+def test_the_injector_changes_native_errno():
     _set_errno(ERANGE)
-    with pytest.raises(OverflowError):
-        abs(complex(math.nan, 0.0))
+    assert _get_errno() == ERANGE
+    _set_errno(0)
+    assert _get_errno() == 0
 
 
 FINITE = [

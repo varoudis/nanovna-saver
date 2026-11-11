@@ -20,6 +20,7 @@
 
 import os
 import time
+import timeit
 
 import pytest
 
@@ -184,19 +185,31 @@ class TestComparisonPerformance:
         source_trace = Trace(id="a", name="A", snapshot=source)
         reference_trace = Trace(id="b", name="B", snapshot=reference)
 
-        started = time.perf_counter()
         result = compare_traces(
             source_trace,
             reference_trace,
             parameter="S11",
             kind=ComparisonKind.MAGNITUDE_DB,
         )
-        elapsed = time.perf_counter() - started
-
         assert result.available
         assert len(result.frequencies()) == points
-        # Measured at 7.4 ms on the reference machine; a 400 ms ceiling
-        # leaves room for slower CI without hiding a regression to seconds.
+        # Measure comparison CPU cost rather than scheduler delays on a
+        # shared CI runner.  timeit excludes cyclic GC of objects left by
+        # other tests; the best of three also excludes transient overhead.
+        elapsed = min(
+            timeit.repeat(
+                lambda: compare_traces(
+                    source_trace,
+                    reference_trace,
+                    parameter="S11",
+                    kind=ComparisonKind.MAGNITUDE_DB,
+                ),
+                timer=time.process_time,
+                number=1,
+                repeat=3,
+            )
+        )
+        # Keep the 400 ms budget to catch quadratic comparison regressions.
         assert elapsed < 0.4, f"comparison took {elapsed * 1000:.0f} ms"
 
     @staticmethod

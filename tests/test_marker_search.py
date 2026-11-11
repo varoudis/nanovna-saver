@@ -220,7 +220,11 @@ class TestCrossings:
     @staticmethod
     def test_a_sample_exactly_on_the_target_is_measured():
         points = _from_db([0, 5, 10])
-        result = search_crossing(points, 5.0, above=True)
+        # The dB -> magnitude -> dB round trip need not return exactly 5.0.
+        # This test requires equality with a measured sample, not proximity.
+        target = points[1].gain
+        assert target == pytest.approx(5.0)
+        result = search_crossing(points, target, above=True)
         assert result.location is LocationKind.MEASURED
         assert result.frequency == freq_of(points, 1)
 

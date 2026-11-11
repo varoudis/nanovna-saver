@@ -288,19 +288,24 @@ class TestInvalidInput:
     def test_large_but_finite_corrections_are_reported_as_is():
         """Near-singular data yields large numbers in the scalar oracle too;
         the bulk path must not clamp or reject them."""
-        calibration = _calibration(TWO_PORT_CAL)
+        # Exact binary coefficients keep this near the pole on every
+        # platform.  Dividing measured delta_e by e11 can land exactly on
+        # the pole, making the supposedly finite fixture singular.
+        calibration = Calibration()
+        calibration.interp = {
+            "e00": lambda f: np.zeros_like(f, dtype=complex),
+            "e11": lambda f: np.ones_like(f, dtype=complex),
+            "delta_e": lambda f: np.ones_like(f, dtype=complex),
+        }
         freq = np.array([200_000_000], dtype=np.int64)
-        e11 = np.asarray(calibration.interp["e11"](freq))
-        delta_e = np.asarray(calibration.interp["delta_e"](freq))
-        values = np.array([delta_e[0] / e11[0]], complex)
+        values = np.array([1.0 + 2.0**-40], complex)
 
         bulk = calibration.correct11_bulk(freq, values)
         scalar = calibration.correct11(
             Datapoint(int(freq[0]), values[0].real, values[0].imag)
         ).z
 
-        assert abs(bulk[0]) > 1e10
-        assert bulk[0] == pytest.approx(scalar, rel=1e-12)
+        assert bulk[0] == scalar == 2.0**40 + 1.0
 
 
 class TestDelayBulk:
