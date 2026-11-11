@@ -41,7 +41,9 @@ The helper's contract, which these tests pin:
 
 import cmath
 import ctypes
+import errno
 import math
+import sys
 
 import pytest
 
@@ -54,13 +56,26 @@ from NanoVNASaver.Traces import ComparisonKind, _difference
 #: Loaded once: ``ctypes.CDLL`` runs ``dlopen``, which itself sets ``errno``
 #: (``ENOENT`` while searching) -- calling it inside ``_get_errno`` would
 #: report the search's ``errno`` instead of the code under test's.
-_LIBC = ctypes.CDLL("libSystem.B.dylib")  # macOS
-_LIBC.__error.restype = ctypes.POINTER(ctypes.c_int)
+# Resolve the process's C library instead of naming a macOS-only dylib.
+# ``use_errno=True`` would access ctypes' private copy, not the errno used
+# by CPython's ``abs()`` and ``cmath`` calls.
+_LIBC = ctypes.CDLL(None)
+try:
+    _ERRNO_LOCATION = getattr(
+        _LIBC, "__error" if sys.platform == "darwin" else "__errno_location"
+    )
+except AttributeError:
+    pytest.skip(
+        "Native errno access requires macOS or a glibc-compatible C library",
+        allow_module_level=True,
+    )
+_ERRNO_LOCATION.argtypes = []
+_ERRNO_LOCATION.restype = ctypes.POINTER(ctypes.c_int)
 
 
 def _errno_pointer():
     """A pointer to the C library's thread-local ``errno``."""
-    return _LIBC.__error().contents
+    return _ERRNO_LOCATION().contents
 
 
 def _set_errno(value: int) -> None:
@@ -71,7 +86,7 @@ def _get_errno() -> int:
     return _errno_pointer().value
 
 
-ERANGE = 34
+ERANGE = errno.ERANGE
 
 #: Complex samples whose magnitude is undefined but whose magnitude is *not*
 #: too large, and what ``abs()`` answers for them with a clean ``errno``.
@@ -246,6 +261,6 @@ def test_erange_is_left_by_a_libm_range_error():
     try:
         cmath.log(0)
     except ValueError:
-        assert _get_errno() == 33
+        assert _get_errno() == errno.EDOM
     else:
         pytest.fail("cmath.log(0) did not fail")
